@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import socket
 from collections.abc import Iterator
 from typing import get_type_hints
@@ -46,6 +47,7 @@ class _FakeSocket:
         self._recv_results: Iterator[tuple[float, bytes]] = iter(recv_results)
         self._timeout: float | None = None
         self.phase_timeouts: list[tuple[str, float]] = []
+        self.sent_payloads: list[bytes] = []
 
     def __enter__(self) -> "_FakeSocket":
         return self
@@ -61,7 +63,8 @@ class _FakeSocket:
         if self._connect_error is not None:
             raise self._connect_error
 
-    def sendall(self, _payload: bytes) -> None:
+    def sendall(self, payload: bytes) -> None:
+        self.sent_payloads.append(payload)
         self._run_phase("send", self._send_duration)
 
     def shutdown(self, _how: int) -> None:
@@ -197,3 +200,21 @@ def test_execute_skill_preserves_successful_jump_host_retry(
     assert result.execution_time == pytest.approx(0.4)
     assert clock.sleeps == [0.2]
     assert len(factory.created) == 2
+
+
+def test_execute_skill_gives_daemon_time_to_return_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    connected = _FakeSocket(
+        clock,
+        recv_results=((0.0, b"\x023"), (0.0, b"")),
+    )
+    factory = _SocketFactory([connected])
+    _use_fake_network(monkeypatch, clock, factory)
+
+    result = VirtuosoClient().execute_skill("1+2", timeout=10.0)
+
+    assert result.status == ExecutionStatus.SUCCESS
+    request = json.loads(connected.sent_payloads[0].decode("utf-8"))
+    assert request["timeout"] == pytest.approx(9.5)

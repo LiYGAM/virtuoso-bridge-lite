@@ -5,7 +5,6 @@ import sys
 import socket
 import os
 import json
-import signal
 import threading
 import time
 import errno
@@ -137,17 +136,22 @@ def _safe_close_connection(conn):
         pass
 
 def watchdog_callback():
-    """Watchdog callback function that sends SIGINT signal to Virtuoso process when timeout occurs."""
+    """Mark timeout without aborting the active Virtuoso IPC callback.
+
+    An asynchronous SIGINT can prevent RBIpcDataHandler from writing its
+    response delimiter.  The TCP client owns the external timeout while this
+    daemon waits to drain the eventual response and restore stream alignment.
+    """
     global timeout_flag
-    if not timeout_flag:  # If not set yet, it means timeout occurred
+    if not timeout_flag:
         timeout_flag = True
-        try:
-            os.kill(virtuoso_pid, signal.SIGINT)
-        except Exception:
-            pass
 
 def read_until_delimiter(start_ok=b'\x02', start_err=b'\x15', end=b'\x1e'):
-    """Read data from Virtuoso's stdout until specific delimiters are found."""
+    """Read one complete response, even after the request watchdog expires.
+
+    Draining a late response keeps the serial request/response stream aligned
+    after a modal form or another callback outlives its client timeout.
+    """
     result = bytearray()
 
     # Wait for start marker
@@ -158,16 +162,10 @@ def read_until_delimiter(start_ok=b'\x02', start_err=b'\x15', end=b'\x1e'):
                 break
         except IOError as e:
             if e.errno == errno.EAGAIN or e.errno == errno.EWOULDBLOCK:
-                # No data available, check timeout and continue
-                if timeout_flag:
-                    return "\x15TimeoutError"
                 time.sleep(0.001)  # Short sleep to avoid busy waiting
                 continue
             else:
                 raise
-        if timeout_flag:
-            # Python 2.7 compatibility: return string directly
-            return "\x15TimeoutError"
 
     # Python 2.7 compatibility: convert string to bytes for bytearray
     if isinstance(ch, str):
@@ -179,9 +177,6 @@ def read_until_delimiter(start_ok=b'\x02', start_err=b'\x15', end=b'\x1e'):
     while True:
         try:
             ch = sys.stdin.read(1)
-            if timeout_flag:
-                # Python 2.7 compatibility: return string directly
-                return "\x15TimeoutError"
             if not ch:  # Python 2.7: empty string means no data
                 continue
             if ch == end:
@@ -193,14 +188,13 @@ def read_until_delimiter(start_ok=b'\x02', start_err=b'\x15', end=b'\x1e'):
                 result.extend(ch)
         except IOError as e:
             if e.errno == errno.EAGAIN or e.errno == errno.EWOULDBLOCK:
-                # No data available, check timeout and continue
-                if timeout_flag:
-                    return "\x15TimeoutError"
                 time.sleep(0.001)  # Short sleep to avoid busy waiting
                 continue
             else:
                 raise
 
+    if timeout_flag:
+        return "\x15TimeoutError"
     return result
 
 def handle_external_connection(conn, addr):

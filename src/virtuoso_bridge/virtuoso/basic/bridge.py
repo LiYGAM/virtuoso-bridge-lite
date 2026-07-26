@@ -37,6 +37,7 @@ _NAK = "\x15"
 _RECV_BUF_SIZE = 1024 * 1024
 _TUNNEL_CONNECT_RETRY_DELAY = 0.2
 _TUNNEL_CONNECT_GRACE_SECONDS = 3.0
+_DAEMON_TIMEOUT_RETURN_GRACE_SECONDS = 0.5
 
 
 def _default_remote_port(username: str | None = None) -> int:
@@ -1431,7 +1432,15 @@ let((result winName ciwNum)
             logger.debug("TCP connect %s:%d", self._host, self._port)
             s.connect((self._host, self._port))
             logger.debug("TCP connected, sending %d-byte payload", len(skill_code))
-            request_timeout = min(timeout, self._remaining_timeout(deadline))
+            remaining = self._remaining_timeout(deadline)
+            return_grace = min(
+                _DAEMON_TIMEOUT_RETURN_GRACE_SECONDS,
+                remaining * 0.5,
+            )
+            request_timeout = max(
+                0.01,
+                min(timeout, remaining - return_grace),
+            )
             payload = json.dumps({"skill": skill_code, "timeout": request_timeout}).encode("utf-8")
             s.settimeout(self._remaining_timeout(deadline))
             s.sendall(payload)

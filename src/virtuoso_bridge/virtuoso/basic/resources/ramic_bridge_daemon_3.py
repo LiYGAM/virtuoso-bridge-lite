@@ -5,7 +5,6 @@ import sys
 import socket
 import os
 import json
-import signal
 import threading
 import time
 import errno
@@ -99,16 +98,24 @@ def _safe_close_connection(conn):
         pass
 
 def watchdog_callback():
+    """Mark the request timed out without asynchronously interrupting CIW.
+
+    SIGINT can unwind RBIpcDataHandler before it writes a framed response,
+    leaving the daemon unable to realign its serial response stream.  The
+    client still enforces its own socket deadline; this daemon keeps draining
+    until the original callback returns.
+    """
     global timeout_flag
     if not timeout_flag:
         timeout_flag = True
-        try:
-            os.kill(virtuoso_pid, signal.SIGINT)
-        except Exception:
-            pass
 
 def read_until_delimiter(start_ok=0x02, start_err=0x15, end=0x1e):
-    """Read data from Virtuoso's stdout until specific delimiters are found."""
+    """Read one complete response, even after the request watchdog expires.
+
+    A timed-out SKILL callback may still return later, especially when it is
+    blocked by a modal form.  The response must be drained before accepting
+    another request or that late response will be mistaken for the next one.
+    """
     result = bytearray()
 
     # Wait for start marker
@@ -116,8 +123,6 @@ def read_until_delimiter(start_ok=0x02, start_err=0x15, end=0x1e):
         try:
             ch = sys.stdin.buffer.read(1)
             if not ch:
-                if timeout_flag:
-                    return b"\x15TimeoutError"
                 time.sleep(0.001)
                 continue
             if ch[0] in (start_ok, start_err):
@@ -125,21 +130,15 @@ def read_until_delimiter(start_ok=0x02, start_err=0x15, end=0x1e):
                 break
         except IOError as e:
             if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                if timeout_flag:
-                    return b"\x15TimeoutError"
                 time.sleep(0.001)
                 continue
             raise
-        if timeout_flag:
-            return b"\x15TimeoutError"
 
     # Read content until end marker
     while True:
         try:
             ch = sys.stdin.buffer.read(1)
             if not ch:
-                if timeout_flag:
-                    return b"\x15TimeoutError"
                 time.sleep(0.001)
                 continue
             if ch[0] == end:
@@ -147,14 +146,12 @@ def read_until_delimiter(start_ok=0x02, start_err=0x15, end=0x1e):
             result.extend(ch)
         except IOError as e:
             if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                if timeout_flag:
-                    return b"\x15TimeoutError"
                 time.sleep(0.001)
                 continue
             raise
-        if timeout_flag:
-            return b"\x15TimeoutError"
 
+    if timeout_flag:
+        return b"\x15TimeoutError"
     return result
 
 def handle_external_connection(conn, addr):

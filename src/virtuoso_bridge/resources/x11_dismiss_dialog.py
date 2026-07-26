@@ -160,7 +160,7 @@ def _root_frames():
     frames = []
     in_children = False
     for line in tree.splitlines():
-        if "children" in line.lower() and ":" in line:
+        if re.search(r"\b(?:child|children)\b\s*:", line.lower()):
             in_children = True
             continue
         if not in_children:
@@ -213,6 +213,26 @@ def _known_action(title):
     return None
 
 
+def _representative_app_window(frame, app_children):
+    """Choose one actionable application window for a top-level WM frame."""
+    meaningful = []
+    for child in app_children:
+        title = (child.get("title") or "").strip()
+        if title and title.lower() not in ("virtuoso", "libmanager"):
+            meaningful.append(child)
+
+    for child in meaningful:
+        if _known_action(child.get("title") or ""):
+            return child
+    if meaningful:
+        return meaningful[0]
+    if _is_virtuoso_class(frame.get("class")):
+        return frame
+    if app_children:
+        return app_children[0]
+    return None
+
+
 def classify_windows(windows):
     classified = []
     for win in windows:
@@ -243,28 +263,28 @@ def discover_windows(display):
         geometry = frame.get("geometry") or {}
         children = _frame_children(frame_id)
         app_children = [c for c in children if _is_virtuoso_class(c.get("class"))]
-        if _is_virtuoso_class(frame.get("class")):
-            app_children.append(frame)
-        for child in app_children:
-            dismiss_id = child["id"]
-            key = (frame_id, dismiss_id)
-            if key in seen:
-                continue
-            seen.add(key)
-            windows.append({
-                "frame_id": frame_id,
-                "window_id": dismiss_id,
-                "dismiss_id": dismiss_id,
-                "title": child.get("title") or frame.get("title") or "",
-                "class": child.get("class") or frame.get("class") or [],
-                "geometry": {
-                    "w": int(geometry.get("w") or 0),
-                    "h": int(geometry.get("h") or 0),
-                    "x": int(geometry.get("x") or 0),
-                    "y": int(geometry.get("y") or 0),
-                },
-                "mapped": True,
-            })
+        child = _representative_app_window(frame, app_children)
+        if not child:
+            continue
+        dismiss_id = child["id"]
+        key = (frame_id, dismiss_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        windows.append({
+            "frame_id": frame_id,
+            "window_id": dismiss_id,
+            "dismiss_id": dismiss_id,
+            "title": child.get("title") or frame.get("title") or "",
+            "class": child.get("class") or frame.get("class") or [],
+            "geometry": {
+                "w": int(geometry.get("w") or 0),
+                "h": int(geometry.get("h") or 0),
+                "x": int(geometry.get("x") or 0),
+                "y": int(geometry.get("y") or 0),
+            },
+            "mapped": True,
+        })
     return classify_windows(windows)
 
 

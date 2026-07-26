@@ -97,6 +97,47 @@ xwininfo: Window id: 0xabc000 "Virtuoso Main"
     assert [d["window_id"] for d in dialogs] == ["0x4203583"]
 
 
+def test_discover_windows_collapses_descendants_from_one_frame(monkeypatch) -> None:
+    helper = _load_helper_module()
+
+    root = """
+xwininfo: Window id: 0xroot (the root window)
+
+  Root window id: 0xroot
+  Parent window id: 0x0 (none)
+     1 child:
+     0xabc000 "Virtuoso Main": ("virtuoso" "virtuoso") 1400x900+0+0 +0+0
+"""
+    main_tree = """
+xwininfo: Window id: 0xabc000 "Virtuoso Main"
+
+  Root window id: 0xroot
+  Parent window id: 0xroot
+     4 children:
+     0xabc111 "Layout Editing": ("virtuoso" "virtuoso") 1400x900+0+0 +0+0
+     0xabc112 "virtuoso": ("virtuoso" "virtuoso") 1200x800+0+0 +0+0
+     0xabc113 "virtuoso": ("virtuoso" "virtuoso") 200x40+0+0 +0+0
+     0xabc114 "virtuoso": ("virtuoso" "virtuoso") 20x20+0+0 +0+0
+"""
+
+    def fake_check_output(cmd, stderr=None):
+        if cmd == ["xwininfo", "-root", "-children"]:
+            return root.encode()
+        if cmd == ["xwininfo", "-id", "0xabc000"]:
+            return _xwininfo_window(x=0, y=0, w=1400, h=900).encode()
+        if cmd == ["xwininfo", "-id", "0xabc000", "-tree"]:
+            return main_tree.encode()
+        raise AssertionError(f"unexpected command: {cmd!r}")
+
+    monkeypatch.setattr(helper.subprocess, "check_output", fake_check_output)
+
+    windows = helper.discover_windows(":1")
+
+    assert len(windows) == 1
+    assert windows[0]["dismiss_id"] == "0xabc111"
+    assert windows[0]["title"] == "Layout Editing"
+
+
 def test_find_x11_env_decodes_pgrep_pid_bytes(monkeypatch) -> None:
     helper = _load_helper_module()
     opened_paths = []

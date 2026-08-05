@@ -5,6 +5,8 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from virtuoso_bridge import cli
 from virtuoso_bridge.virtuoso import x11
 
@@ -202,6 +204,379 @@ def test_x11_wrapper_lists_and_dismisses_explicit_window(monkeypatch) -> None:
     assert result == [{"dismissed": "0x4203583", "action": "enter"}]
     assert any("--list-windows --json :".split()[0] in cmd for cmd in runner.commands)
     assert any("--dismiss-window 0x4203583 --action enter" in cmd for cmd in runner.commands)
+
+
+def _input_windows():
+    return [{
+        "dismiss_id": "0x4203583",
+        "title": "ADE Explorer Update and Run",
+        "mapped": True,
+    }]
+
+
+def _input_info(*, mapped=True):
+    return {"mapped": mapped, "geometry": {"x": 528, "y": 477, "w": 843, "h": 132}}
+
+
+def test_window_input_preflight_converts_relative_coordinates_and_orders_drag() -> None:
+    helper = _load_helper_module()
+
+    prepared = helper.preflight_window_input(
+        _input_windows(), "0x4203583", "Explorer", "drag", 20, 30, 1, 40, 50,
+        _input_info(),
+    )
+
+    assert prepared["root"] == {"x": 548, "y": 507, "to_x": 568, "to_y": 527}
+    assert helper.build_window_input_events(prepared) == [
+        ("motion", 548, 507),
+        ("button", 1, True),
+        ("motion", 568, 527),
+        ("button", 1, False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"action": "key", "x": 1, "y": 1}, "unsupported action"),
+        ({"action": "click", "x": 1, "y": 1, "button": 4}, "button must be"),
+        ({"action": "click", "x": 843, "y": 1}, "outside current target bounds"),
+        ({"action": "drag", "x": 1, "y": 1}, "drag requires both"),
+        ({"action": "move", "x": 1, "y": 1, "to_x": 2}, "only valid for drag"),
+    ],
+)
+def test_window_input_preflight_rejects_invalid_actions_and_coordinates(kwargs, error) -> None:
+    helper = _load_helper_module()
+    options = dict(kwargs)
+
+    with pytest.raises(ValueError, match=error):
+        helper.preflight_window_input(
+            _input_windows(), "0x4203583", "Explorer", button=options.pop("button", 1),
+            to_x=options.pop("to_x", None), to_y=options.pop("to_y", None),
+            window_info=_input_info(), **options,
+        )
+
+
+def test_window_input_preflight_rejects_stale_id_unmapped_and_title_mismatch() -> None:
+    helper = _load_helper_module()
+
+    with pytest.raises(ValueError, match="currently discovered"):
+        helper.preflight_window_input(
+            _input_windows(), "0xdead", "Explorer", "move", 1, 1, window_info=_input_info(),
+        )
+    with pytest.raises(ValueError, match="not mapped"):
+        helper.preflight_window_input(
+            _input_windows(), "0x4203583", "Explorer", "move", 1, 1,
+            window_info=_input_info(mapped=False),
+        )
+    with pytest.raises(ValueError, match="does not contain"):
+        helper.preflight_window_input(
+            _input_windows(), "0x4203583", "Wrong", "move", 1, 1, window_info=_input_info(),
+        )
+    with pytest.raises(ValueError, match="currently discovered"):
+        helper.preflight_window_input(
+            [{"dismiss_id": "0xframe", "frame_id": "0xframe", "title": "ADE"}],
+            "0xframe", "ADE", "move", 1, 1, window_info=_input_info(),
+        )
+
+
+def test_window_input_refreshes_exact_target_before_sending(monkeypatch) -> None:
+    helper = _load_helper_module()
+    calls = []
+    monkeypatch.setattr(helper, "discover_windows", lambda display: calls.append(
+        ("discover", display)) or _input_windows())
+    monkeypatch.setattr(helper, "_read_window_info", lambda window_id: calls.append(
+        ("xwininfo", window_id)) or _input_info())
+    monkeypatch.setattr(helper, "send_window_input", lambda display, prepared, **kwargs: calls.append(
+        ("send", display, prepared)) or {"sent": True})
+
+    result = helper.window_input(":1", "0x4203583", "Explorer", "click", 2, 3)
+    assert result["sent"] is True
+    assert result["verified"] is True
+    assert result["state_before"]["geometry"] == _input_info()["geometry"]
+    assert calls[0:2] == [("discover", ":1"), ("xwininfo", "0x4203583")]
+    assert calls[2][0:2] == ("send", ":1")
+    assert calls[2][2]["root"] == {"x": 530, "y": 480}
+
+
+def test_window_input_raises_and_focuses_target_before_xtest(monkeypatch) -> None:
+    helper = _load_helper_module()
+    calls = []
+
+    class FakeFunction:
+        def __init__(self, name, result=1):
+            self.name = name
+            self.result = result
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args):
+            calls.append((self.name, args))
+            return self.result
+
+    class FakeLibrary:
+        pass
+
+    xlib = FakeLibrary()
+    xtst = FakeLibrary()
+    for name in ("XCloseDisplay", "XFlush", "XRaiseWindow", "XSetInputFocus", "XSync"):
+        setattr(xlib, name, FakeFunction(name))
+    xlib.XOpenDisplay = FakeFunction("XOpenDisplay", result=1234)
+    xtst.XTestFakeMotionEvent = FakeFunction("XTestFakeMotionEvent")
+    xtst.XTestFakeButtonEvent = FakeFunction("XTestFakeButtonEvent")
+    monkeypatch.setattr(helper.ctypes.util, "find_library", lambda name: name)
+    monkeypatch.setattr(
+        helper.ctypes.cdll,
+        "LoadLibrary",
+        lambda name: xlib if name == "X11" else xtst,
+    )
+    monkeypatch.setattr(helper.time, "sleep", lambda seconds: None)
+    prepared = helper.preflight_window_input(
+        _input_windows(), "0x4203583", "Explorer", "click", 20, 30, 1,
+        window_info=_input_info(),
+    )
+
+    result = helper.send_window_input(":1", prepared)
+
+    names = [name for name, _ in calls]
+    assert result["sent"] is True
+    assert names.index("XRaiseWindow") < names.index("XTestFakeMotionEvent")
+    assert names.index("XSetInputFocus") < names.index("XTestFakeMotionEvent")
+    assert names.index("XSync") < names.index("XTestFakeMotionEvent")
+    assert next(args for name, args in calls if name == "XRaiseWindow")[1] == int(
+        "0x4203583", 16
+    )
+
+
+def test_window_input_dry_run_never_opens_x11(monkeypatch) -> None:
+    helper = _load_helper_module()
+    monkeypatch.setattr(helper, "discover_windows", lambda display: _input_windows())
+    monkeypatch.setattr(helper, "_read_window_info", lambda window_id: _input_info())
+    monkeypatch.setattr(
+        helper, "send_window_input",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not send")),
+    )
+
+    result = helper.window_input(
+        ":1", "0x4203583", "Explorer", "drag", 2, 3, 1, 4, 5, dry_run=True,
+    )
+
+    assert result["sent"] is False
+    assert result["dry_run"] is True
+    assert result["state_before"]["geometry"] == _input_info()["geometry"]
+    assert result["state_after"] is None
+    assert result["planned_events"][-1] == ("button", 1, False)
+
+
+def test_window_input_schedule_supports_bounded_drag_timing() -> None:
+    helper = _load_helper_module()
+    prepared = helper.preflight_window_input(
+        _input_windows(), "0x4203583", "Explorer", "drag", 0, 0, 1, 10, 4,
+        _input_info(),
+    )
+    timing = helper._validate_window_input_timing(50, 20, 100, 2)
+
+    assert helper.build_window_input_schedule(prepared, timing) == [
+        ("event", ("motion", 528, 477)),
+        ("event", ("button", 1, True)),
+        ("sleep", 20),
+        ("sleep", 50.0),
+        ("event", ("motion", 533, 479)),
+        ("sleep", 50.0),
+        ("event", ("motion", 538, 481)),
+        ("event", ("button", 1, False)),
+    ]
+    with pytest.raises(ValueError, match="drag_steps"):
+        helper._validate_window_input_timing(drag_steps=101)
+
+
+def test_window_input_rechecks_fingerprint_after_focus_before_xtest(monkeypatch) -> None:
+    helper = _load_helper_module()
+    calls = []
+
+    class FakeFunction:
+        def __init__(self, name, result=1):
+            self.name, self.result, self.argtypes, self.restype = name, result, None, None
+
+        def __call__(self, *args):
+            calls.append((self.name, args))
+            return self.result
+
+    class FakeLibrary:
+        pass
+
+    xlib, xtst = FakeLibrary(), FakeLibrary()
+    for name in ("XCloseDisplay", "XFlush", "XRaiseWindow", "XSetInputFocus", "XSync"):
+        setattr(xlib, name, FakeFunction(name))
+    xlib.XOpenDisplay = FakeFunction("XOpenDisplay", result=1234)
+    xtst.XTestFakeMotionEvent = FakeFunction("XTestFakeMotionEvent")
+    xtst.XTestFakeButtonEvent = FakeFunction("XTestFakeButtonEvent")
+    monkeypatch.setattr(helper.ctypes.util, "find_library", lambda name: name)
+    monkeypatch.setattr(helper.ctypes.cdll, "LoadLibrary", lambda name: xlib if name == "X11" else xtst)
+    prepared = helper.preflight_window_input(
+        _input_windows(), "0x4203583", "Explorer", "move", 2, 3, window_info=_input_info(),
+    )
+    changed = dict(prepared)
+    changed["fingerprint"] = dict(prepared["fingerprint"], title="Different Window")
+
+    result = helper.send_window_input(
+        ":1", prepared, timing=helper._validate_window_input_timing(settle_ms=0),
+        refresh_preflight=lambda: changed,
+    )
+
+    assert "fingerprint changed" in result["error"]
+    assert not any(name.startswith("XTest") for name, _ in calls)
+
+
+def test_window_input_checks_xtest_status_and_releases_failed_drag(monkeypatch) -> None:
+    helper = _load_helper_module()
+    calls = []
+
+    class FakeFunction:
+        def __init__(self, name, results=None):
+            self.name, self.results, self.argtypes, self.restype = name, list(results or [1]), None, None
+
+        def __call__(self, *args):
+            calls.append((self.name, args))
+            return self.results.pop(0) if self.results else 1
+
+    class FakeLibrary:
+        pass
+
+    xlib, xtst = FakeLibrary(), FakeLibrary()
+    for name in ("XCloseDisplay", "XFlush", "XRaiseWindow", "XSetInputFocus", "XSync"):
+        setattr(xlib, name, FakeFunction(name))
+    xlib.XOpenDisplay = FakeFunction("XOpenDisplay", [1234])
+    # Start motion succeeds, drag motion fails after button press; finally must release.
+    xtst.XTestFakeMotionEvent = FakeFunction("XTestFakeMotionEvent", [1, 0])
+    xtst.XTestFakeButtonEvent = FakeFunction("XTestFakeButtonEvent", [1, 1])
+    monkeypatch.setattr(helper.ctypes.util, "find_library", lambda name: name)
+    monkeypatch.setattr(helper.ctypes.cdll, "LoadLibrary", lambda name: xlib if name == "X11" else xtst)
+    prepared = helper.preflight_window_input(
+        _input_windows(), "0x4203583", "Explorer", "drag", 2, 3, 1, 4, 5, _input_info(),
+    )
+
+    result = helper.send_window_input(
+        ":1", prepared, timing=helper._validate_window_input_timing(settle_ms=0),
+    )
+
+    assert "XTestFakeMotionEvent returned failure" in result["error"]
+    button_events = [args for name, args in calls if name == "XTestFakeButtonEvent"]
+    assert button_events[-1][2] is False
+
+
+def test_window_input_postconditions_are_explicit() -> None:
+    helper = _load_helper_module()
+    before = {"found": True, "mapped": True, "fingerprint": {"title": "Layout"}}
+    after = {"found": False, "mapped": False}
+
+    assert helper._evaluate_window_input_postcondition("unmapped", before, after)["passed"] is True
+    assert helper._evaluate_window_input_postcondition("still-mapped", before, after)["passed"] is False
+    with pytest.raises(ValueError, match="post-expect-title"):
+        helper._evaluate_window_input_postcondition("title-contains", before, before)
+
+
+def test_window_input_reports_sent_but_unverified_postcondition(monkeypatch) -> None:
+    helper = _load_helper_module()
+    monkeypatch.setattr(helper, "discover_windows", lambda display: _input_windows())
+    monkeypatch.setattr(helper, "_read_window_info", lambda window_id: _input_info())
+    monkeypatch.setattr(
+        helper, "send_window_input",
+        lambda display, prepared, **kwargs: dict(prepared, sent=True),
+    )
+    monkeypatch.setattr(
+        helper, "_capture_window_input_state",
+        lambda display, window_id: {"found": False, "window_id": window_id},
+    )
+
+    result = helper.window_input(
+        ":1", "0x4203583", "Explorer", "click", 2, 3, postcondition="still-mapped",
+    )
+
+    assert result["sent"] is True
+    assert result["verified"] is False
+    assert result["postcondition"] == {"requested": "still-mapped", "passed": False}
+    assert result["error"] == "window-input postcondition failed"
+
+
+def test_x11_wrapper_builds_live_window_input_command(monkeypatch) -> None:
+    monkeypatch.setattr(x11, "load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.remote_paths.load_vb_env", lambda: None)
+    monkeypatch.delenv("VB_REMOTE_SCRATCH_ROOT", raising=False)
+    monkeypatch.setenv("VB_CLIENT_ID", "90590")
+    runner = _Runner({"--window-input": '{"sent":true,"action":"click"}\n'})
+
+    result = x11.window_input(
+        runner, "designer", "0x4203583", expect_title="ADE Explorer", action="click",
+        x=20, y=30, button=1, allow_live=True,
+    )
+
+    assert result == [{"sent": True, "action": "click"}]
+    command = next(cmd for cmd in runner.commands if "--window-input" in cmd)
+    assert "--window-input 0x4203583" in command
+    assert "--expect-title 'ADE Explorer'" in command
+    assert "--action click --x 20 --y 30 --button 1" in command
+    assert "--settle-ms 50 --hold-ms 0 --drag-duration-ms 0 --drag-steps 1" in command
+    assert "--allow-live" in command
+
+
+def test_x11_wrapper_refuses_window_input_without_live_acknowledgement(monkeypatch) -> None:
+    monkeypatch.setattr(x11, "load_vb_env", lambda: None)
+    runner = _Runner({})
+
+    result = x11.window_input(
+        runner, "designer", "0x4203583", expect_title="ADE", action="move", x=1, y=1,
+    )
+
+    assert result == [{"error": "--allow-live is required"}]
+    assert runner.commands == []
+
+
+def test_x11_wrapper_allows_dry_run_without_live_acknowledgement(monkeypatch) -> None:
+    monkeypatch.setattr(x11, "load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.remote_paths.load_vb_env", lambda: None)
+    monkeypatch.delenv("VB_REMOTE_SCRATCH_ROOT", raising=False)
+    monkeypatch.setenv("VB_CLIENT_ID", "90590")
+    runner = _Runner({"--window-input": '{"sent":false,"dry_run":true}\n'})
+
+    result = x11.window_input(
+        runner, "designer", "0x4203583", expect_title="ADE", action="move", x=1, y=1,
+        dry_run=True, postcondition="still-mapped",
+    )
+
+    assert result == [{"sent": False, "dry_run": True}]
+    command = next(cmd for cmd in runner.commands if "--window-input" in cmd)
+    assert "--dry-run" in command
+    assert "--allow-live" not in command
+    assert "--postcondition still-mapped" in command
+
+
+def test_window_input_cli_parser_dispatches_only_with_live_acknowledgement(monkeypatch) -> None:
+    calls = []
+
+    def fake_window_input(**kwargs):
+        calls.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "cli_window_input", fake_window_input)
+    assert cli.main([
+        "window-input", "0x4203583", "--expect-title", "ADE", "--action", "move",
+        "--x", "20", "--y", "30", "--allow-live",
+    ]) == 0
+    assert calls == [{
+        "window_id": "0x4203583", "expect_title": "ADE", "action": "move",
+        "x": 20, "y": 30, "button": 1, "to_x": None, "to_y": None, "allow_live": True,
+        "dry_run": False, "settle_ms": 50, "hold_ms": 0,
+        "drag_duration_ms": 0, "drag_steps": 1, "postcondition": "none",
+        "post_expect_title": None,
+    }]
+    assert cli.main([
+        "window-input", "0x4203583", "--expect-title", "ADE", "--action", "move",
+        "--x", "20", "--y", "30", "--dry-run", "--postcondition", "still-mapped",
+    ]) == 0
+    assert calls[-1]["dry_run"] is True
+    assert calls[-1]["allow_live"] is False
+    assert calls[-1]["postcondition"] == "still-mapped"
 
 
 def test_make_ssh_runner_skips_ssh_for_localhost(monkeypatch) -> None:

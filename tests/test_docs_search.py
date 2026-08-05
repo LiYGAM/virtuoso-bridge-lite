@@ -4,9 +4,12 @@ import gzip
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 import virtuoso_bridge
 from virtuoso_bridge.cli import main
@@ -249,6 +252,7 @@ class _RemoteDocsTunnel:
         self._ssh_runner = runner
 
 
+@pytest.mark.posix
 def test_client_search_docs_builds_remote_index_from_metadata(tmp_path: Path) -> None:
     remote_root = Path("/cad/ic/doc")
     downloaded_tree = tmp_path / "remote-docs"
@@ -470,6 +474,8 @@ def test_client_search_docs_deduplicates_topic_and_document_hits(tmp_path: Path)
     assert locations == ["skdfref/dbOpenCellViewByType.html"]
 
 
+@pytest.mark.posix
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
 def test_remote_doc_index_command_extracts_records(tmp_path: Path) -> None:
     doc_root = tmp_path / "doc"
     html_path = doc_root / "skdfref" / "dbOpenCellViewByType.html"
@@ -508,6 +514,8 @@ def test_remote_doc_index_command_extracts_records(tmp_path: Path) -> None:
     assert records[0]["relative_path"] == "skdfref/dbOpenCellViewByType.html"
 
 
+@pytest.mark.posix
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
 def test_remote_doc_index_command_skips_broken_cadence_python(tmp_path: Path) -> None:
     install_root = tmp_path / "IC618"
     doc_root = install_root / "doc"

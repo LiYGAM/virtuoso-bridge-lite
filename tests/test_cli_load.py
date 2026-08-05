@@ -16,9 +16,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import virtuoso_bridge
 from virtuoso_bridge.cli import main
-from virtuoso_bridge.models import ExecutionStatus, VirtuosoResult
+from virtuoso_bridge.models import ExecutionStatus, OperationClass, VirtuosoResult
+
+pytestmark = pytest.mark.unit
 
 
 class _FakeClient:
@@ -26,10 +30,12 @@ class _FakeClient:
         self._result = result
 
     def load_il(self, path, timeout=None):
+        self.last_path = path
+        self.last_timeout = timeout
         return self._result
 
 
-def _patch_client(monkeypatch, result: VirtuosoResult) -> None:
+def _patch_client(monkeypatch, result: VirtuosoResult) -> _FakeClient:
     """Replace ``VirtuosoClient.from_env`` with a stub yielding *result*.
 
     Also silences ``_load_cli_env`` so .env auto-discovery doesn't
@@ -44,6 +50,7 @@ def _patch_client(monkeypatch, result: VirtuosoResult) -> None:
 
     monkeypatch.setattr(virtuoso_bridge, "VirtuosoClient", _FakeVirtuosoClient)
     monkeypatch.setattr("virtuoso_bridge.cli._load_cli_env", lambda: None)
+    return fake
 
 
 def test_load_missing_file_returns_2(tmp_path, capsys):
@@ -74,6 +81,22 @@ def test_load_success_emits_json_and_exits_0(tmp_path, capsys, monkeypatch):
     assert parsed["status"] == "success"
     assert parsed["errors"] == []
     assert parsed["metadata"]["skill_command"].startswith("load(")
+
+
+def test_load_result_preserves_mutating_operation_class(tmp_path, capsys, monkeypatch):
+    f = tmp_path / "ok.il"
+    f.write_text("1\n")
+    fake_result = VirtuosoResult(
+        status=ExecutionStatus.SUCCESS,
+        output="t",
+        operation_class=OperationClass.MUTATING,
+    )
+    _patch_client(monkeypatch, fake_result)
+
+    rc = main(["load", str(f)])
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["operation_class"] == "mutating"
 
 
 def test_load_skill_error_emits_json_and_exits_1(tmp_path, capsys, monkeypatch):

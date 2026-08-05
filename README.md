@@ -152,6 +152,8 @@ All commands take `-p PROFILE` / `--env PATH` to pick a non-default config; run 
 | `dismiss-dialog` | X11 path: find and dismiss blocking GUI dialogs (saves you when SKILL channel deadlocks on a modal) |
 | `list-windows [--json]` | X11 path: enumerate Virtuoso-related windows, including frame/child IDs and suggested modal actions |
 | `dismiss-window WINDOW_ID [--action enter\|escape\|alt-y\|alt-n]` | X11 path: send an explicit action to one window ID returned by `list-windows` |
+| `window-input WINDOW_ID --expect-title TEXT --action move\|click\|drag --x X --y Y --allow-live` | X11 path: send one bounds-checked pointer action to an explicitly confirmed current child window |
+| `request-status [REQUEST_ID]` | Read the daemon's request ledger over SSH/local filesystem without using the CIW request channel |
 | `snapshot [-o DIR] [--history H]` | Dump the focused Virtuoso window (maestro/schematic/...) — brief by default, full disk dump with `-o` |
 | **Export** | |
 | `export-visio LIB CELL -o OUT.vsdx` | Render a Virtuoso schematic to Microsoft Visio (Windows + pywin32) |
@@ -159,6 +161,34 @@ All commands take `-p PROFILE` / `--env PATH` to pick a non-default config; run 
 | `skill-find <query>` | Search SKILL functions by name (fuzzy/prefix/suffix/exact/regex) |
 | `skill-info <fn>` | Get detailed More Info docs for a SKILL function |
 | `doc-search <query>` | Search installed Cadence documentation through the active bridge, or pass `--doc-root` for local/offline search |
+
+`window-input` is intentionally excluded from unattended/default tests. Use
+`--dry-run` to validate discovery, fingerprint, bounds, and coordinates without
+loading XTest or emitting an event. Live input requires `--allow-live`. The
+helper focuses and synchronizes the target, re-discovers it immediately before
+input, checks every XTest call, and records before/after state. Use
+`--postcondition still-mapped|unmapped|same-fingerprint|title-contains` when an
+action needs a verifiable UI outcome. Timing controls are available through
+`--settle-ms`, `--hold-ms`, `--drag-duration-ms`, and `--drag-steps`.
+
+## Request security and machine output
+
+Generated setups bind the CIW daemon to `127.0.0.1` by default and provision a
+per-profile authentication token outside repository state. Remote exposure is
+available only through the explicit `start --allow-remote-bind` or
+`restart --allow-remote-bind` opt-in. The remote work directory is mode 700 and
+its token file is mode 600.
+
+Every protocol-v2 SKILL request carries a UUID, operation class, and token. The
+daemon keeps a bounded, atomic status ledger without storing SKILL source or
+the token. Reusing an ID with different content is rejected; same-daemon
+duplicates replay the cached response, while post-restart duplicates are
+rejected when an exact response is no longer available. Query a timeout without
+occupying the CIW channel with `request-status REQUEST_ID`.
+
+Prefix any command with `--json-envelope` to emit one stable JSON object with
+command/profile, timestamps, exit status, normalized data, errors, warnings,
+and evidence links. Existing command-specific JSON output remains supported.
 
 ## Snapshot a maestro run
 

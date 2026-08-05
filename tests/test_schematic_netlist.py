@@ -188,6 +188,7 @@ def test_schematic_import_netlist_skill_rejects_same_target_views() -> None:
     assert 'when("schematic" == "schematic" error("netlist and schematic views must differ"))' in skill
 
 
+@pytest.mark.posix
 def test_import_netlist_schematic_runs_spicein_outside_skill(monkeypatch, tmp_path) -> None:
     work_dir = tmp_path / "virtuoso"
     work_dir.mkdir()
@@ -323,6 +324,7 @@ def test_import_netlist_schematic_rejects_missing_local_input(tmp_path) -> None:
         )
 
 
+@pytest.mark.posix
 def test_import_netlist_schematic_uses_unique_default_run_dirs(monkeypatch, tmp_path) -> None:
     work_dir = tmp_path / "virtuoso"
     work_dir.mkdir()
@@ -770,6 +772,7 @@ def test_export_schematic_netlist_rejects_relative_source_path(tmp_path) -> None
         export_schematic_netlist(Client(), "demoLib", "tb_inv", tmp_path / "netlist")
 
 
+@pytest.mark.posix
 def test_export_schematic_netlist_rejects_local_output_nested_under_source_dir(tmp_path) -> None:
     from virtuoso_bridge import VirtuosoClient
 

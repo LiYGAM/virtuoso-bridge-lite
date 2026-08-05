@@ -12,7 +12,9 @@ except Exception:
 from virtuoso_bridge.virtuoso.basic.bridge import VirtuosoClient
 from virtuoso_bridge.transport.tunnel import SSHClient
 from virtuoso_bridge.models import (
+    CompletionStatus,
     ExecutionStatus,
+    OperationClass,
     SimulationResult,
     SkillResult,
     VirtuosoResult,
@@ -34,6 +36,8 @@ __all__ = [
     "SanitizingClient",
     "VirtuosoResult",
     "ExecutionStatus",
+    "OperationClass",
+    "CompletionStatus",
     "SkillResult",
     "SimulationResult",
     "resolve_profile",

@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 
 RESOURCE_DIR = (
     Path(__file__).parents[1]
@@ -107,3 +109,20 @@ def test_watchdog_marks_timeout_without_signaling_virtuoso(filename: str) -> Non
     namespace["watchdog_callback"]()
 
     assert namespace["timeout_flag"] is True
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["ramic_bridge_daemon_3.py", "ramic_bridge_daemon_27.py"],
+)
+def test_watchdog_records_request_ledger_state(filename: str) -> None:
+    namespace = _load_watchdog(filename)
+    recorded: list[tuple[str, str]] = []
+    namespace["current_request_id"] = "req-timeout"
+    namespace["_record_request"] = lambda request_id, state: recorded.append(
+        (request_id, state)
+    )
+
+    namespace["watchdog_callback"]()
+
+    assert recorded == [("req-timeout", "timed_out_pending")]

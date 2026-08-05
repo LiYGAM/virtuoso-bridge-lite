@@ -8,7 +8,10 @@ import json
 import threading
 import time
 import errno
+import hashlib
+import hmac
 import traceback
+import uuid
 
 # Counters surfaced to the SKILL monitor via stderr [RB-stat] lines.
 # Throttled to ~1 Hz so heavy traffic doesn't flood stderr.
@@ -53,8 +56,125 @@ def _fcntl_or_die(*args):
 
 HOST = sys.argv[1]
 PORT = int(sys.argv[2])
+AUTH_TOKEN_FILE = sys.argv[3] if len(sys.argv) > 3 else ""
+REQUEST_STATE_FILE = sys.argv[4] if len(sys.argv) > 4 else ""
+PROFILE = sys.argv[5] if len(sys.argv) > 5 else ""
+
+
+def _read_secret(path):
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except (OSError, IOError):
+        return ""
+
+
+AUTH_TOKEN = _read_secret(AUTH_TOKEN_FILE)
+DAEMON_EPOCH = uuid.uuid4().hex
+_REQUESTS = {}
+_REQUEST_ORDER = []
+_RESPONSE_CACHE = {}
+_STATE_LOCK = threading.Lock()
+_ACTIVE_REQUEST_ID = None
+_MAX_REQUESTS = 64
+
+
+def _load_request_history():
+    if not REQUEST_STATE_FILE:
+        return
+    try:
+        with open(REQUEST_STATE_FILE, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return
+    for entry in payload.get("requests", [])[-_MAX_REQUESTS:]:
+        request_id = str(entry.get("request_id") or "")
+        if not request_id:
+            continue
+        restored = dict(entry)
+        restored["restored_from_daemon_epoch"] = payload.get("daemon_epoch")
+        if restored.get("state") in ("running", "timed_out_pending"):
+            restored["state"] = "orphaned_unknown_after_daemon_restart"
+        _REQUESTS[request_id] = restored
+        _REQUEST_ORDER.append(request_id)
+
+
+_load_request_history()
+
+
+def _safe_token_equal(left, right):
+    try:
+        return hmac.compare_digest(str(left), str(right))
+    except (AttributeError, TypeError):
+        left = str(left)
+        right = str(right)
+        if len(left) != len(right):
+            return False
+        result = 0
+        for a, b in zip(bytearray(left.encode("utf-8")), bytearray(right.encode("utf-8"))):
+            result |= a ^ b
+        return result == 0
+
+
+def _write_request_state():
+    if not REQUEST_STATE_FILE:
+        return
+    payload = {
+        "schema_version": 1,
+        "protocol_version": 2,
+        "daemon_epoch": DAEMON_EPOCH,
+        "daemon_pid": os.getpid(),
+        "bind_host": HOST,
+        "port": PORT,
+        "profile": PROFILE or None,
+        "auth_enabled": bool(AUTH_TOKEN),
+        "active_request_id": _ACTIVE_REQUEST_ID,
+        "updated_at_epoch": time.time(),
+        "requests": [_REQUESTS[key] for key in _REQUEST_ORDER if key in _REQUESTS],
+    }
+    directory = os.path.dirname(REQUEST_STATE_FILE)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory, 0o700)
+    tmp_path = "%s.tmp.%d" % (REQUEST_STATE_FILE, os.getpid())
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, REQUEST_STATE_FILE)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _record_request(request_id, state, **fields):
+    global _ACTIVE_REQUEST_ID
+    if not request_id:
+        return
+    with _STATE_LOCK:
+        entry = dict(_REQUESTS.get(request_id) or {"request_id": request_id})
+        entry.update(fields)
+        entry["state"] = state
+        entry["updated_at_epoch"] = time.time()
+        _REQUESTS[request_id] = entry
+        if request_id in _REQUEST_ORDER:
+            _REQUEST_ORDER.remove(request_id)
+        _REQUEST_ORDER.append(request_id)
+        while len(_REQUEST_ORDER) > _MAX_REQUESTS:
+            expired = _REQUEST_ORDER.pop(0)
+            _REQUESTS.pop(expired, None)
+            _RESPONSE_CACHE.pop(expired, None)
+        _ACTIVE_REQUEST_ID = request_id if state in ("running", "timed_out_pending") else None
+        _write_request_state()
 
 timeout_flag = False
+current_request_id = None
 
 # Get Virtuoso's PID (grandparent: virtuoso -> sh -> this daemon)
 def get_grandparent_pid():
@@ -108,6 +228,9 @@ def watchdog_callback():
     global timeout_flag
     if not timeout_flag:
         timeout_flag = True
+        request_id = globals().get("current_request_id")
+        if request_id and "_record_request" in globals():
+            _record_request(request_id, "timed_out_pending")
 
 def read_until_delimiter(start_ok=0x02, start_err=0x15, end=0x1e):
     """Read one complete response, even after the request watchdog expires.
@@ -155,7 +278,8 @@ def read_until_delimiter(start_ok=0x02, start_err=0x15, end=0x1e):
     return result
 
 def handle_external_connection(conn, addr):
-    global watchdog_timer, timeout_flag
+    global watchdog_timer, timeout_flag, current_request_id
+    request_id = ""
 
     try:
         chunks = []
@@ -169,6 +293,41 @@ def handle_external_connection(conn, addr):
 
         skill_code = request_data["skill"]
         timeout_seconds = request_data["timeout"]
+        request_id = str(request_data.get("request_id") or "")
+        operation_class = str(request_data.get("operation_class") or "unknown")
+        protocol_version = int(request_data.get("protocol_version") or 1)
+        supplied_token = request_data.get("auth_token") or ""
+        if AUTH_TOKEN and not _safe_token_equal(supplied_token, AUTH_TOKEN):
+            _safe_sendall(conn, b"\x15AUTH_REQUIRED")
+            return
+        if protocol_version != 2 or not request_id:
+            _safe_sendall(conn, b"\x15PROTOCOL_V2_REQUIRED")
+            return
+        request_digest = hashlib.sha256(
+            (operation_class + "\x00" + skill_code).encode("utf-8")
+        ).hexdigest()
+        previous = _REQUESTS.get(request_id)
+        if previous and previous.get("request_digest_sha256") != request_digest:
+            _safe_sendall(conn, b"\x15REQUEST_ID_CONFLICT")
+            return
+        if request_id in _RESPONSE_CACHE:
+            _record_request(request_id, "duplicate_replayed", duplicate=True)
+            _safe_sendall(conn, _RESPONSE_CACHE[request_id])
+            return
+        if previous:
+            _record_request(request_id, "duplicate_rejected_no_cached_response", duplicate=True)
+            _safe_sendall(conn, b"\x15REQUEST_ALREADY_SEEN_NO_CACHED_RESPONSE")
+            return
+
+        current_request_id = request_id
+        _record_request(
+            request_id,
+            "running",
+            operation_class=operation_class,
+            request_digest_sha256=request_digest,
+            started_at_epoch=time.time(),
+            protocol_version=protocol_version,
+        )
 
         timeout_flag = False
 
@@ -205,10 +364,27 @@ def handle_external_connection(conn, addr):
         watchdog_timer.start()
 
         returnData = read_until_delimiter()
+        was_timed_out = timeout_flag
 
         if not timeout_flag:
             timeout_flag = True
         watchdog_timer.cancel()
+
+        response_digest = hashlib.sha256(bytes(returnData)).hexdigest()
+        marker = "STX" if returnData[:1] == b"\x02" else "NAK"
+        final_state = (
+            "completed_after_timeout_unknown"
+            if was_timed_out
+            else ("succeeded" if marker == "STX" else "failed")
+        )
+        _RESPONSE_CACHE[request_id] = bytes(returnData)
+        _record_request(
+            request_id,
+            final_state,
+            finished_at_epoch=time.time(),
+            response_marker=marker,
+            response_digest_sha256=response_digest,
+        )
 
         _safe_sendall(conn, returnData)
 
@@ -232,14 +408,21 @@ def handle_external_connection(conn, addr):
         _safe_sendall(conn, f"\x15JSONDecodeError: {e}".encode("utf-8"))
     except Exception as e:
         traceback.print_exc()
+        if request_id and request_id in _REQUESTS:
+            _record_request(request_id, "failed_internal", finished_at_epoch=time.time())
         _safe_sendall(conn, f"\x15{e}".encode("utf-8"))
     finally:
+        current_request_id = None
         timeout_flag = True
         if watchdog_timer:
             watchdog_timer.cancel()
         _safe_close_connection(conn)
 
 def start_server():
+    if AUTH_TOKEN_FILE and not AUTH_TOKEN:
+        sys.stderr.write("ERROR: daemon auth token file is missing or empty.\n")
+        sys.exit(2)
+    _write_request_state()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:

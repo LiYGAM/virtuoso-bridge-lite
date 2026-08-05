@@ -31,6 +31,11 @@ from virtuoso_bridge.virtuoso.layout.streamout import (
 from virtuoso_bridge.virtuoso.layout.xstream import XStreamLogResult
 
 
+# XStream runs on the Virtuoso host and exercises POSIX shell, permission,
+# symlink, and atomic-publication semantics throughout this module.
+pytestmark = pytest.mark.posix
+
+
 _GDS_EXPORT_RESULT_FIELDS = (
     "status",
     "reason",

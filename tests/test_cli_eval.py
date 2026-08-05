@@ -16,9 +16,18 @@ from __future__ import annotations
 import io
 import json
 
+import pytest
+
 import virtuoso_bridge
 from virtuoso_bridge.cli import main
-from virtuoso_bridge.models import ExecutionStatus, VirtuosoResult
+from virtuoso_bridge.models import (
+    CompletionStatus,
+    ExecutionStatus,
+    OperationClass,
+    VirtuosoResult,
+)
+
+pytestmark = pytest.mark.unit
 
 
 class _FakeClient:
@@ -26,10 +35,12 @@ class _FakeClient:
         self._result = result
         self.last_skill: str | None = None
         self.last_timeout: int | None = None
+        self.last_operation_class: OperationClass | None = None
 
-    def execute_skill(self, skill_code: str, timeout=None):
+    def execute_skill(self, skill_code: str, timeout=None, operation_class=None):
         self.last_skill = skill_code
         self.last_timeout = timeout
+        self.last_operation_class = operation_class
         return self._result
 
 
@@ -77,6 +88,8 @@ def test_eval_argv_success_emits_json_and_exits_0(capsys, monkeypatch):
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["status"] == "success"
     assert parsed["output"] == "2"
+    assert parsed["operation_class"] == "unknown"
+    assert parsed["completion"] == CompletionStatus.CONFIRMED.value
     assert "1+1" in fake.last_skill
 
 
@@ -129,6 +142,26 @@ def test_eval_passes_timeout(monkeypatch):
     rc = main(["eval", "1+1", "--timeout", "120", "--quiet"])
     assert rc == 0
     assert fake.last_timeout == 120
+
+
+def test_eval_defaults_operation_class_to_unknown(monkeypatch):
+    fake_result = VirtuosoResult(status=ExecutionStatus.SUCCESS, output="t")
+    fake = _patch_client(monkeypatch, fake_result)
+
+    rc = main(["eval", "1+1", "--quiet"])
+
+    assert rc == 0
+    assert fake.last_operation_class == OperationClass.UNKNOWN
+
+
+def test_eval_passes_explicit_operation_class(monkeypatch):
+    fake_result = VirtuosoResult(status=ExecutionStatus.SUCCESS, output="t")
+    fake = _patch_client(monkeypatch, fake_result)
+
+    rc = main(["eval", "dbSave(cv)", "--operation-class", "mutating", "--quiet"])
+
+    assert rc == 0
+    assert fake.last_operation_class == OperationClass.MUTATING
 
 
 def test_eval_wraps_in_progn_for_multi_statement(monkeypatch):

@@ -148,6 +148,389 @@ def _read_window_info(win_id):
     return {"geometry": geometry, "mapped": mapped}
 
 
+WINDOW_INPUT_ACTIONS = ("move", "click", "drag")
+WINDOW_INPUT_POSTCONDITIONS = (
+    "none", "still-mapped", "unmapped", "same-fingerprint", "title-contains",
+)
+_WINDOW_INPUT_MAX_DELAY_MS = 5000
+_WINDOW_INPUT_MAX_DRAG_STEPS = 100
+
+
+def _input_child_candidate(windows, window_id):
+    """Return a currently discovered child candidate, never its WM frame."""
+    for candidate in windows or []:
+        child_id = candidate.get("dismiss_id") or candidate.get("window_id")
+        if child_id == candidate.get("frame_id"):
+            continue
+        if child_id == window_id:
+            return candidate
+    return None
+
+
+def _input_fingerprint(candidate):
+    """Return the stable identity fields that guard a reused X11 id."""
+    return {
+        "window_id": candidate.get("dismiss_id") or candidate.get("window_id"),
+        "frame_id": candidate.get("frame_id"),
+        "title": candidate.get("title") or "",
+        "class": list(candidate.get("class") or []),
+    }
+
+
+def _capture_window_input_state(display, window_id):
+    """Capture a fresh discovery plus exact child xwininfo state."""
+    windows = discover_windows(display)
+    candidate = _input_child_candidate(windows, window_id)
+    if candidate is None:
+        return {"found": False, "window_id": window_id}
+    info = _read_window_info(window_id)
+    return {
+        "found": True,
+        "fingerprint": _input_fingerprint(candidate),
+        "mapped": bool(info.get("mapped", False)),
+        "geometry": info.get("geometry") or {},
+    }
+
+
+def _prepared_window_input_state(prepared):
+    return {
+        "found": True,
+        "fingerprint": prepared["fingerprint"],
+        "mapped": True,
+        "geometry": dict(prepared["geometry"]),
+    }
+
+
+def _validate_window_input_timing(settle_ms=50, hold_ms=0,
+                                  drag_duration_ms=0, drag_steps=1):
+    """Normalize bounded timing knobs without changing the default behavior."""
+    values = {
+        "settle_ms": settle_ms,
+        "hold_ms": hold_ms,
+        "drag_duration_ms": drag_duration_ms,
+        "drag_steps": drag_steps,
+    }
+    try:
+        for key in values:
+            values[key] = int(values[key])
+    except (TypeError, ValueError):
+        raise ValueError("window-input timing values must be integers")
+    for key in ("settle_ms", "hold_ms", "drag_duration_ms"):
+        if values[key] < 0 or values[key] > _WINDOW_INPUT_MAX_DELAY_MS:
+            raise ValueError("%s must be from 0 to %d" % (key, _WINDOW_INPUT_MAX_DELAY_MS))
+    if values["drag_steps"] < 1 or values["drag_steps"] > _WINDOW_INPUT_MAX_DRAG_STEPS:
+        raise ValueError("drag_steps must be from 1 to %d" % _WINDOW_INPUT_MAX_DRAG_STEPS)
+    return values
+
+
+def preflight_window_input(windows, window_id, expect_title, action, x, y,
+                           button=1, to_x=None, to_y=None, window_info=None):
+    """Validate a pointer operation without opening X11 or emitting events.
+
+    ``windows`` must be a freshly discovered list from :func:`discover_windows`
+    and ``window_info`` must be a fresh exact-target ``xwininfo`` response.
+    This deliberately does not accept a WM frame id or cached geometry.
+    """
+    if not expect_title:
+        raise ValueError("--expect-title is required")
+    if action not in WINDOW_INPUT_ACTIONS:
+        raise ValueError("unsupported action: %s" % action)
+    try:
+        button = int(button)
+    except (TypeError, ValueError):
+        raise ValueError("button must be an integer from 1 to 3")
+    if button not in (1, 2, 3):
+        raise ValueError("button must be from 1 to 3")
+    try:
+        x, y = int(x), int(y)
+    except (TypeError, ValueError):
+        raise ValueError("x and y must be integers")
+
+    target = _input_child_candidate(windows, window_id)
+    if target is None:
+        raise ValueError("window id is not a currently discovered Virtuoso child: %s" % window_id)
+
+    title = target.get("title") or ""
+    if expect_title not in title:
+        raise ValueError("window title does not contain expected text")
+
+    info = window_info or {}
+    if not info.get("mapped", False):
+        raise ValueError("target window is not mapped/viewable")
+    geometry = info.get("geometry") or {}
+    try:
+        root_x = int(geometry["x"])
+        root_y = int(geometry["y"])
+        width = int(geometry["w"])
+        height = int(geometry["h"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("target window has incomplete current geometry")
+    if width <= 0 or height <= 0:
+        raise ValueError("target window has invalid current geometry")
+
+    if action == "drag":
+        if to_x is None or to_y is None:
+            raise ValueError("drag requires both --to-x and --to-y")
+        try:
+            to_x, to_y = int(to_x), int(to_y)
+        except (TypeError, ValueError):
+            raise ValueError("drag endpoint must be integer coordinates")
+    elif to_x is not None or to_y is not None:
+        raise ValueError("--to-x and --to-y are only valid for drag")
+
+    points = [("x/y", x, y)]
+    if action == "drag":
+        points.append(("to-x/to-y", to_x, to_y))
+    for label, point_x, point_y in points:
+        if point_x < 0 or point_x >= width or point_y < 0 or point_y >= height:
+            raise ValueError("%s is outside current target bounds" % label)
+
+    prepared = {
+        "window_id": window_id,
+        "fingerprint": _input_fingerprint(target),
+        "title": title,
+        "action": action,
+        "button": button,
+        "geometry": {"x": root_x, "y": root_y, "w": width, "h": height},
+        "relative": {"x": x, "y": y},
+        "root": {"x": root_x + x, "y": root_y + y},
+    }
+    if action == "drag":
+        prepared["relative"].update({"to_x": to_x, "to_y": to_y})
+        prepared["root"].update({"to_x": root_x + to_x, "to_y": root_y + to_y})
+    return prepared
+
+
+def build_window_input_events(prepared):
+    """Return the XTest event sequence for a validated pointer operation."""
+    root = prepared["root"]
+    action = prepared["action"]
+    button = prepared["button"]
+    events = [("motion", root["x"], root["y"])]
+    if action == "click":
+        events.extend([("button", button, True), ("button", button, False)])
+    elif action == "drag":
+        events.extend([
+            ("button", button, True),
+            ("motion", root["to_x"], root["to_y"]),
+            ("button", button, False),
+        ])
+    return events
+
+
+def build_window_input_schedule(prepared, timing):
+    """Return event/sleep steps for a validated pointer operation."""
+    action = prepared["action"]
+    button = prepared["button"]
+    root = prepared["root"]
+    schedule = [("event", ("motion", root["x"], root["y"]))]
+    if action == "move":
+        return schedule
+    schedule.append(("event", ("button", button, True)))
+    if timing["hold_ms"]:
+        schedule.append(("sleep", timing["hold_ms"]))
+    if action == "drag":
+        steps = timing["drag_steps"]
+        start_x, start_y = root["x"], root["y"]
+        end_x, end_y = root["to_x"], root["to_y"]
+        for step in range(1, steps + 1):
+            if timing["drag_duration_ms"]:
+                schedule.append(("sleep", float(timing["drag_duration_ms"]) / steps))
+            schedule.append(("event", (
+                "motion",
+                start_x + ((end_x - start_x) * step // steps),
+                start_y + ((end_y - start_y) * step // steps),
+            )))
+    schedule.append(("event", ("button", button, False)))
+    return schedule
+
+
+def _configure_pointer_x11(xlib, xtst):
+    """Declare ctypes signatures used by window-input XTest calls."""
+    xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    xlib.XOpenDisplay.restype = ctypes.c_void_p
+    xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    xlib.XFlush.argtypes = [ctypes.c_void_p]
+    xlib.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    xlib.XSetInputFocus.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong,
+    ]
+    xlib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    xlib.XSync.restype = ctypes.c_int
+    xtst.XTestFakeMotionEvent.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong,
+    ]
+    xtst.XTestFakeMotionEvent.restype = ctypes.c_int
+    xtst.XTestFakeButtonEvent.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong,
+    ]
+    xtst.XTestFakeButtonEvent.restype = ctypes.c_int
+
+
+def _xtest_or_raise(function, name, *args):
+    if not function(*args):
+        raise RuntimeError("%s returned failure" % name)
+
+
+def _sync_or_raise(xlib, dpy, phase):
+    if not xlib.XSync(dpy, False):
+        raise RuntimeError("XSync failed during %s" % phase)
+
+
+def send_window_input(display, prepared, timing=None, refresh_preflight=None,
+                      sleeper=None):
+    """Emit a preflighted XTest pointer sequence, releasing a held drag button."""
+    timing = timing or _validate_window_input_timing()
+    sleeper = sleeper or time.sleep
+    xlib_path = ctypes.util.find_library("X11")
+    xtst_path = ctypes.util.find_library("Xtst")
+    if not xlib_path or not xtst_path:
+        return {"error": "libX11 or libXtst not found"}
+    xlib = ctypes.cdll.LoadLibrary(xlib_path)
+    xtst = ctypes.cdll.LoadLibrary(xtst_path)
+    _configure_pointer_x11(xlib, xtst)
+    dpy = xlib.XOpenDisplay(None)
+    if not dpy:
+        return {"error": "cannot open display %s" % display}
+
+    pressed = False
+    released = False
+    try:
+        target_id = int(prepared["window_id"], 16) \
+            if prepared["window_id"].startswith("0x") \
+            else int(prepared["window_id"])
+        xlib.XRaiseWindow(dpy, target_id)
+        xlib.XSetInputFocus(dpy, target_id, 1, 0)  # RevertToParent
+        _sync_or_raise(xlib, dpy, "focus")
+        if refresh_preflight is not None:
+            refreshed = refresh_preflight()
+            if refreshed["fingerprint"] != prepared["fingerprint"]:
+                raise RuntimeError("target window fingerprint changed after focus")
+            prepared = refreshed
+        if timing["settle_ms"]:
+            sleeper(float(timing["settle_ms"]) / 1000.0)
+        for step in build_window_input_schedule(prepared, timing):
+            if step[0] == "sleep":
+                sleeper(float(step[1]) / 1000.0)
+                continue
+            event = step[1]
+            if event[0] == "motion":
+                _xtest_or_raise(
+                    xtst.XTestFakeMotionEvent, "XTestFakeMotionEvent",
+                    dpy, -1, event[1], event[2], 0,
+                )
+            else:
+                if event[2]:
+                    # Mark before the call: an exception may follow an accepted
+                    # X request, so finally must still attempt the release.
+                    pressed = True
+                _xtest_or_raise(
+                    xtst.XTestFakeButtonEvent, "XTestFakeButtonEvent",
+                    dpy, event[1], event[2], 0,
+                )
+                if not event[2]:
+                    released = True
+        _sync_or_raise(xlib, dpy, "input")
+    except Exception as exc:
+        return {"error": "XTest input failed: %s" % str(exc)}
+    finally:
+        if pressed and not released:
+            try:
+                xtst.XTestFakeButtonEvent(dpy, prepared["button"], False, 0)
+                xlib.XFlush(dpy)
+            except Exception:
+                pass
+        xlib.XCloseDisplay(dpy)
+    result = dict(prepared)
+    result["sent"] = True
+    result["timing"] = dict(timing)
+    result["sync"] = {"after_focus": True, "after_input": True}
+    return result
+
+
+def _evaluate_window_input_postcondition(postcondition, before, after,
+                                         post_expect_title=None):
+    if postcondition not in WINDOW_INPUT_POSTCONDITIONS:
+        raise ValueError("unsupported postcondition: %s" % postcondition)
+    if postcondition == "none":
+        return {"requested": postcondition, "passed": True}
+    if postcondition == "still-mapped":
+        passed = bool(after.get("found") and after.get("mapped"))
+    elif postcondition == "unmapped":
+        passed = not (after.get("found") and after.get("mapped"))
+    elif postcondition == "same-fingerprint":
+        passed = bool(after.get("found") and
+                      before.get("fingerprint") == after.get("fingerprint"))
+    else:
+        if not post_expect_title:
+            raise ValueError("title-contains requires --post-expect-title")
+        fingerprint = after.get("fingerprint") or {}
+        passed = bool(after.get("found") and
+                      post_expect_title in (fingerprint.get("title") or ""))
+    result = {"requested": postcondition, "passed": passed}
+    if postcondition == "title-contains":
+        result["expected_title"] = post_expect_title
+    return result
+
+
+def window_input(display, window_id, expect_title, action, x, y, button=1,
+                 to_x=None, to_y=None, dry_run=False, settle_ms=50,
+                 hold_ms=0, drag_duration_ms=0, drag_steps=1,
+                 postcondition="none", post_expect_title=None):
+    """Discover, refresh, bounds-check, then send one explicit pointer action."""
+    windows = discover_windows(display)
+    info = _read_window_info(window_id)
+    prepared = preflight_window_input(
+        windows, window_id, expect_title, action, x, y, button, to_x, to_y, info,
+    )
+    timing = _validate_window_input_timing(
+        settle_ms, hold_ms, drag_duration_ms, drag_steps,
+    )
+    if postcondition not in WINDOW_INPUT_POSTCONDITIONS:
+        raise ValueError("unsupported postcondition: %s" % postcondition)
+    if postcondition == "title-contains" and not post_expect_title:
+        raise ValueError("title-contains requires --post-expect-title")
+    state_before = _prepared_window_input_state(prepared)
+    if dry_run:
+        result = dict(prepared)
+        result.update({
+            "sent": False,
+            "dry_run": True,
+            "timing": timing,
+            "planned_events": build_window_input_events(prepared),
+            "state_before": state_before,
+            "state_after": None,
+            "postcondition": {"requested": postcondition, "passed": None},
+        })
+        return result
+
+    def refresh_preflight():
+        current_windows = discover_windows(display)
+        current_info = _read_window_info(window_id)
+        return preflight_window_input(
+            current_windows, window_id, expect_title, action, x, y, button,
+            to_x, to_y, current_info,
+        )
+
+    result = send_window_input(
+        display, prepared, timing=timing, refresh_preflight=refresh_preflight,
+    )
+    state_after = _capture_window_input_state(display, window_id)
+    result["state_before"] = state_before
+    result["state_after"] = state_after
+    if "error" not in result:
+        post = _evaluate_window_input_postcondition(
+            postcondition, state_before, state_after, post_expect_title,
+        )
+        result["postcondition"] = post
+        if not post["passed"]:
+            result["verified"] = False
+            result["error"] = "window-input postcondition failed"
+        else:
+            result["verified"] = True
+    return result
+
+
 def _root_frames():
     try:
         tree = subprocess.check_output(
@@ -561,6 +944,21 @@ def main():
     list_windows = False
     dismiss_target = None
     action = "enter"
+    input_target = None
+    expect_title = None
+    input_x = None
+    input_y = None
+    input_to_x = None
+    input_to_y = None
+    input_button = 1
+    allow_live = False
+    dry_run = False
+    settle_ms = 50
+    hold_ms = 0
+    drag_duration_ms = 0
+    drag_steps = 1
+    postcondition = "none"
+    post_expect_title = None
 
     i = 0
     while i < len(args):
@@ -580,6 +978,64 @@ def main():
                 sys.exit(2)
             action = args[i + 1]
             i += 1
+        elif args[i] == "--window-input":
+            if i + 1 >= len(args):
+                print(json.dumps({"error": "--window-input requires a window id"}))
+                sys.exit(2)
+            input_target = args[i + 1]
+            i += 1
+        elif args[i] == "--expect-title":
+            if i + 1 >= len(args):
+                print(json.dumps({"error": "--expect-title requires a value"}))
+                sys.exit(2)
+            expect_title = args[i + 1]
+            i += 1
+        elif args[i] in (
+                "--x", "--y", "--to-x", "--to-y", "--button", "--settle-ms",
+                "--hold-ms", "--drag-duration-ms", "--drag-steps"):
+            if i + 1 >= len(args):
+                print(json.dumps({"error": "%s requires an integer" % args[i]}))
+                sys.exit(2)
+            try:
+                value = int(args[i + 1])
+            except ValueError:
+                print(json.dumps({"error": "%s requires an integer" % args[i]}))
+                sys.exit(2)
+            if args[i] == "--x":
+                input_x = value
+            elif args[i] == "--y":
+                input_y = value
+            elif args[i] == "--to-x":
+                input_to_x = value
+            elif args[i] == "--to-y":
+                input_to_y = value
+            elif args[i] == "--settle-ms":
+                settle_ms = value
+            elif args[i] == "--hold-ms":
+                hold_ms = value
+            elif args[i] == "--drag-duration-ms":
+                drag_duration_ms = value
+            elif args[i] == "--drag-steps":
+                drag_steps = value
+            else:
+                input_button = value
+            i += 1
+        elif args[i] == "--postcondition":
+            if i + 1 >= len(args):
+                print(json.dumps({"error": "--postcondition requires a value"}))
+                sys.exit(2)
+            postcondition = args[i + 1]
+            i += 1
+        elif args[i] == "--post-expect-title":
+            if i + 1 >= len(args):
+                print(json.dumps({"error": "--post-expect-title requires a value"}))
+                sys.exit(2)
+            post_expect_title = args[i + 1]
+            i += 1
+        elif args[i] == "--allow-live":
+            allow_live = True
+        elif args[i] == "--dry-run":
+            dry_run = True
         elif args[i] == "--json":
             pass
         elif not args[i].startswith("-"):
@@ -601,6 +1057,23 @@ def main():
     # Without this, auto-detected DISPLAY stays a Python variable and
     # XOpenDisplay(None) returns NULL -> segfault.
     os.environ["DISPLAY"] = display
+
+    if input_target:
+        try:
+            if not dry_run and not allow_live:
+                raise ValueError("--allow-live is required")
+            if input_x is None or input_y is None:
+                raise ValueError("--window-input requires --x and --y")
+            result = window_input(
+                display, input_target, expect_title, action, input_x, input_y,
+                input_button, input_to_x, input_to_y, dry_run, settle_ms,
+                hold_ms, drag_duration_ms, drag_steps, postcondition,
+                post_expect_title,
+            )
+        except ValueError as exc:
+            result = {"error": str(exc), "window_id": input_target}
+        print(json.dumps(result))
+        sys.exit(1 if "error" in result else 0)
 
     if dismiss_target:
         result = dismiss_window(display, dismiss_target, action=action)

@@ -17,6 +17,23 @@ class ExecutionStatus(str, Enum):
     PARTIAL = "partial"
     ERROR = "error"
 
+
+class OperationClass(str, Enum):
+    """Safety classification supplied by the caller for a SKILL request."""
+
+    UNKNOWN = "unknown"
+    READ_ONLY = "read_only"
+    MUTATING = "mutating"
+
+
+class CompletionStatus(str, Enum):
+    """What the client can prove about a dispatched SKILL request."""
+
+    CONFIRMED = "confirmed"
+    NOT_DISPATCHED = "not_dispatched"
+    TIMED_OUT_UNKNOWN = "timed_out_unknown"
+
+
 class VirtuosoResult(BaseModel):
     """Result from executing a SKILL command in Virtuoso."""
 
@@ -26,6 +43,10 @@ class VirtuosoResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     execution_time: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    operation_class: OperationClass = OperationClass.UNKNOWN
+    completion: CompletionStatus = CompletionStatus.CONFIRMED
+    request_id: str | None = None
+    protocol_version: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -88,7 +109,13 @@ class VirtuosoInterface(ABC):
         """Ensure bridge is ready (remote setup, tunnel, daemon reachable)."""
 
     @abstractmethod
-    def execute_skill(self, skill_code: str, timeout: float = 30.0) -> VirtuosoResult:
+    def execute_skill(
+        self,
+        skill_code: str,
+        timeout: float = 30.0,
+        operation_class: OperationClass = OperationClass.UNKNOWN,
+        request_id: str | None = None,
+    ) -> VirtuosoResult:
         """Execute SKILL code in Virtuoso."""
 
     @abstractmethod

@@ -20,7 +20,15 @@ RBPort = if(getShellEnvVar("RB_PORT") then
             else
                 65432
             )                                                                      ; TCP port for client connections
-RBLocal = nil                                                                      ; Local-only connections (127.0.0.1 vs 0.0.0.0)
+RBBindHost = if(getShellEnvVar("RB_BIND_HOST") then
+                   getShellEnvVar("RB_BIND_HOST")
+               else
+                   "127.0.0.1"
+               )
+RBLocal = (RBBindHost == "127.0.0.1")                                             ; Loopback-only by default
+RBAuthTokenFile = if(getShellEnvVar("RB_AUTH_TOKEN_FILE") getShellEnvVar("RB_AUTH_TOKEN_FILE") "")
+RBRequestStateFile = if(getShellEnvVar("RB_REQUEST_STATE_FILE") getShellEnvVar("RB_REQUEST_STATE_FILE") "")
+RBProfile = if(getShellEnvVar("RB_PROFILE") getShellEnvVar("RB_PROFILE") "")
 RBEcho = nil                                                                     ; Echo bridging messages for debugging
 RBDLog = nil                                                                     ; Enable daemon logging to /tmp/RB.log
 
@@ -194,12 +202,9 @@ procedure(RBStart()
         RBStatErrors = 0
         RBStatUptime = 0
         prog((host logpath)
-            ; Determine host binding based on RBLocal setting
-            if(RBLocal then
-                host = "127.0.0.1"  ; Local-only connections
-            else
-                host = "0.0.0.0"   ; Accept connections from any IP
-            )
+            ; A generated setup pins RBBindHost.  Legacy/manual loads fall
+            ; back to the safe loopback default above.
+            host = RBBindHost
             ; Set log path if logging is enabled
             if(RBDLog then
                 logpath = "/tmp/RB.log"
@@ -210,11 +215,11 @@ procedure(RBStart()
             ; Use "env -u" to strip Virtuoso's LD_LIBRARY_PATH / LD_PRELOAD
             ; so the system Python links against its own libs, not Virtuoso's
             ; bundled (and often incompatible) copies.
-            RBIpc = ipcBeginProcess(sprintf(nil "/usr/bin/env -u LD_LIBRARY_PATH -u LD_PRELOAD stdbuf -oL %s -u %L %L %L" RBPython RBDPath host RBPort) "" 'RBIpcDataHandler 'RBIpcErrHandler 'RBIpcFinishHandler logpath)
+            RBIpc = ipcBeginProcess(sprintf(nil "/usr/bin/env -u LD_LIBRARY_PATH -u LD_PRELOAD stdbuf -oL %s -u %L %L %L %L %L %L" RBPython RBDPath host RBPort RBAuthTokenFile RBRequestStateFile RBProfile) "" 'RBIpcDataHandler 'RBIpcErrHandler 'RBIpcFinishHandler logpath)
         )
         printf("[RAMIC Bridge ipc=%L] launching daemon (bind=%s:%d) at (%s)\n"
             RBIpc
-            if(RBLocal "127.0.0.1" "0.0.0.0")
+            RBBindHost
             RBPort
             getCurrentTime())
     )
@@ -503,7 +508,7 @@ procedure(RBMRefresh()
             bind = if(RBLastBind && strlen(RBLastBind) > 0
                 RBLastBind
                 sprintf(nil "%s:%d"
-                    if(RBLocal "127.0.0.1" "0.0.0.0")
+                    RBBindHost
                     RBPort))
             ; Identity: "IP (hostname)" if both, else whichever
             hostStr = cond(
@@ -575,6 +580,7 @@ procedure(RBMApply()
 	prog((refresh)
 	unless(RBMonitor->RBMBolLocal->value == RBLocal
 		RBLocal = RBMonitor->RBMBolLocal->value
+		RBBindHost = if(RBLocal "127.0.0.1" "0.0.0.0")
 		refresh = t
 	)
 	unless(RBMonitor->RBMIntPort->value == RBPort

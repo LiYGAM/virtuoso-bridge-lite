@@ -18,10 +18,13 @@ from virtuoso_bridge.virtuoso.symbol import (
 )
 
 
-pytestmark = pytest.mark.skipif(
-    os.getenv("VB_RUN_LIVE_TESTS") != "1",
-    reason="set VB_RUN_LIVE_TESTS=1 to run against a live Virtuoso session",
-)
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(
+        os.getenv("VB_RUN_LIVE_TESTS") != "1",
+        reason="set VB_RUN_LIVE_TESTS=1 to run against a live Virtuoso session",
+    ),
+]
 
 
 def _semantic_labels(labels: list[dict[str, object]]) -> dict[str, dict[str, object]]:

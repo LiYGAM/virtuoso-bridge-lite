@@ -10,13 +10,20 @@ import re
 import socket
 import hashlib
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from virtuoso_bridge.env import load_vb_env
 from virtuoso_bridge.profile import resolve_profile
 from virtuoso_bridge.virtuoso.basic.composition import compose_skill_script
-from virtuoso_bridge.models import ExecutionStatus, VirtuosoInterface, VirtuosoResult
+from virtuoso_bridge.models import (
+    CompletionStatus,
+    ExecutionStatus,
+    OperationClass,
+    VirtuosoInterface,
+    VirtuosoResult,
+)
 from virtuoso_bridge.virtuoso.ops import (
     close_current_cellview as op_close_current_cellview,
     default_view_type_for,
@@ -38,6 +45,14 @@ _RECV_BUF_SIZE = 1024 * 1024
 _TUNNEL_CONNECT_RETRY_DELAY = 0.2
 _TUNNEL_CONNECT_GRACE_SECONDS = 3.0
 _DAEMON_TIMEOUT_RETURN_GRACE_SECONDS = 0.5
+
+
+class _SkillRequestTimeout(socket.timeout):
+    """A socket timeout annotated with whether request delivery began."""
+
+    def __init__(self, *, dispatched: bool) -> None:
+        super().__init__()
+        self.dispatched = dispatched
 
 
 def _default_remote_port(username: str | None = None) -> int:
@@ -83,12 +98,18 @@ class VirtuosoClient(VirtuosoInterface):
         timeout: int = 30,
         tunnel: Any = None,
         log_to_ciw: bool = True,
+        auth_token: str | None = None,
+        profile: str | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._timeout = timeout
         self._tunnel = tunnel  # SSHClient, if provided
         self._log_to_ciw = log_to_ciw
+        self._profile = resolve_profile(profile)
+        if auth_token is None and tunnel is not None:
+            auth_token = getattr(tunnel, "auth_token", None)
+        self._auth_token = auth_token or ""
         self.layout = LayoutOps(self)
         self.library = LibraryOps(self)
         self.schematic = SchematicOps(self)
@@ -135,7 +156,15 @@ class VirtuosoClient(VirtuosoInterface):
                 raise RuntimeError("Tunnel state file is missing or invalid.")
             port = state["port"]
             ssh = SSHClient.from_env(keep_remote_files=True, profile=profile)
-            client = cls(host="127.0.0.1", port=port, timeout=timeout, tunnel=ssh, log_to_ciw=log_to_ciw)
+            client = cls(
+                host="127.0.0.1",
+                port=port,
+                timeout=timeout,
+                tunnel=ssh,
+                log_to_ciw=log_to_ciw,
+                auth_token=getattr(ssh, "auth_token", ""),
+                profile=profile,
+            )
             client._reject_cross_user_daemon_if_reachable(profile=profile, timeout=min(timeout, 5))
             return client
 
@@ -150,7 +179,15 @@ class VirtuosoClient(VirtuosoInterface):
             )
 
         ssh = SSHClient.from_env(keep_remote_files=True, profile=profile)
-        client = cls(host="127.0.0.1", port=ssh.port, timeout=timeout, tunnel=ssh, log_to_ciw=log_to_ciw)
+        client = cls(
+            host="127.0.0.1",
+            port=ssh.port,
+            timeout=timeout,
+            tunnel=ssh,
+            log_to_ciw=log_to_ciw,
+            auth_token=getattr(ssh, "auth_token", ""),
+            profile=profile,
+        )
         client._reject_cross_user_daemon_if_reachable(profile=profile, timeout=min(timeout, 5))
         return client
 
@@ -160,9 +197,21 @@ class VirtuosoClient(VirtuosoInterface):
         host: str = "127.0.0.1",
         port: int = 65432,
         timeout: int = 30,
+        auth_token: str | None = None,
+        profile: str | None = None,
     ) -> "VirtuosoClient":
         """Create a bridge for a locally running daemon."""
-        return cls(host=host, port=port, timeout=timeout)
+        if auth_token is None and profile is not None:
+            from virtuoso_bridge.transport.tunnel import resolve_auth_token
+
+            auth_token = resolve_auth_token(resolve_profile(profile), create=False)
+        return cls(
+            host=host,
+            port=port,
+            timeout=timeout,
+            auth_token=auth_token,
+            profile=profile,
+        )
 
     @classmethod
     def from_tunnel(
@@ -178,6 +227,8 @@ class VirtuosoClient(VirtuosoInterface):
             timeout=timeout,
             tunnel=tunnel,
             log_to_ciw=log_to_ciw,
+            auth_token=getattr(tunnel, "auth_token", ""),
+            profile=getattr(tunnel, "_profile", None),
         )
 
     # -- context manager ----------------------------------------------------
@@ -315,9 +366,19 @@ class VirtuosoClient(VirtuosoInterface):
         self,
         skill_code: str,
         timeout: float | None = None,
+        operation_class: OperationClass = OperationClass.UNKNOWN,
+        request_id: str | None = None,
     ) -> VirtuosoResult:
-        """Execute SKILL code in Virtuoso via the RAMIC Bridge daemon."""
+        """Execute SKILL code in Virtuoso via the RAMIC Bridge daemon.
+
+        A timeout after request delivery is deliberately reported as
+        ``timed_out_unknown``: the daemon or Virtuoso may still complete a
+        mutating request, so callers must not automatically retry it.
+        """
         effective_timeout = timeout if timeout is not None else self._timeout
+        request_id = request_id or str(uuid.uuid4())
+        if not isinstance(operation_class, OperationClass):
+            operation_class = OperationClass(str(operation_class))
 
         start_time = time.monotonic()
         deadline = start_time + effective_timeout
@@ -340,11 +401,22 @@ class VirtuosoClient(VirtuosoInterface):
                         skill_code,
                         effective_timeout,
                         deadline,
+                        request_id=request_id,
+                        operation_class=operation_class,
                     )
                     elapsed = time.monotonic() - start_time
-                    result = self._parse_response(raw_response, elapsed)
+                    result = self._parse_response(
+                        raw_response,
+                        elapsed,
+                        operation_class=operation_class,
+                        request_id=request_id,
+                    )
                     logger.debug("execute_skill OK (%.3fs)", elapsed)
                     return result
+                except _SkillRequestTimeout:
+                    # Preserve whether sendall() began; the generic OSError
+                    # retry path below would otherwise discard this evidence.
+                    raise
                 except ConnectionRefusedError:
                     now = time.monotonic()
                     if now >= deadline:
@@ -364,6 +436,25 @@ class VirtuosoClient(VirtuosoInterface):
                                  exc, connect_deadline - now)
                     time.sleep(min(_TUNNEL_CONNECT_RETRY_DELAY, connect_deadline - now))
 
+        except _SkillRequestTimeout as exc:
+            elapsed = time.monotonic() - start_time
+            completion = (
+                CompletionStatus.TIMED_OUT_UNKNOWN
+                if exc.dispatched
+                else CompletionStatus.NOT_DISPATCHED
+            )
+            logger.warning("Socket timeout %s %s:%d after %gs",
+                           "after request dispatch to" if exc.dispatched else "connecting to",
+                           self._host, self._port, effective_timeout)
+            return VirtuosoResult(
+                status=ExecutionStatus.ERROR,
+                errors=[f"Socket timeout after {effective_timeout}s"],
+                execution_time=elapsed,
+                operation_class=operation_class,
+                completion=completion,
+                request_id=request_id,
+                protocol_version=2,
+            )
         except socket.timeout:
             elapsed = time.monotonic() - start_time
             logger.warning("Socket timeout connecting to %s:%d after %gs",
@@ -372,6 +463,10 @@ class VirtuosoClient(VirtuosoInterface):
                 status=ExecutionStatus.ERROR,
                 errors=[f"Socket timeout after {effective_timeout}s"],
                 execution_time=elapsed,
+                operation_class=operation_class,
+                completion=CompletionStatus.NOT_DISPATCHED,
+                request_id=request_id,
+                protocol_version=2,
             )
         except ConnectionRefusedError:
             elapsed = time.monotonic() - start_time
@@ -384,6 +479,9 @@ class VirtuosoClient(VirtuosoInterface):
                     "Ensure the RAMIC Bridge daemon is running in Virtuoso."
                 ],
                 execution_time=elapsed,
+                operation_class=operation_class,
+                request_id=request_id,
+                protocol_version=2,
             )
         except OSError as exc:
             elapsed = time.monotonic() - start_time
@@ -393,6 +491,9 @@ class VirtuosoClient(VirtuosoInterface):
                 status=ExecutionStatus.ERROR,
                 errors=[f"Socket error: {exc}"],
                 execution_time=elapsed,
+                operation_class=operation_class,
+                request_id=request_id,
+                protocol_version=2,
             )
 
     def test_connection(self, timeout: int = 10) -> bool:
@@ -1338,7 +1439,11 @@ let((result winName ciwNum)
 
         effective_timeout = timeout if timeout is not None else self._timeout
         skill_command = f'load("{_escape_for_skill_evalstring_source(prepared)}")'
-        result = self.execute_skill(skill_command, timeout=effective_timeout)
+        result = self.execute_skill(
+            skill_command,
+            timeout=effective_timeout,
+            operation_class=OperationClass.MUTATING,
+        )
 
         if self._log_to_ciw and result.status == ExecutionStatus.SUCCESS:
             self.ciw_log(
@@ -1426,35 +1531,54 @@ let((result winName ciwNum)
         skill_code: str,
         timeout: float,
         deadline: float,
+        *,
+        request_id: str,
+        operation_class: OperationClass,
     ) -> str:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(self._remaining_timeout(deadline))
-            logger.debug("TCP connect %s:%d", self._host, self._port)
-            s.connect((self._host, self._port))
-            logger.debug("TCP connected, sending %d-byte payload", len(skill_code))
-            remaining = self._remaining_timeout(deadline)
-            return_grace = min(
-                _DAEMON_TIMEOUT_RETURN_GRACE_SECONDS,
-                remaining * 0.5,
-            )
-            request_timeout = max(
-                0.01,
-                min(timeout, remaining - return_grace),
-            )
-            payload = json.dumps({"skill": skill_code, "timeout": request_timeout}).encode("utf-8")
-            s.settimeout(self._remaining_timeout(deadline))
-            s.sendall(payload)
-            s.shutdown(socket.SHUT_WR)
-            chunks: list[bytes] = []
-            while True:
+        dispatched = False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(self._remaining_timeout(deadline))
-                chunk = s.recv(_RECV_BUF_SIZE)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            raw = b"".join(chunks).decode("utf-8", errors="ignore")
-            logger.debug("TCP received %d bytes", len(raw))
-            return raw
+                logger.debug("TCP connect %s:%d", self._host, self._port)
+                s.connect((self._host, self._port))
+                logger.debug("TCP connected, sending %d-byte payload", len(skill_code))
+                remaining = self._remaining_timeout(deadline)
+                return_grace = min(
+                    _DAEMON_TIMEOUT_RETURN_GRACE_SECONDS,
+                    remaining * 0.5,
+                )
+                request_timeout = max(
+                    0.01,
+                    min(timeout, remaining - return_grace),
+                )
+                payload = json.dumps(
+                    {
+                        "protocol_version": 2,
+                        "request_id": request_id,
+                        "operation_class": operation_class.value,
+                        "auth_token": self._auth_token,
+                        "skill": skill_code,
+                        "timeout": request_timeout,
+                    }
+                ).encode("utf-8")
+                s.settimeout(self._remaining_timeout(deadline))
+                # ``sendall`` can time out after a partial send.  Once invoked,
+                # delivery is no longer provably absent and must be quarantined.
+                dispatched = True
+                s.sendall(payload)
+                s.shutdown(socket.SHUT_WR)
+                chunks: list[bytes] = []
+                while True:
+                    s.settimeout(self._remaining_timeout(deadline))
+                    chunk = s.recv(_RECV_BUF_SIZE)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                raw = b"".join(chunks).decode("utf-8", errors="ignore")
+                logger.debug("TCP received %d bytes", len(raw))
+                return raw
+        except socket.timeout as exc:
+            raise _SkillRequestTimeout(dispatched=dispatched) from exc
 
     @staticmethod
     def _remaining_timeout(deadline: float) -> float:
@@ -1475,17 +1599,59 @@ let((result winName ciwNum)
         return getattr(exc, "errno", None) in retryable_errno or "Connection refused" in str(exc)
 
     @staticmethod
-    def _parse_response(raw: str, elapsed: float) -> VirtuosoResult:
+    def _parse_response(
+        raw: str,
+        elapsed: float,
+        *,
+        operation_class: OperationClass = OperationClass.UNKNOWN,
+        request_id: str | None = None,
+    ) -> VirtuosoResult:
         if not raw:
-            return VirtuosoResult(status=ExecutionStatus.ERROR, errors=["Empty response from daemon"], execution_time=elapsed)
+            return VirtuosoResult(
+                status=ExecutionStatus.ERROR,
+                errors=["Empty response from daemon"],
+                execution_time=elapsed,
+                operation_class=operation_class,
+                request_id=request_id,
+                protocol_version=2,
+            )
         if "TimeoutError" in raw:
-            return VirtuosoResult(status=ExecutionStatus.ERROR, errors=["SKILL execution timeout in Virtuoso"], execution_time=elapsed)
+            return VirtuosoResult(
+                status=ExecutionStatus.ERROR,
+                errors=["SKILL execution timeout in Virtuoso"],
+                execution_time=elapsed,
+                operation_class=operation_class,
+                completion=CompletionStatus.TIMED_OUT_UNKNOWN,
+                request_id=request_id,
+                protocol_version=2,
+            )
         if raw.startswith(_STX):
-            return VirtuosoResult(status=ExecutionStatus.SUCCESS, output=raw[1:], execution_time=elapsed)
+            return VirtuosoResult(
+                status=ExecutionStatus.SUCCESS,
+                output=raw[1:],
+                execution_time=elapsed,
+                operation_class=operation_class,
+                request_id=request_id,
+                protocol_version=2,
+            )
         if raw.startswith(_NAK):
-            return VirtuosoResult(status=ExecutionStatus.ERROR, errors=[raw[1:]], execution_time=elapsed)
-        return VirtuosoResult(status=ExecutionStatus.SUCCESS, output=raw, execution_time=elapsed,
-                              warnings=["Response did not contain a standard status marker"])
+            return VirtuosoResult(
+                status=ExecutionStatus.ERROR,
+                errors=[raw[1:]],
+                execution_time=elapsed,
+                operation_class=operation_class,
+                request_id=request_id,
+                protocol_version=2,
+            )
+        return VirtuosoResult(
+            status=ExecutionStatus.SUCCESS,
+            output=raw,
+            execution_time=elapsed,
+            warnings=["Response did not contain a standard status marker"],
+            operation_class=operation_class,
+            request_id=request_id,
+            protocol_version=2,
+        )
 
     # -- cleanup ------------------------------------------------------------
 

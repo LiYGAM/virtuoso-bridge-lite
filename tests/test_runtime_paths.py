@@ -62,6 +62,7 @@ def test_command_log_is_created_lazily(monkeypatch, tmp_path) -> None:
 
 def test_tunnel_state_reads_legacy_cache_path(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("VB_STATE_DIR", str(tmp_path / "new-state"))
     legacy = tmp_path / ".cache" / "virtuoso_bridge" / "state.json"
     legacy.parent.mkdir(parents=True)

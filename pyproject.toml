@@ -36,4 +36,11 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-q"
+addopts = "-q --strict-markers"
+markers = [
+    "unit: in-process test with no real network or child process",
+    "process: local child-process or loopback-socket integration test",
+    "windows: Windows-specific path, process, or file-lock semantics",
+    "posix: POSIX shell, permission, ownership, or path semantics",
+    "live: requires a real Bridge, SSH, Virtuoso, or design database",
+]

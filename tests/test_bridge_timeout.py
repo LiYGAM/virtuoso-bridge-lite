@@ -8,9 +8,15 @@ from typing import get_type_hints
 
 import pytest
 
-from virtuoso_bridge import VirtuosoClient
-from virtuoso_bridge.models import ExecutionStatus
+from virtuoso_bridge import (
+    CompletionStatus,
+    ExecutionStatus,
+    OperationClass,
+    VirtuosoClient,
+)
 from virtuoso_bridge.virtuoso.basic import bridge
+
+pytestmark = pytest.mark.unit
 
 
 class _FakeClock:
@@ -128,6 +134,7 @@ def test_execute_skill_uses_one_deadline_across_retry_and_socket_phases(
 
     assert result.status == ExecutionStatus.ERROR
     assert result.errors == ["Socket timeout after 1.0s"]
+    assert result.completion == CompletionStatus.TIMED_OUT_UNKNOWN
     assert result.execution_time == pytest.approx(1.0)
     assert clock.sleeps == [0.2]
     assert refused.phase_timeouts == [("connect", pytest.approx(1.0))]
@@ -158,6 +165,7 @@ def test_execute_skill_timeout_caps_jump_host_retry_grace(
 
     assert result.status == ExecutionStatus.ERROR
     assert result.errors == ["Socket timeout after 0.1s"]
+    assert result.completion == CompletionStatus.NOT_DISPATCHED
     assert result.execution_time == pytest.approx(0.1)
     assert clock.sleeps == [pytest.approx(0.1)]
     assert factory.created[0].phase_timeouts == [("connect", pytest.approx(0.1))]
@@ -213,8 +221,64 @@ def test_execute_skill_gives_daemon_time_to_return_timeout(
     factory = _SocketFactory([connected])
     _use_fake_network(monkeypatch, clock, factory)
 
-    result = VirtuosoClient().execute_skill("1+2", timeout=10.0)
+    result = VirtuosoClient(auth_token="test-token").execute_skill(
+        "1+2",
+        timeout=10.0,
+        operation_class=OperationClass.READ_ONLY,
+        request_id="req-fixed-001",
+    )
 
     assert result.status == ExecutionStatus.SUCCESS
     request = json.loads(connected.sent_payloads[0].decode("utf-8"))
     assert request["timeout"] == pytest.approx(9.5)
+    assert request["protocol_version"] == 2
+    assert request["request_id"] == "req-fixed-001"
+    assert request["operation_class"] == "read_only"
+    assert request["auth_token"] == "test-token"
+    assert result.request_id == "req-fixed-001"
+    assert result.protocol_version == 2
+
+
+def test_execute_skill_daemon_timeout_is_unknown_commit_for_mutating_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    connected = _FakeSocket(
+        clock,
+        recv_results=((0.0, b"\x15TimeoutError: CIW still busy"), (0.0, b"")),
+    )
+    factory = _SocketFactory([connected])
+    _use_fake_network(monkeypatch, clock, factory)
+
+    result = VirtuosoClient().execute_skill(
+        "dbCreateRect(cv list(0:0 1:1))",
+        timeout=1.0,
+        operation_class=OperationClass.MUTATING,
+    )
+
+    assert result.status == ExecutionStatus.ERROR
+    assert result.operation_class == OperationClass.MUTATING
+    assert result.completion == CompletionStatus.TIMED_OUT_UNKNOWN
+
+
+def test_load_il_classifies_the_request_as_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    script = tmp_path / "check.il"
+    script.write_text("t\n", encoding="utf-8")
+    client = VirtuosoClient(log_to_ciw=False)
+    observed: dict[str, object] = {}
+
+    def fake_execute(skill_code, timeout=None, operation_class=OperationClass.UNKNOWN):
+        observed["skill_code"] = skill_code
+        observed["timeout"] = timeout
+        observed["operation_class"] = operation_class
+        return bridge.VirtuosoResult(status=ExecutionStatus.SUCCESS, output="t")
+
+    monkeypatch.setattr(client, "execute_skill", fake_execute)
+
+    result = client.load_il(script)
+
+    assert result.status == ExecutionStatus.SUCCESS
+    assert observed["operation_class"] == OperationClass.MUTATING

@@ -160,6 +160,65 @@ def dismiss_window(
     return _parse_result(result)
 
 
+def window_input(
+    runner: SSHRunner | None,
+    user: str,
+    window_id: str,
+    *,
+    expect_title: str,
+    action: str,
+    x: int,
+    y: int,
+    button: int = 1,
+    to_x: int | None = None,
+    to_y: int | None = None,
+    allow_live: bool = False,
+    dry_run: bool = False,
+    settle_ms: int = 50,
+    hold_ms: int = 0,
+    drag_duration_ms: int = 0,
+    drag_steps: int = 1,
+    postcondition: str = "none",
+    post_expect_title: str | None = None,
+    display: str | None = None,
+    profile: str | None = None,
+) -> list[dict[str, Any]]:
+    """Send explicitly opted-in pointer input to one discovered child window.
+
+    The remote helper repeats discovery and reads the target's current mapped
+    geometry immediately before sending any XTest event.  Keeping the
+    confirmation arguments in the command also makes direct helper use obey
+    the same safety contract as the public CLI.
+    """
+    if not allow_live and not dry_run:
+        return [{"error": "--allow-live is required"}]
+    load_vb_env()
+    script = _ensure_helper(runner, user, profile)
+    py = _detect_remote_python(runner)
+    resolved = _get_display(display)
+    cmd = (
+        f"{py} {script} --window-input {shlex.quote(window_id)} "
+        f"--expect-title {shlex.quote(expect_title)} "
+        f"--action {shlex.quote(action)} --x {int(x)} --y {int(y)} "
+        f"--button {int(button)} --settle-ms {int(settle_ms)} "
+        f"--hold-ms {int(hold_ms)} --drag-duration-ms {int(drag_duration_ms)} "
+        f"--drag-steps {int(drag_steps)} --postcondition {shlex.quote(postcondition)}"
+    )
+    if allow_live:
+        cmd += " --allow-live"
+    if dry_run:
+        cmd += " --dry-run"
+    if to_x is not None:
+        cmd += f" --to-x {int(to_x)}"
+    if to_y is not None:
+        cmd += f" --to-y {int(to_y)}"
+    if post_expect_title is not None:
+        cmd += f" --post-expect-title {shlex.quote(post_expect_title)}"
+    if resolved:
+        cmd += f" {resolved}"
+    return _parse_result(_run(runner, cmd, timeout=15))
+
+
 def dismiss_dialogs(
     runner: SSHRunner | None,
     user: str,

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
+import io
+import json
 import os
 import re
 import shlex
@@ -13,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from virtuoso_bridge.env import default_user_env_path, load_vb_env, set_runtime_env_file
+from virtuoso_bridge.models import OperationClass
 from virtuoso_bridge.transport.ssh import SSHRunner, remote_ssh_env_from_os
 
 
@@ -207,7 +211,11 @@ def _start_one_profile(profile: str | None) -> int:
         print(f"Setting up local bridge{label}...")
     else:
         print(f"Starting tunnel{label}...")
-    ssh = SSHClient.from_env(keep_remote_files=True, profile=profile)
+    ssh = SSHClient.from_env(
+        keep_remote_files=True,
+        profile=profile,
+        allow_remote_bind=_CLI_ALLOW_REMOTE_BIND[0],
+    )
     try:
         started = time.monotonic()
         try:
@@ -280,7 +288,7 @@ def cli_start() -> int:
 def _stop_one() -> int:
     """Stop tunnel for the current profile."""
     profile = _get_cli_profile()
-    from virtuoso_bridge.transport.tunnel import SSHClient
+    from virtuoso_bridge.transport.tunnel import SSHClient, resolve_auth_token
 
     label = f" [{profile}]" if profile else ""
     if not SSHClient.is_running(profile):
@@ -304,7 +312,7 @@ def _restart_daemon_one(profile: str | None) -> None:
     """Ask the CIW-side RAMIC loader to restart the daemon for this profile."""
     from virtuoso_bridge.daemon_guard import check_daemon_user
     from virtuoso_bridge.models import ExecutionStatus
-    from virtuoso_bridge.transport.tunnel import SSHClient
+    from virtuoso_bridge.transport.tunnel import SSHClient, resolve_auth_token
     from virtuoso_bridge.virtuoso.basic.bridge import VirtuosoClient
     from virtuoso_bridge.virtuoso.ops import escape_skill_string
 
@@ -325,6 +333,8 @@ def _restart_daemon_one(profile: str | None) -> None:
         port=int(state["port"]),
         timeout=5,
         log_to_ciw=False,
+        auth_token=resolve_auth_token(profile, create=False),
+        profile=profile,
     )
     try:
         user_check = check_daemon_user(client, profile=profile, timeout=5)
@@ -409,7 +419,12 @@ def _print_cross_user_daemon_failure(error: str) -> None:
 def _print_status() -> int:
     _load_cli_env()
     profile = _get_cli_profile()
-    from virtuoso_bridge.transport.tunnel import SSHClient, _is_localhost, _profiled_bridge_leaf
+    from virtuoso_bridge.transport.tunnel import (
+        SSHClient,
+        _is_localhost,
+        _profiled_bridge_leaf,
+        resolve_auth_token,
+    )
     from virtuoso_bridge.virtuoso.basic.bridge import VirtuosoClient
 
     state = SSHClient.read_state(profile)
@@ -451,6 +466,8 @@ def _print_status() -> int:
         print(f"\n[mode] local (no SSH tunnel)")
         if state:
             print(f"  port : {state.get('port')}")
+            print(f"  bind : {state.get('bind_policy', 'legacy/unknown')}")
+            print(f"  auth : {'enabled' if state.get('auth_enabled') else 'legacy/disabled'}")
             setup_path = state.get("setup_path")
         else:
             setup_path = None
@@ -463,6 +480,8 @@ def _print_status() -> int:
             print(f"  jump host   : {jump_host}")
         if state:
             print(f"  local port  : {state.get('port')}")
+            print(f"  bind policy : {state.get('bind_policy', 'legacy/unknown')}")
+            print(f"  auth        : {'enabled' if state.get('auth_enabled') else 'legacy/disabled'}")
             setup_path = state.get("setup_path")
         else:
             setup_path = None
@@ -480,7 +499,13 @@ def _print_status() -> int:
             return 1
         port = state["port"]
         try:
-            vc = VirtuosoClient(host="127.0.0.1", port=port, timeout=5)
+            vc = VirtuosoClient(
+                host="127.0.0.1",
+                port=port,
+                timeout=5,
+                auth_token=resolve_auth_token(profile, create=False),
+                profile=profile,
+            )
             ok = vc.test_connection(timeout=5)
             print(f"\n[daemon] {'OK - connected to Virtuoso CIW' if ok else 'NO RESPONSE'}")
             if ok:
@@ -732,6 +757,21 @@ def cli_status() -> int:
     return _for_each_profile(_print_status)
 
 
+def cli_request_status(*, request_id: str | None = None) -> int:
+    """Read the daemon request ledger without using the CIW request channel."""
+    _load_cli_env()
+    from virtuoso_bridge.transport.tunnel import SSHClient, resolve_auth_token
+
+    payload = SSHClient.read_request_status(_get_cli_profile(), request_id=request_id)
+    if payload is None:
+        print(json.dumps({"status": "unavailable", "request_id": request_id}))
+        return 1
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    if request_id and payload.get("request") is None:
+        return 1
+    return 0
+
+
 # -- license ----------------------------------------------------------------
 
 def cli_license() -> int:
@@ -863,7 +903,8 @@ def cli_load(*, file: str, timeout: int = 60, quiet: bool = False) -> int:
 
 
 def cli_eval(*, skill: str | None, stdin: bool, timeout: int = 60,
-             quiet: bool = False) -> int:
+             quiet: bool = False,
+             operation_class: OperationClass = OperationClass.UNKNOWN) -> int:
     """Execute a SKILL expression in the running Virtuoso session.
 
     Companion to :func:`cli_load` for one-liners and round-trip checks
@@ -909,7 +950,11 @@ def cli_eval(*, skill: str | None, stdin: bool, timeout: int = 60,
 
     _load_cli_env()
     client = _vb_pkg.VirtuosoClient.from_env(profile=_get_cli_profile())
-    result = client.execute_skill(wrapped, timeout=timeout)
+    result = client.execute_skill(
+        wrapped,
+        timeout=timeout,
+        operation_class=operation_class,
+    )
 
     if not quiet:
         print(json.dumps(
@@ -998,6 +1043,41 @@ def cli_dismiss_window(*, window_id: str, action: str = "enter") -> int:
                 f"action={result.get('action', action)}"
             )
     return 0 if ok else 1
+
+
+def cli_window_input(*, window_id: str, expect_title: str, action: str,
+                     x: int, y: int, button: int, to_x: int | None,
+                     to_y: int | None, allow_live: bool, dry_run: bool,
+                     settle_ms: int, hold_ms: int, drag_duration_ms: int,
+                     drag_steps: int, postcondition: str,
+                     post_expect_title: str | None) -> int:
+    """Perform one explicitly confirmed, bounds-checked X11 pointer action."""
+    _load_cli_env()
+    from virtuoso_bridge.virtuoso import x11
+    runner, user = _make_ssh_runner()
+    results = x11.window_input(
+        runner,
+        user,
+        window_id,
+        expect_title=expect_title,
+        action=action,
+        x=x,
+        y=y,
+        button=button,
+        to_x=to_x,
+        to_y=to_y,
+        allow_live=allow_live,
+        dry_run=dry_run,
+        settle_ms=settle_ms,
+        hold_ms=hold_ms,
+        drag_duration_ms=drag_duration_ms,
+        drag_steps=drag_steps,
+        postcondition=postcondition,
+        post_expect_title=post_expect_title,
+        profile=_get_cli_profile(),
+    )
+    print(json.dumps(results, ensure_ascii=False, default=str))
+    return 0 if results and not any("error" in item for item in results) else 1
 
 
 
@@ -1417,6 +1497,11 @@ def cli_screenshot() -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="virtuoso-bridge")
+    parser.add_argument(
+        "--json-envelope",
+        action="store_true",
+        help="Emit one stable machine-readable command envelope",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     sp_init = subparsers.add_parser("init", help="Create a starter .env")
     sp_init.add_argument(
@@ -1447,6 +1532,23 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "start":
             sp.add_argument("--bind-venv", action="store_true",
                             help="Bind the active virtualenv to this -p profile before starting")
+        if name in {"start", "restart"}:
+            sp.add_argument(
+                "--allow-remote-bind",
+                action="store_true",
+                default=None,
+                help="Explicitly expose the daemon beyond loopback (unsafe unless firewalled)",
+            )
+
+    sp_request_status = subparsers.add_parser(
+        "request-status",
+        help="Read the daemon request ledger without using the CIW channel",
+    )
+    sp_request_status.add_argument("request_id", nargs="?", default=None)
+    sp_request_status.add_argument("-p", "--profile", default=None,
+                                   help="Connection profile")
+    sp_request_status.add_argument("--env", default=None,
+                                   help="Explicit .env file path (highest priority)")
 
     sp_profile = subparsers.add_parser("profile", help="Show or edit profile bindings")
     profile_sub = sp_profile.add_subparsers(dest="profile_action", required=True)
@@ -1521,6 +1623,13 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Explicit .env file path (highest priority)")
     sp_eval.add_argument("--timeout", type=int, default=60,
                          help="SKILL execution timeout in seconds (default: 60)")
+    sp_eval.add_argument(
+        "--operation-class",
+        type=OperationClass,
+        choices=list(OperationClass),
+        default=OperationClass.UNKNOWN,
+        help="Safety classification for timeout handling (default: unknown)",
+    )
     sp_eval.add_argument("--quiet", action="store_true",
                          help="Suppress JSON output; only the exit code is reported")
 
@@ -1553,6 +1662,52 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="Connection profile")
     sp_dismiss_window.add_argument("--env", default=None,
                                    help="Explicit .env file path (highest priority)")
+
+    sp_window_input = subparsers.add_parser(
+        "window-input",
+        help="Send an explicitly confirmed XTest pointer action to one Virtuoso child window",
+    )
+    sp_window_input.add_argument("window_id", help="Child id reported by list-windows")
+    sp_window_input.add_argument("--expect-title", required=True,
+                                 help="Required substring of the currently discovered child title")
+    sp_window_input.add_argument("--action", required=True, choices=["move", "click", "drag"],
+                                 help="Pointer action to perform")
+    sp_window_input.add_argument("--x", required=True, type=int,
+                                 help="Relative X coordinate inside the target window")
+    sp_window_input.add_argument("--y", required=True, type=int,
+                                 help="Relative Y coordinate inside the target window")
+    sp_window_input.add_argument("--to-x", type=int,
+                                 help="Drag endpoint relative X coordinate (drag only)")
+    sp_window_input.add_argument("--to-y", type=int,
+                                 help="Drag endpoint relative Y coordinate (drag only)")
+    sp_window_input.add_argument("--button", type=int, default=1, choices=[1, 2, 3],
+                                 help="Pointer button for click/drag (default: 1)")
+    sp_window_input.add_argument("--allow-live", action="store_true",
+                                 help="Required acknowledgement for live X11 input")
+    sp_window_input.add_argument("--dry-run", action="store_true",
+                                 help="Validate target and coordinates without sending XTest events")
+    sp_window_input.add_argument("--settle-ms", type=int, default=50,
+                                 help="Delay before postcondition discovery (default: 50)")
+    sp_window_input.add_argument("--hold-ms", type=int, default=0,
+                                 help="Button hold time for click/drag (default: 0)")
+    sp_window_input.add_argument("--drag-duration-ms", type=int, default=0,
+                                 help="Total drag interpolation time (default: 0)")
+    sp_window_input.add_argument("--drag-steps", type=int, default=1,
+                                 help="Number of interpolated drag steps (default: 1)")
+    sp_window_input.add_argument(
+        "--postcondition",
+        choices=["none", "still-mapped", "unmapped", "same-fingerprint", "title-contains"],
+        default="none",
+        help="Verified state required after the input action",
+    )
+    sp_window_input.add_argument(
+        "--post-expect-title",
+        default=None,
+        help="Required title substring for the title-contains postcondition",
+    )
+    sp_window_input.add_argument("-p", "--profile", default=None, help="Connection profile")
+    sp_window_input.add_argument("--env", default=None,
+                                 help="Explicit .env file path (highest priority)")
 
     sp_screenshot = subparsers.add_parser(
         "screenshot", help="Take a screenshot of a Virtuoso window")
@@ -1737,6 +1892,7 @@ def main(argv: list[str] | None = None) -> int:
     profile = resolve_profile(getattr(args, "profile", None))
     if profile is not None:
         _CLI_PROFILE[0] = profile
+    _CLI_ALLOW_REMOTE_BIND[0] = getattr(args, "allow_remote_bind", None)
     dispatch = {
         "init": lambda: cli_init(
             remote=getattr(args, "remote", None),
@@ -1751,6 +1907,9 @@ def main(argv: list[str] | None = None) -> int:
         "stop": cli_stop,
         "restart": cli_restart,
         "status": cli_status,
+        "request-status": lambda: cli_request_status(
+            request_id=getattr(args, "request_id", None),
+        ),
         "license": cli_license,
         "load": lambda: cli_load(
             file=getattr(args, "file"),
@@ -1762,6 +1921,7 @@ def main(argv: list[str] | None = None) -> int:
             stdin=getattr(args, "stdin", False),
             timeout=getattr(args, "timeout", 60),
             quiet=getattr(args, "quiet", False),
+            operation_class=getattr(args, "operation_class", OperationClass.UNKNOWN),
         ),
         "dismiss-dialog": cli_dismiss_dialog,
         "list-windows": lambda: cli_list_windows(
@@ -1770,6 +1930,24 @@ def main(argv: list[str] | None = None) -> int:
         "dismiss-window": lambda: cli_dismiss_window(
             window_id=getattr(args, "window_id"),
             action=getattr(args, "action", "enter"),
+        ),
+        "window-input": lambda: cli_window_input(
+            window_id=getattr(args, "window_id"),
+            expect_title=getattr(args, "expect_title"),
+            action=getattr(args, "action"),
+            x=getattr(args, "x"),
+            y=getattr(args, "y"),
+            button=getattr(args, "button", 1),
+            to_x=getattr(args, "to_x", None),
+            to_y=getattr(args, "to_y", None),
+            allow_live=getattr(args, "allow_live", False),
+            dry_run=getattr(args, "dry_run", False),
+            settle_ms=getattr(args, "settle_ms", 50),
+            hold_ms=getattr(args, "hold_ms", 0),
+            drag_duration_ms=getattr(args, "drag_duration_ms", 0),
+            drag_steps=getattr(args, "drag_steps", 1),
+            postcondition=getattr(args, "postcondition", "none"),
+            post_expect_title=getattr(args, "post_expect_title", None),
         ),
         "screenshot": cli_screenshot,
         "windows": cli_windows,
@@ -1811,11 +1989,63 @@ def main(argv: list[str] | None = None) -> int:
             v = getattr(args, k, None)
             if v is not None:
                 _EXPORT_VISIO_OPTS[k] = v
-    return dispatch[args.command]()
+    handler = dispatch[args.command]
+    if not getattr(args, "json_envelope", False):
+        return handler()
+
+    started = datetime.now(timezone.utc)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    caught: Exception | None = None
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        try:
+            exit_code = int(handler() or 0)
+        except Exception as exc:
+            caught = exc
+            exit_code = 1
+    ended = datetime.now(timezone.utc)
+    stdout_text = stdout.getvalue().strip()
+    stderr_text = stderr.getvalue().strip()
+    parsed: object | None = None
+    if stdout_text:
+        try:
+            parsed = json.loads(stdout_text)
+        except json.JSONDecodeError:
+            parsed = None
+    error_items: list[str] = []
+    if caught is not None:
+        error_items.append(str(caught))
+    if exit_code and stderr_text:
+        error_items.append(stderr_text)
+    data: object = parsed if parsed is not None else {"stdout": stdout_text}
+    request_id = None
+    if isinstance(parsed, dict):
+        request_id = parsed.get("request_id")
+        if request_id is None and isinstance(parsed.get("request"), dict):
+            request_id = parsed["request"].get("request_id")
+    status = "success" if exit_code == 0 else "error"
+    envelope = {
+        "schema_version": 1,
+        "command": args.command,
+        "profile": _get_cli_profile(),
+        "ok": exit_code == 0,
+        "status": status,
+        "exit_code": exit_code,
+        "request_id": request_id,
+        "started_utc": started.isoformat(),
+        "ended_utc": ended.isoformat(),
+        "data": data,
+        "errors": error_items,
+        "warnings": [stderr_text] if stderr_text and not exit_code else [],
+        "evidence": [],
+    }
+    print(json.dumps(envelope, ensure_ascii=False, default=str))
+    return exit_code
 
 
 # Global profile for CLI commands (avoids changing all function signatures)
 _CLI_PROFILE: list[str | None] = [None]
+_CLI_ALLOW_REMOTE_BIND: list[bool | None] = [None]
 _SCREENSHOT_OUTPUT: list[str | None] = [None]
 
 

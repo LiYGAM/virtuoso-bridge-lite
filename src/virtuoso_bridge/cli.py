@@ -757,12 +757,18 @@ def cli_status() -> int:
     return _for_each_profile(_print_status)
 
 
-def cli_request_status(*, request_id: str | None = None) -> int:
+def cli_request_status(
+    *, request_id: str | None = None, timeout: float = 10.0
+) -> int:
     """Read the daemon request ledger without using the CIW request channel."""
+    if timeout <= 0:
+        raise ValueError("request status timeout must be greater than zero")
     _load_cli_env()
-    from virtuoso_bridge.transport.tunnel import SSHClient, resolve_auth_token
+    from virtuoso_bridge.transport.tunnel import SSHClient
 
-    payload = SSHClient.read_request_status(_get_cli_profile(), request_id=request_id)
+    payload = SSHClient.read_request_status(
+        _get_cli_profile(), request_id=request_id, timeout=timeout
+    )
     if payload is None:
         print(json.dumps({"status": "unavailable", "request_id": request_id}))
         return 1
@@ -770,6 +776,144 @@ def cli_request_status(*, request_id: str | None = None) -> int:
     if request_id and payload.get("request") is None:
         return 1
     return 0
+
+
+def cli_deployment_status(*, timeout: float = 10.0) -> int:
+    """Compare packaged, staged, and running daemon identities."""
+    if timeout <= 0:
+        raise ValueError("deployment status timeout must be greater than zero")
+    _load_cli_env()
+    from virtuoso_bridge.transport.tunnel import SSHClient
+
+    payload = SSHClient.deployment_status(
+        _get_cli_profile(), timeout=timeout
+    )
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return 0 if (
+        payload.get("local_matches_deployed")
+        and payload.get("deployed_matches_running")
+        and payload.get("running_heartbeat_fresh")
+    ) else 2
+
+
+_REQUEST_PENDING_STATES = frozenset({"queued", "running", "timed_out_pending"})
+_REQUEST_KNOWN_TERMINAL_STATES = frozenset({
+    "succeeded",
+    "failed",
+    "succeeded_after_timeout",
+    "failed_after_timeout",
+})
+
+
+def _classify_request_reconciliation(
+    payload: dict[str, object] | None,
+    request_id: str,
+) -> dict[str, object]:
+    request = payload.get("request") if payload else None
+    if not isinstance(request, dict):
+        return {
+            "request_id": request_id,
+            "state": None,
+            "terminal": False,
+            "outcome": "not_found",
+            "safe_to_clear_quarantine": False,
+        }
+
+    state = str(request.get("state") or "")
+    if state in _REQUEST_PENDING_STATES:
+        outcome = "in_progress"
+        terminal = False
+        safe_to_clear = False
+    else:
+        terminal = True
+        safe_to_clear = state in _REQUEST_KNOWN_TERMINAL_STATES
+        outcome = "known_terminal" if safe_to_clear else "indeterminate_terminal"
+    return {
+        "request_id": request_id,
+        "state": state or None,
+        "terminal": terminal,
+        "outcome": outcome,
+        "safe_to_clear_quarantine": safe_to_clear,
+        "response_marker": request.get("response_marker"),
+        "operation_class": request.get("operation_class"),
+        "request_digest_sha256": request.get("request_digest_sha256"),
+        "daemon_epoch": payload.get("daemon_epoch") if payload else None,
+        "heartbeat_at_epoch": payload.get("heartbeat_at_epoch") if payload else None,
+    }
+
+
+def cli_request_await(
+    *,
+    request_id: str,
+    timeout: float = 60.0,
+    poll_interval: float = 1.0,
+) -> int:
+    """Wait for a ledger terminal state without replaying the request."""
+    if timeout <= 0:
+        raise ValueError("request wait timeout must be greater than zero")
+    if poll_interval <= 0:
+        raise ValueError("request poll interval must be greater than zero")
+
+    _load_cli_env()
+    from virtuoso_bridge.transport.tunnel import SSHClient
+
+    deadline = time.monotonic() + timeout
+    first_epoch: str | None = None
+    latest: dict[str, object] | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            payload = None
+        else:
+            payload = SSHClient.read_request_status(
+                _get_cli_profile(),
+                request_id=request_id,
+                timeout=min(10.0, remaining),
+            )
+        if payload is not None:
+            latest = dict(payload)
+            epoch_value = payload.get("daemon_epoch")
+            epoch = str(epoch_value) if epoch_value else None
+            if first_epoch is None:
+                first_epoch = epoch
+            latest["observed_daemon_epoch"] = first_epoch
+            latest["daemon_epoch_changed"] = bool(
+                first_epoch and epoch and first_epoch != epoch
+            )
+            reconciliation = _classify_request_reconciliation(latest, request_id)
+            if latest["daemon_epoch_changed"] and reconciliation["outcome"] == "not_found":
+                reconciliation = dict(reconciliation)
+                reconciliation.update({
+                    "terminal": True,
+                    "outcome": "indeterminate_terminal",
+                    "state": "orphaned_unknown_after_daemon_restart",
+                })
+            latest["reconciliation"] = reconciliation
+            if reconciliation["terminal"]:
+                print(json.dumps(latest, ensure_ascii=False, sort_keys=True))
+                return 0
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            result = dict(latest or {
+                "schema_version": 1,
+                "daemon_epoch": None,
+                "request": None,
+            })
+            result["reconciliation"] = {
+                "request_id": request_id,
+                "state": (
+                    result.get("request", {}).get("state")
+                    if isinstance(result.get("request"), dict)
+                    else None
+                ),
+                "terminal": False,
+                "outcome": "wait_timeout",
+                "safe_to_clear_quarantine": False,
+            }
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return 2
+        time.sleep(min(poll_interval, remaining))
 
 
 # -- license ----------------------------------------------------------------
@@ -853,7 +997,7 @@ def _make_ssh_runner() -> tuple["SSHRunner | None", str]:
                      jump_host=jump_host, jump_user=jump_user), remote_user
 
 
-def cli_load(*, file: str, timeout: int = 60, quiet: bool = False) -> int:
+def cli_load(*, file: str, timeout: float = 60, quiet: bool = False) -> int:
     """Execute a SKILL .il file in the running Virtuoso session.
 
     Equivalent to ``load("<file>")`` typed in the CIW: SKILL reads the
@@ -902,7 +1046,7 @@ def cli_load(*, file: str, timeout: int = 60, quiet: bool = False) -> int:
     return 0 if result.status == ExecutionStatus.SUCCESS else 1
 
 
-def cli_eval(*, skill: str | None, stdin: bool, timeout: int = 60,
+def cli_eval(*, skill: str | None, stdin: bool, timeout: float = 60,
              quiet: bool = False,
              operation_class: OperationClass = OperationClass.UNKNOWN) -> int:
     """Execute a SKILL expression in the running Virtuoso session.
@@ -1549,6 +1693,34 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="Connection profile")
     sp_request_status.add_argument("--env", default=None,
                                    help="Explicit .env file path (highest priority)")
+    sp_request_status.add_argument("--timeout", type=float, default=10.0,
+                                   help="Ledger read timeout in seconds")
+
+    sp_deployment_status = subparsers.add_parser(
+        "deployment-status",
+        help="Compare packaged, staged, and running daemon identities",
+    )
+    sp_deployment_status.add_argument("-p", "--profile", default=None,
+                                      help="Connection profile")
+    sp_deployment_status.add_argument("--env", default=None,
+                                      help="Explicit .env file path (highest priority)")
+    sp_deployment_status.add_argument("--timeout", type=float, default=10.0,
+                                      help="Status read timeout in seconds")
+
+    for name, help_text in [
+        ("request-await", "Wait for a terminal daemon-ledger request state"),
+        ("request-reconcile", "Classify a terminal request state without replaying it"),
+    ]:
+        sp_wait = subparsers.add_parser(name, help=help_text)
+        sp_wait.add_argument("request_id")
+        sp_wait.add_argument("-p", "--profile", default=None,
+                             help="Connection profile")
+        sp_wait.add_argument("--env", default=None,
+                             help="Explicit .env file path (highest priority)")
+        sp_wait.add_argument("--timeout", type=float, default=60.0,
+                             help="Absolute ledger wait budget in seconds")
+        sp_wait.add_argument("--poll-interval", type=float, default=1.0,
+                             help="Ledger poll interval in seconds")
 
     sp_profile = subparsers.add_parser("profile", help="Show or edit profile bindings")
     profile_sub = sp_profile.add_subparsers(dest="profile_action", required=True)
@@ -1588,7 +1760,7 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Connection profile (reads VB_*_<profile> env vars)")
     sp_load.add_argument("--env", default=None,
                          help="Explicit .env file path (highest priority)")
-    sp_load.add_argument("--timeout", type=int, default=60,
+    sp_load.add_argument("--timeout", type=float, default=60,
                          help="SKILL execution timeout in seconds (default: 60)")
     sp_load.add_argument("--quiet", action="store_true",
                          help="Suppress JSON output; only the exit code is reported")
@@ -1621,7 +1793,7 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Connection profile (reads VB_*_<profile> env vars)")
     sp_eval.add_argument("--env", default=None,
                          help="Explicit .env file path (highest priority)")
-    sp_eval.add_argument("--timeout", type=int, default=60,
+    sp_eval.add_argument("--timeout", type=float, default=60,
                          help="SKILL execution timeout in seconds (default: 60)")
     sp_eval.add_argument(
         "--operation-class",
@@ -1909,6 +2081,20 @@ def main(argv: list[str] | None = None) -> int:
         "status": cli_status,
         "request-status": lambda: cli_request_status(
             request_id=getattr(args, "request_id", None),
+            timeout=getattr(args, "timeout", 10.0),
+        ),
+        "deployment-status": lambda: cli_deployment_status(
+            timeout=getattr(args, "timeout", 10.0),
+        ),
+        "request-await": lambda: cli_request_await(
+            request_id=getattr(args, "request_id"),
+            timeout=getattr(args, "timeout", 60.0),
+            poll_interval=getattr(args, "poll_interval", 1.0),
+        ),
+        "request-reconcile": lambda: cli_request_await(
+            request_id=getattr(args, "request_id"),
+            timeout=getattr(args, "timeout", 60.0),
+            poll_interval=getattr(args, "poll_interval", 1.0),
         ),
         "license": cli_license,
         "load": lambda: cli_load(

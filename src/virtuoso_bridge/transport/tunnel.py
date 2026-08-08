@@ -8,12 +8,12 @@ localhost:port TCP endpoint; SSHClient makes that endpoint available.
 from __future__ import annotations
 
 import importlib.resources
+import hashlib
 import json
 import logging
 import os
 import re
 import secrets
-import shutil
 import shlex
 import socket
 import sys
@@ -29,11 +29,43 @@ from virtuoso_bridge.transport.remote_paths import (
     resolve_client_id,
     resolve_remote_username,
 )
-from virtuoso_bridge.transport.ssh import SSHRunner, CommandResult
+from virtuoso_bridge.transport.ssh import SSHRunner, CommandResult, _TimeoutBudget
 
 logger = logging.getLogger(__name__)
 
 _TUNNEL_STARTUP_SETTLE_SECONDS = 1.0
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _canonical_resource_text(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    return text if text.endswith("\n") else text + "\n"
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            tmp_path.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _is_localhost(host: str | None) -> bool:
     """Return True if *host* refers to the local machine."""
     if not host:
@@ -237,6 +269,14 @@ class SSHClient:
         self._auth_token = auth_token or secrets.token_urlsafe(32)
         self._allow_remote_bind = bool(allow_remote_bind)
         self._request_state_path: str | None = None
+        self._deployed_daemon_sha256: str | None = None
+        self._deployed_il_sha256: str | None = None
+        self._deployed_setup_sha256: str | None = None
+        self._deployed_daemon_path: str | None = None
+        self._deployed_il_path: str | None = None
+        self._compat_setup_path: str | None = None
+        self._deployment_id: str | None = None
+        self._daemon_filename: str | None = None
 
         if _is_localhost(remote_host):
             self._ssh_runner = None
@@ -373,7 +413,9 @@ class SSHClient:
 
     # -- remote deployment --------------------------------------------------
 
-    def _detect_remote_python(self) -> tuple[str, int, int]:
+    def _detect_remote_python(
+        self, *, _budget: _TimeoutBudget | None = None
+    ) -> tuple[str, int, int]:
         # Try Cadence-bundled Python 3.9+ first (IC23.1+), then system python3,
         # then generic python, then python2.7.
         detect_cmd = (
@@ -386,7 +428,11 @@ class SSHClient:
             'echo "CMD:NONE"'
         )
         runner = self._require_runner()
-        result = runner.run_command(detect_cmd)
+        budget = _budget or _TimeoutBudget.start(None, self._timeout)
+        result = runner.run_command(
+            detect_cmd,
+            timeout=budget.remaining("detect-remote-python"),
+        )
         output = result.stdout.strip()
         stderr = result.stderr.strip()
         logger.info("Remote Python detection output: %s", output)
@@ -421,18 +467,40 @@ class SSHClient:
         logger.info("Detected remote Python: %s (version %d.%d)", python_cmd, python_major, python_minor)
         return python_cmd, python_major, python_minor
 
-    def ensure_remote_setup(self) -> None:
+    def ensure_remote_setup(
+        self,
+        timeout: float | None = None,
+        *,
+        _budget: _TimeoutBudget | None = None,
+    ) -> None:
         """Upload daemon files and generate virtuoso_setup.il on the remote host."""
         if self._remote_setup_done:
             return
 
         runner = self._require_runner()
-        python_cmd, python_major, python_minor = self._detect_remote_python()
+        budget = _budget or _TimeoutBudget.start(timeout, self._timeout)
+        try:
+            python_cmd, python_major, python_minor = self._detect_remote_python(
+                _budget=budget
+            )
+        except TypeError as exc:
+            # Preserve compatibility with lightweight test/client overrides
+            # that implement the older zero-argument hook.
+            if "_budget" not in str(exc):
+                raise
+            python_cmd, python_major, python_minor = self._detect_remote_python()
         daemon_local = _find_ramic_bridge_daemon(
             3 if python_major >= 3 else 2
         )
         il_local = _find_ramic_bridge_il()
         daemon_filename = daemon_local.name
+        daemon_text = _canonical_resource_text(daemon_local)
+        il_text = _canonical_resource_text(il_local)
+        daemon_sha256 = _sha256_bytes(daemon_text.encode("utf-8"))
+        il_sha256 = _sha256_bytes(il_text.encode("utf-8"))
+        deployment_id = _sha256_bytes(
+            (daemon_sha256 + "\x00" + il_sha256).encode("ascii")
+        )
 
         remote_username = resolve_remote_username(
             configured_user=self._remote_user,
@@ -444,35 +512,64 @@ class SSHClient:
             resolve_client_id(self._profile),
         )
 
-        remote_daemon = f"{self._remote_work_dir}/{daemon_filename}"
-        remote_il = f"{self._remote_work_dir}/ramic_bridge.il"
-        remote_setup = f"{self._remote_work_dir}/virtuoso_setup.il"
+        daemon_stem, daemon_suffix = os.path.splitext(daemon_filename)
+        remote_daemon = (
+            f"{self._remote_work_dir}/{daemon_stem}.{daemon_sha256}{daemon_suffix}"
+        )
+        remote_il = f"{self._remote_work_dir}/ramic_bridge.{il_sha256}.il"
+        remote_setup = f"{self._remote_work_dir}/virtuoso_setup.{deployment_id}.il"
+        remote_compat_setup = f"{self._remote_work_dir}/virtuoso_setup.il"
         remote_token = f"{self._remote_work_dir}/auth.token"
         remote_request_state = f"{self._remote_work_dir}/request-status.json"
 
         logger.info("Creating remote directory: %s", self._remote_work_dir)
+        quoted_work_dir = shlex.quote(self._remote_work_dir)
         mkdir_result = runner.run_command(
-            f"mkdir -p {self._remote_work_dir} && chmod 700 {self._remote_work_dir}"
+            f"if [ -L {quoted_work_dir} ]; then exit 41; fi; "
+            f"if [ -e {quoted_work_dir} ] && [ ! -d {quoted_work_dir} ]; then exit 42; fi; "
+            f"mkdir -p {quoted_work_dir} || exit 42; "
+            f"owner=$(stat -c %u -- {quoted_work_dir}) || exit 43; "
+            f"[ \"$owner\" = \"$(id -u)\" ] || exit 44; "
+            f"chmod 700 {quoted_work_dir}",
+            timeout=budget.remaining("create-remote-bridge-directory"),
+            retry_transport_errors=False,
         )
         if mkdir_result.returncode != 0:
             raise RuntimeError(f"Failed to create remote directory: {mkdir_result.stderr.strip()}")
 
         logger.info("Uploading daemon script (%s) to %s", daemon_filename, remote_daemon)
-        daemon_content = daemon_local.read_text(encoding="utf-8")
-        up = runner.upload_text(daemon_content, remote_daemon)
+        up = runner.upload_text(
+            daemon_text,
+            remote_daemon,
+            timeout=budget.remaining("upload-daemon"),
+            retry_transport_errors=False,
+        )
         if up.returncode != 0:
             raise RuntimeError(f"Failed to upload daemon: {up.stderr.strip()}")
 
         logger.info("Uploading IL script to %s", remote_il)
-        il_content = il_local.read_text(encoding="utf-8")
-        up = runner.upload_text(il_content, remote_il)
+        up = runner.upload_text(
+            il_text,
+            remote_il,
+            timeout=budget.remaining("upload-bridge-il"),
+            retry_transport_errors=False,
+        )
         if up.returncode != 0:
             raise RuntimeError(f"Failed to upload IL script: {up.stderr.strip()}")
 
-        up = runner.upload_text(self._auth_token + "\n", remote_token)
+        up = runner.upload_text(
+            self._auth_token + "\n",
+            remote_token,
+            timeout=budget.remaining("upload-auth-token"),
+            retry_transport_errors=False,
+        )
         if up.returncode != 0:
             raise RuntimeError(f"Failed to upload daemon auth token: {up.stderr.strip()}")
-        chmod_result = runner.run_command(f"chmod 600 {shlex.quote(remote_token)}")
+        chmod_result = runner.run_command(
+            f"chmod 600 {shlex.quote(remote_token)}",
+            timeout=budget.remaining("protect-auth-token"),
+            retry_transport_errors=False,
+        )
         if chmod_result.returncode != 0:
             raise RuntimeError(
                 f"Failed to protect daemon auth token: {chmod_result.stderr.strip()}"
@@ -488,18 +585,39 @@ class SSHClient:
             allow_remote_bind=self._allow_remote_bind,
             profile=self._profile,
         )
+        if not setup_content.endswith("\n"):
+            setup_content += "\n"
+        setup_sha256 = _sha256_bytes(setup_content.encode("utf-8"))
         logger.info("Uploading setup script to %s", remote_setup)
-        up = runner.upload_text(setup_content, remote_setup)
+        up = runner.upload_text(
+            setup_content,
+            remote_setup,
+            timeout=budget.remaining("upload-bridge-setup"),
+            retry_transport_errors=False,
+        )
         if up.returncode != 0:
             raise RuntimeError(f"Failed to upload setup script: {up.stderr.strip()}")
+        compat_up = runner.upload_text(
+            setup_content,
+            remote_compat_setup,
+            timeout=budget.remaining("upload-compatible-bridge-setup"),
+            retry_transport_errors=False,
+        )
+        if compat_up.returncode != 0:
+            raise RuntimeError(
+                f"Failed to upload compatible setup script: {compat_up.stderr.strip()}"
+            )
         permissions_result = runner.run_command(
-            "chmod 700 {work_dir} && chmod 600 {daemon} {il} {setup} {token}".format(
+            "chmod 700 {work_dir} && chmod 600 {daemon} {il} {setup} {compat_setup} {token}".format(
                 work_dir=shlex.quote(self._remote_work_dir),
                 daemon=shlex.quote(remote_daemon),
                 il=shlex.quote(remote_il),
                 setup=shlex.quote(remote_setup),
+                compat_setup=shlex.quote(remote_compat_setup),
                 token=shlex.quote(remote_token),
-            )
+            ),
+            timeout=budget.remaining("finalize-bridge-permissions"),
+            retry_transport_errors=False,
         )
         if permissions_result.returncode != 0:
             raise RuntimeError(
@@ -507,9 +625,44 @@ class SSHClient:
                 f"{permissions_result.stderr.strip()}"
             )
 
+        for label, remote_path, expected_sha256 in (
+            ("daemon", remote_daemon, daemon_sha256),
+            ("SKILL bridge", remote_il, il_sha256),
+            ("setup", remote_setup, setup_sha256),
+            ("compatible setup", remote_compat_setup, setup_sha256),
+        ):
+            quoted = shlex.quote(remote_path)
+            digest_result = runner.run_command(
+                "if command -v sha256sum >/dev/null 2>&1; then "
+                f"sha256sum -- {quoted}; "
+                "elif command -v shasum >/dev/null 2>&1; then "
+                f"shasum -a 256 {quoted}; "
+                "elif command -v openssl >/dev/null 2>&1; then "
+                f"openssl dgst -sha256 {quoted}; "
+                "else exit 127; fi",
+                timeout=budget.remaining(f"verify-{label}-digest"),
+                retry_transport_errors=True,
+            )
+            match = re.search(r"(?i)(?<![0-9a-f])([0-9a-f]{64})(?![0-9a-f])", digest_result.stdout)
+            if digest_result.returncode != 0 or not match:
+                raise RuntimeError(
+                    f"Unable to verify deployed {label} digest: "
+                    f"{digest_result.stderr.strip() or digest_result.stdout.strip()}"
+                )
+            if match.group(1).lower() != expected_sha256:
+                raise RuntimeError(f"Deployed {label} digest mismatch")
+
         self._remote_setup_done = True
         self._remote_virtuoso_setup_path = remote_setup
         self._request_state_path = remote_request_state
+        self._deployed_daemon_sha256 = daemon_sha256
+        self._deployed_il_sha256 = il_sha256
+        self._deployed_setup_sha256 = setup_sha256
+        self._deployed_daemon_path = remote_daemon
+        self._deployed_il_path = remote_il
+        self._compat_setup_path = remote_compat_setup
+        self._deployment_id = deployment_id
+        self._daemon_filename = daemon_filename
         logger.info("Remote setup complete; setup script at %s (using %s)", remote_setup, python_cmd)
 
     def ensure_local_setup(self) -> None:
@@ -522,6 +675,13 @@ class SSHClient:
 
         daemon_local = _find_ramic_bridge_daemon(python_major)
         il_local = _find_ramic_bridge_il()
+        daemon_text = _canonical_resource_text(daemon_local)
+        il_text = _canonical_resource_text(il_local)
+        daemon_sha256 = _sha256_bytes(daemon_text.encode("utf-8"))
+        il_sha256 = _sha256_bytes(il_text.encode("utf-8"))
+        deployment_id = _sha256_bytes(
+            (daemon_sha256 + "\x00" + il_sha256).encode("ascii")
+        )
 
         # Determine local work directory
         if self._profile:
@@ -531,16 +691,18 @@ class SSHClient:
         work_dir.mkdir(parents=True, exist_ok=True)
 
         # Copy daemon and IL files into the work directory
-        local_daemon = work_dir / daemon_local.name
-        local_il = work_dir / "ramic_bridge.il"
-        local_setup = work_dir / "virtuoso_setup.il"
+        local_daemon = work_dir / (
+            f"{daemon_local.stem}.{daemon_sha256}{daemon_local.suffix}"
+        )
+        local_il = work_dir / f"ramic_bridge.{il_sha256}.il"
+        local_setup = work_dir / f"virtuoso_setup.{deployment_id}.il"
+        local_compat_setup = work_dir / "virtuoso_setup.il"
         local_token = _auth_token_file(self._profile)
         local_request_state = work_dir / "request-status.json"
 
-        shutil.copy2(daemon_local, local_daemon)
+        local_daemon.write_bytes(daemon_text.encode("utf-8"))
 
-        il_content = il_local.read_text(encoding="utf-8")
-        local_il.write_text(il_content, encoding="utf-8")
+        local_il.write_bytes(il_text.encode("utf-8"))
 
         local_token.parent.mkdir(parents=True, exist_ok=True)
         local_token.write_text(self._auth_token + "\n", encoding="utf-8")
@@ -559,12 +721,24 @@ class SSHClient:
             allow_remote_bind=self._allow_remote_bind,
             profile=self._profile,
         )
-        local_setup.write_text(setup_content, encoding="utf-8")
+        if not setup_content.endswith("\n"):
+            setup_content += "\n"
+        setup_sha256 = _sha256_bytes(setup_content.encode("utf-8"))
+        local_setup.write_bytes(setup_content.encode("utf-8"))
+        local_compat_setup.write_bytes(setup_content.encode("utf-8"))
 
         self._remote_setup_done = True
         self._remote_virtuoso_setup_path = str(local_setup)
         self._remote_work_dir = str(work_dir)
         self._request_state_path = str(local_request_state)
+        self._deployed_daemon_sha256 = daemon_sha256
+        self._deployed_il_sha256 = il_sha256
+        self._deployed_setup_sha256 = setup_sha256
+        self._deployed_daemon_path = str(local_daemon)
+        self._deployed_il_path = str(local_il)
+        self._compat_setup_path = str(local_compat_setup)
+        self._deployment_id = deployment_id
+        self._daemon_filename = daemon_local.name
         logger.info(
             "Local setup complete; setup script at %s (using %s)",
             local_setup, python_cmd,
@@ -572,11 +746,17 @@ class SSHClient:
 
     # -- SSH tunnel (delegated to SSHRunner) ----------------------------------
 
-    def ensure_tunnel(self) -> None:
+    def ensure_tunnel(
+        self,
+        timeout: float | None = None,
+        *,
+        _budget: _TimeoutBudget | None = None,
+    ) -> None:
         """Ensure SSH tunnel is running, auto-retry on port conflict."""
         if _is_localhost(self._remote_host):
             return
         runner = self._require_runner()
+        budget = _budget or _TimeoutBudget.start(timeout, self._timeout)
         if runner.is_tunnel_alive:
             return
         if SSHRunner.can_reach_port(self._local_port):
@@ -589,9 +769,11 @@ class SSHClient:
         max_attempts = 10
         local_port = self._local_port
         for attempt in range(max_attempts):
+            budget.remaining("start-ssh-tunnel")
             settle = _TUNNEL_STARTUP_SETTLE_SECONDS
             if self._jump_host:
                 settle = max(settle, 3.0)
+            settle = min(settle, budget.remaining("start-ssh-tunnel"))
             proc = runner.start_port_forward(local_port, settle=settle, remote_port=self._port)
             if proc is None:
                 # Reusing existing tunnel
@@ -624,16 +806,17 @@ class SSHClient:
 
     def warm(self, timeout: int = 15) -> None:
         """Full startup: remote setup + persistent shell + tunnel."""
+        budget = _TimeoutBudget.start(timeout, self._timeout)
         if _is_localhost(self._remote_host):
             self.ensure_local_setup()
             self.save_state()
             return
         try:
-            self.ensure_remote_setup()
+            self.ensure_remote_setup(_budget=budget)
             runner = self._require_runner()
             if runner.persistent_shell_enabled:
-                runner.ensure_persistent_shell(timeout=timeout)
-            self.ensure_tunnel()
+                runner.ensure_persistent_shell(_budget=budget)
+            self.ensure_tunnel(_budget=budget)
             self.save_state()
         except Exception:
             try:
@@ -692,29 +875,48 @@ class SSHClient:
     def save_state(self) -> None:
         """Save tunnel state so other processes can find the port."""
         state_dir().mkdir(parents=True, exist_ok=True)
+        previous_state = self.read_state(self._profile) or {}
+        previous_setup_path = previous_state.get("previous_setup_path")
+        previous_daemon_sha256 = previous_state.get("previous_deployed_daemon_sha256")
+        existing_setup_path = previous_state.get("setup_path")
+        if existing_setup_path and existing_setup_path != self._remote_virtuoso_setup_path:
+            previous_setup_path = existing_setup_path
+            previous_daemon_sha256 = previous_state.get("deployed_daemon_sha256")
         is_local = _is_localhost(self._remote_host)
         tunnel_pid = None
         if not is_local:
             tunnel_pid = self._require_runner().tunnel_pid
         state = {
+            "state_schema_version": 2,
             "mode": "local" if is_local else "remote",
             "port": self._port if is_local else self._local_port,
             "tunnel_pid": tunnel_pid,
             "remote_host": self._remote_host,
             "setup_path": self._remote_virtuoso_setup_path,
+            "previous_setup_path": previous_setup_path,
             "request_state_path": self._request_state_path,
+            "deployed_daemon_sha256": self._deployed_daemon_sha256,
+            "deployed_il_sha256": self._deployed_il_sha256,
+            "deployed_setup_sha256": self._deployed_setup_sha256,
+            "deployed_daemon_path": self._deployed_daemon_path,
+            "deployed_il_path": self._deployed_il_path,
+            "compat_setup_path": self._compat_setup_path,
+            "deployment_id": self._deployment_id,
+            "daemon_filename": self._daemon_filename,
+            "previous_deployed_daemon_sha256": previous_daemon_sha256,
             "bind_policy": "remote-explicit" if self._allow_remote_bind else "loopback",
             "auth_enabled": bool(self._auth_token),
             "profile": self._profile,
             "started_at": time.time(),
         }
-        _state_file(self._profile).write_text(json.dumps(state, indent=2), encoding="utf-8")
+        _atomic_write_json(_state_file(self._profile), state)
 
     @classmethod
     def read_request_status(
         cls,
         profile: str | None = None,
         request_id: str | None = None,
+        timeout: float = 10.0,
     ) -> dict[str, Any] | None:
         """Read the daemon ledger over SSH, independent of the SKILL channel."""
         profile = resolve_profile(profile)
@@ -738,7 +940,7 @@ class SSHClient:
             try:
                 result = client._require_runner().run_command(
                     f"cat -- {shlex.quote(path)}",
-                    timeout=10,
+                    timeout=timeout,
                 )
                 if result.returncode != 0:
                     return None
@@ -751,15 +953,151 @@ class SSHClient:
             return payload
         for entry in payload.get("requests", []):
             if entry.get("request_id") == request_id:
-                return {
+                filtered = {
                     "schema_version": payload.get("schema_version"),
                     "daemon_epoch": payload.get("daemon_epoch"),
                     "request": entry,
                 }
-        return {
+                for key in (
+                    "protocol_version",
+                    "protocol_versions",
+                    "daemon_build_sha256",
+                    "capabilities",
+                    "daemon_started_at_epoch",
+                    "heartbeat_at_epoch",
+                    "active_request_id",
+                    "queue_depth",
+                    "queue_capacity",
+                ):
+                    if key in payload:
+                        filtered[key] = payload.get(key)
+                return filtered
+        filtered = {
             "schema_version": payload.get("schema_version"),
             "daemon_epoch": payload.get("daemon_epoch"),
             "request": None,
+        }
+        for key in (
+            "protocol_version",
+            "protocol_versions",
+            "daemon_build_sha256",
+            "capabilities",
+            "daemon_started_at_epoch",
+            "heartbeat_at_epoch",
+            "active_request_id",
+            "queue_depth",
+            "queue_capacity",
+        ):
+            if key in payload:
+                filtered[key] = payload.get(key)
+        return filtered
+
+    @classmethod
+    def deployment_status(
+        cls,
+        profile: str | None = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Compare local resources, staged files, and the running daemon."""
+        profile = resolve_profile(profile)
+        state = cls.read_state(profile) or {}
+        source_variants: dict[str, str] = {}
+        for major in (2, 3):
+            daemon_path = _find_ramic_bridge_daemon(major)
+            daemon_text = _canonical_resource_text(daemon_path)
+            source_variants[daemon_path.name] = _sha256_bytes(daemon_text.encode("utf-8"))
+        il_text = _canonical_resource_text(_find_ramic_bridge_il())
+        il_sha256 = _sha256_bytes(il_text.encode("utf-8"))
+        selected_name = str(state.get("daemon_filename") or "")
+        local_daemon_sha256 = source_variants.get(selected_name)
+        running = cls.read_request_status(profile, timeout=timeout)
+        running_sha256 = (
+            str(running.get("daemon_build_sha256") or "") if running else ""
+        )
+        deployed_sha256 = str(state.get("deployed_daemon_sha256") or "")
+        deployed_path = str(state.get("deployed_daemon_path") or "")
+        actual_deployed_sha256 = ""
+        actual_digest_error: str | None = None
+        if deployed_path:
+            if state.get("mode") == "local":
+                try:
+                    actual_deployed_sha256 = _sha256_bytes(Path(deployed_path).read_bytes())
+                except OSError as exc:
+                    actual_digest_error = str(exc)
+            else:
+                client = cls.from_env(
+                    keep_remote_files=True,
+                    profile=profile,
+                    create_auth_token=False,
+                )
+                try:
+                    quoted = shlex.quote(deployed_path)
+                    result = client._require_runner().run_command(
+                        "if command -v sha256sum >/dev/null 2>&1; then "
+                        f"sha256sum -- {quoted}; "
+                        "elif command -v shasum >/dev/null 2>&1; then "
+                        f"shasum -a 256 {quoted}; "
+                        "elif command -v openssl >/dev/null 2>&1; then "
+                        f"openssl dgst -sha256 {quoted}; "
+                        "else exit 127; fi",
+                        timeout=timeout,
+                        retry_transport_errors=True,
+                    )
+                    match = re.search(
+                        r"(?i)(?<![0-9a-f])([0-9a-f]{64})(?![0-9a-f])",
+                        result.stdout,
+                    )
+                    if result.returncode == 0 and match:
+                        actual_deployed_sha256 = match.group(1).lower()
+                    else:
+                        actual_digest_error = (
+                            result.stderr.strip() or result.stdout.strip()
+                            or "remote digest unavailable"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    actual_digest_error = str(exc)
+                finally:
+                    client.close()
+        heartbeat_value = running.get("heartbeat_at_epoch") if running else None
+        heartbeat_age_seconds: float | None = None
+        try:
+            heartbeat_age_seconds = max(0.0, time.time() - float(heartbeat_value))
+        except (TypeError, ValueError):
+            pass
+        return {
+            "schema_version": 1,
+            "profile": profile,
+            "deployment_id": state.get("deployment_id"),
+            "setup_path": state.get("setup_path"),
+            "previous_setup_path": state.get("previous_setup_path"),
+            "daemon_filename": selected_name or None,
+            "local_daemon_sha256": local_daemon_sha256,
+            "local_daemon_variants": source_variants,
+            "local_il_sha256": il_sha256,
+            "deployed_daemon_sha256": deployed_sha256 or None,
+            "deployed_daemon_path": deployed_path or None,
+            "actual_deployed_daemon_sha256": actual_deployed_sha256 or None,
+            "actual_digest_error": actual_digest_error,
+            "deployed_il_sha256": state.get("deployed_il_sha256"),
+            "deployed_setup_sha256": state.get("deployed_setup_sha256"),
+            "running_daemon_sha256": running_sha256 or None,
+            "running_daemon_epoch": running.get("daemon_epoch") if running else None,
+            "running_heartbeat_age_seconds": heartbeat_age_seconds,
+            "running_protocol_versions": running.get("protocol_versions") if running else None,
+            "running_capabilities": running.get("capabilities") if running else None,
+            "local_matches_deployed": bool(
+                local_daemon_sha256
+                and deployed_sha256 == local_daemon_sha256
+                and actual_deployed_sha256 == deployed_sha256
+            ),
+            "deployed_matches_running": bool(
+                deployed_sha256 and running_sha256 == deployed_sha256
+            ),
+            "running_available": running is not None,
+            "running_heartbeat_fresh": bool(
+                heartbeat_age_seconds is not None and heartbeat_age_seconds <= 5.0
+            ),
         }
 
     @staticmethod
@@ -807,18 +1145,57 @@ class SSHClient:
 
     # -- file transfer (delegated to SSHRunner) -----------------------------
 
-    def upload_file(self, local_path: Path, remote_path: str, timeout: int | None = None) -> CommandResult:
+    def upload_file(
+        self,
+        local_path: Path,
+        remote_path: str,
+        timeout: int | None = None,
+        *,
+        retry_transport_errors: bool = False,
+    ) -> CommandResult:
         runner = self._require_runner()
-        return runner.upload(local_path, remote_path, timeout=timeout or self._timeout)
+        return runner.upload(
+            local_path,
+            remote_path,
+            timeout=timeout or self._timeout,
+            retry_transport_errors=retry_transport_errors,
+        )
 
     def download_file(self, remote_path: str, local_path: Path, timeout: int | None = None, recursive: bool = False) -> CommandResult:
         runner = self._require_runner()
         return runner.download(remote_path, local_path, recursive=recursive, timeout=timeout or self._timeout)
 
-    def upload_text(self, text: str, remote_path: str, timeout: int | None = None) -> CommandResult:
+    def upload_text(
+        self,
+        text: str,
+        remote_path: str,
+        timeout: int | None = None,
+        *,
+        retry_transport_errors: bool = False,
+    ) -> CommandResult:
         runner = self._require_runner()
-        return runner.upload_text(text, remote_path, timeout=timeout or self._timeout)
+        return runner.upload_text(
+            text,
+            remote_path,
+            timeout=timeout or self._timeout,
+            retry_transport_errors=retry_transport_errors,
+        )
 
-    def run_command(self, cmd: str, timeout: int | None = None) -> CommandResult:
+    def run_command(
+        self,
+        cmd: str,
+        timeout: int | None = None,
+        *,
+        operation_class: str = "unknown",
+        retry_transport_errors: bool | None = None,
+    ) -> CommandResult:
         runner = self._require_runner()
-        return runner.run_command(cmd, timeout=timeout or self._timeout)
+        if operation_class not in {"unknown", "read_only", "mutating"}:
+            raise ValueError("operation_class must be unknown, read_only, or mutating")
+        if retry_transport_errors is None:
+            retry_transport_errors = operation_class == "read_only"
+        return runner.run_command(
+            cmd,
+            timeout=timeout or self._timeout,
+            retry_transport_errors=retry_transport_errors,
+        )

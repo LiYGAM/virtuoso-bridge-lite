@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import hashlib
+import struct
 import time
 import uuid
 from pathlib import Path
@@ -42,9 +43,13 @@ logger = logging.getLogger(__name__)
 _STX = "\x02"
 _NAK = "\x15"
 _RECV_BUF_SIZE = 1024 * 1024
+_MAX_CLIENT_RESPONSE_BYTES = 32 * 1024 * 1024
 _TUNNEL_CONNECT_RETRY_DELAY = 0.2
 _TUNNEL_CONNECT_GRACE_SECONDS = 3.0
 _DAEMON_TIMEOUT_RETURN_GRACE_SECONDS = 0.5
+_V3_MAGIC = b"VBR3\x00"
+_V3_FOOTER = b"\x1eVBR3-END\x1e"
+_MAX_V3_HEADER_BYTES = 64 * 1024
 
 
 class _SkillRequestTimeout(socket.timeout):
@@ -53,6 +58,78 @@ class _SkillRequestTimeout(socket.timeout):
     def __init__(self, *, dispatched: bool) -> None:
         super().__init__()
         self.dispatched = dispatched
+
+
+class _SkillRequestTransportError(OSError):
+    """A socket failure annotated with whether request delivery began."""
+
+    def __init__(self, error: OSError, *, dispatched: bool) -> None:
+        super().__init__(*error.args)
+        self.error = error
+        self.dispatched = dispatched
+
+
+class _V3FrameError(ValueError):
+    pass
+
+
+def _parse_v3_frame(raw: bytes, expected_request_id: str) -> tuple[dict[str, Any], bytes]:
+    if not raw.startswith(_V3_MAGIC):
+        raise _V3FrameError("missing VBR3 magic")
+    prefix_size = len(_V3_MAGIC) + 4
+    if len(raw) < prefix_size:
+        raise _V3FrameError("truncated VBR3 header length")
+    header_length = struct.unpack(">I", raw[len(_V3_MAGIC):prefix_size])[0]
+    if header_length < 2 or header_length > _MAX_V3_HEADER_BYTES:
+        raise _V3FrameError("invalid VBR3 header length")
+    header_end = prefix_size + header_length
+    if len(raw) < header_end:
+        raise _V3FrameError("truncated VBR3 header")
+    try:
+        header = json.loads(raw[prefix_size:header_end].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _V3FrameError("invalid VBR3 header JSON") from exc
+    if not isinstance(header, dict) or header.get("protocol_version") != 3:
+        raise _V3FrameError("invalid VBR3 protocol version")
+    if header.get("request_id") != expected_request_id:
+        raise _V3FrameError("VBR3 request_id mismatch")
+    if not str(header.get("daemon_epoch") or ""):
+        raise _V3FrameError("VBR3 daemon epoch is missing")
+    status = str(header.get("status") or "")
+    marker = str(header.get("marker") or "")
+    allowed_statuses = {
+        "succeeded",
+        "succeeded_after_timeout",
+        "failed",
+        "failed_after_timeout",
+        "timed_out_unknown",
+        "duplicate_pending",
+        "transport_unknown",
+        "busy",
+        "rejected",
+    }
+    if status not in allowed_statuses:
+        raise _V3FrameError("invalid VBR3 response status")
+    expected_marker = (
+        "STX" if status in {"succeeded", "succeeded_after_timeout"} else "NAK"
+    )
+    if marker != expected_marker:
+        raise _V3FrameError("VBR3 status/marker mismatch")
+    payload_length = header.get("payload_length")
+    if not isinstance(payload_length, int) or isinstance(payload_length, bool):
+        raise _V3FrameError("invalid VBR3 payload length")
+    if payload_length < 0 or payload_length > _MAX_CLIENT_RESPONSE_BYTES:
+        raise _V3FrameError("VBR3 payload exceeds the client size limit")
+    expected_size = header_end + payload_length + len(_V3_FOOTER)
+    if len(raw) != expected_size:
+        raise _V3FrameError("VBR3 frame length mismatch")
+    payload = raw[header_end:header_end + payload_length]
+    if raw[header_end + payload_length:] != _V3_FOOTER:
+        raise _V3FrameError("invalid VBR3 footer")
+    digest = str(header.get("payload_sha256") or "")
+    if len(digest) != 64 or hashlib.sha256(payload).hexdigest() != digest:
+        raise _V3FrameError("VBR3 payload digest mismatch")
+    return header, payload
 
 
 def _default_remote_port(username: str | None = None) -> int:
@@ -379,6 +456,11 @@ class VirtuosoClient(VirtuosoInterface):
         request_id = request_id or str(uuid.uuid4())
         if not isinstance(operation_class, OperationClass):
             operation_class = OperationClass(str(operation_class))
+        request_digest = hashlib.sha256(
+            (operation_class.value + "\x00" + skill_code).encode("utf-8")
+        ).hexdigest()
+        protocol_version = 3
+        used_v2_fallback = False
 
         start_time = time.monotonic()
         deadline = start_time + effective_timeout
@@ -403,13 +485,27 @@ class VirtuosoClient(VirtuosoInterface):
                         deadline,
                         request_id=request_id,
                         operation_class=operation_class,
+                        protocol_version=protocol_version,
                     )
+                    if (
+                        protocol_version == 3
+                        and not used_v2_fallback
+                        and raw_response == b"\x15PROTOCOL_V2_REQUIRED"
+                    ):
+                        protocol_version = 2
+                        used_v2_fallback = True
+                        logger.info(
+                            "Daemon rejected protocol v3 before execution; retrying request %s with v2",
+                            request_id,
+                        )
+                        continue
                     elapsed = time.monotonic() - start_time
                     result = self._parse_response(
                         raw_response,
                         elapsed,
                         operation_class=operation_class,
                         request_id=request_id,
+                        request_digest_sha256=request_digest,
                     )
                     logger.debug("execute_skill OK (%.3fs)", elapsed)
                     return result
@@ -417,14 +513,24 @@ class VirtuosoClient(VirtuosoInterface):
                     # Preserve whether sendall() began; the generic OSError
                     # retry path below would otherwise discard this evidence.
                     raise
-                except ConnectionRefusedError:
+                except _SkillRequestTransportError as exc:
+                    # Never retry once sendall() has begun.  A mutating request
+                    # may already be running even though the reply connection
+                    # was reset or closed before a response arrived.
+                    if exc.dispatched:
+                        raise
                     now = time.monotonic()
                     if now >= deadline:
-                        raise socket.timeout
-                    if now >= connect_deadline:
+                        raise socket.timeout from exc
+                    if not self._should_retry_tunnel_connect(
+                        exc.error, now, connect_deadline
+                    ):
                         raise
-                    logger.debug("Connection refused, retrying (deadline in %.1fs)",
-                                 connect_deadline - now)
+                    logger.debug(
+                        "Pre-dispatch OSError %s, retrying (deadline in %.1fs)",
+                        exc.error,
+                        connect_deadline - now,
+                    )
                     time.sleep(min(_TUNNEL_CONNECT_RETRY_DELAY, connect_deadline - now))
                 except OSError as exc:
                     now = time.monotonic()
@@ -450,10 +556,35 @@ class VirtuosoClient(VirtuosoInterface):
                 status=ExecutionStatus.ERROR,
                 errors=[f"Socket timeout after {effective_timeout}s"],
                 execution_time=elapsed,
+                metadata={"request_digest_sha256": request_digest},
                 operation_class=operation_class,
                 completion=completion,
                 request_id=request_id,
-                protocol_version=2,
+                protocol_version=protocol_version,
+            )
+        except _SkillRequestTransportError as exc:
+            elapsed = time.monotonic() - start_time
+            completion = (
+                CompletionStatus.TIMED_OUT_UNKNOWN
+                if exc.dispatched
+                else CompletionStatus.NOT_DISPATCHED
+            )
+            logger.warning(
+                "Socket error %s %s:%d: %s",
+                "after request dispatch to" if exc.dispatched else "connecting to",
+                self._host,
+                self._port,
+                exc.error,
+            )
+            return VirtuosoResult(
+                status=ExecutionStatus.ERROR,
+                errors=[f"Socket error: {exc.error}"],
+                execution_time=elapsed,
+                metadata={"request_digest_sha256": request_digest},
+                operation_class=operation_class,
+                completion=completion,
+                request_id=request_id,
+                protocol_version=protocol_version,
             )
         except socket.timeout:
             elapsed = time.monotonic() - start_time
@@ -463,10 +594,11 @@ class VirtuosoClient(VirtuosoInterface):
                 status=ExecutionStatus.ERROR,
                 errors=[f"Socket timeout after {effective_timeout}s"],
                 execution_time=elapsed,
+                metadata={"request_digest_sha256": request_digest},
                 operation_class=operation_class,
                 completion=CompletionStatus.NOT_DISPATCHED,
                 request_id=request_id,
-                protocol_version=2,
+                protocol_version=protocol_version,
             )
         except ConnectionRefusedError:
             elapsed = time.monotonic() - start_time
@@ -479,9 +611,11 @@ class VirtuosoClient(VirtuosoInterface):
                     "Ensure the RAMIC Bridge daemon is running in Virtuoso."
                 ],
                 execution_time=elapsed,
+                metadata={"request_digest_sha256": request_digest},
                 operation_class=operation_class,
+                completion=CompletionStatus.NOT_DISPATCHED,
                 request_id=request_id,
-                protocol_version=2,
+                protocol_version=protocol_version,
             )
         except OSError as exc:
             elapsed = time.monotonic() - start_time
@@ -491,9 +625,11 @@ class VirtuosoClient(VirtuosoInterface):
                 status=ExecutionStatus.ERROR,
                 errors=[f"Socket error: {exc}"],
                 execution_time=elapsed,
+                metadata={"request_digest_sha256": request_digest},
                 operation_class=operation_class,
+                completion=CompletionStatus.NOT_DISPATCHED,
                 request_id=request_id,
-                protocol_version=2,
+                protocol_version=protocol_version,
             )
 
     def test_connection(self, timeout: int = 10) -> bool:
@@ -1429,27 +1565,35 @@ let((result winName ciwNum)
 
     def load_il(self, path: str | Path, timeout: int | None = None) -> VirtuosoResult:
         """Load an IL file in Virtuoso."""
+        effective_timeout = timeout if timeout is not None else self._timeout
+        deadline = time.monotonic() + effective_timeout
         try:
-            prepared, uploaded = self._prepare_il_path(path)
+            prepared, uploaded = self._prepare_il_path(
+                path,
+                timeout=self._remaining_timeout(deadline),
+            )
         except Exception as e:
             return VirtuosoResult(
                 status=ExecutionStatus.ERROR,
                 errors=[f"Failed to prepare IL path: {e}"],
+                operation_class=OperationClass.MUTATING,
+                completion=CompletionStatus.NOT_DISPATCHED,
             )
 
-        effective_timeout = timeout if timeout is not None else self._timeout
         skill_command = f'load("{_escape_for_skill_evalstring_source(prepared)}")'
         result = self.execute_skill(
             skill_command,
-            timeout=effective_timeout,
+            timeout=self._remaining_timeout(deadline),
             operation_class=OperationClass.MUTATING,
         )
 
         if self._log_to_ciw and result.status == ExecutionStatus.SUCCESS:
-            self.ciw_log(
-                f'printf("[RAMIC] loaded {_escape_skill_string(prepared)}\\n")',
-                timeout=5,
-            )
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self.ciw_log(
+                    f'printf("[RAMIC] loaded {_escape_skill_string(prepared)}\\n")',
+                    timeout=min(5, remaining),
+                )
 
         result.metadata["uploaded"] = uploaded
         result.metadata["skill_command"] = skill_command
@@ -1460,20 +1604,35 @@ let((result winName ciwNum)
                     mode: str = "a", open_window: bool = True,
                     save: bool = False, timeout: int | None = None) -> VirtuosoResult:
         effective_timeout = timeout if timeout is not None else self._timeout
-        opened = self.open_cell_view(lib, cell, view=view, view_type=view_type, mode=mode, timeout=effective_timeout)
+        deadline = time.monotonic() + effective_timeout
+        opened = self.open_cell_view(
+            lib, cell, view=view, view_type=view_type, mode=mode,
+            timeout=self._remaining_timeout(deadline),
+        )
         if opened.status != ExecutionStatus.SUCCESS:
             return opened
         if open_window:
-            window_result = self.open_window(lib, cell, view=view, view_type=view_type, timeout=effective_timeout)
+            window_result = self.open_window(
+                lib, cell, view=view, view_type=view_type,
+                timeout=self._remaining_timeout(deadline),
+            )
             if window_result.status != ExecutionStatus.SUCCESS:
                 return window_result
-        sync_result = self.execute_skill("cv = geGetEditCellView()", timeout=effective_timeout)
+        sync_result = self.execute_skill(
+            "cv = geGetEditCellView()",
+            timeout=self._remaining_timeout(deadline),
+        )
         if sync_result.status != ExecutionStatus.SUCCESS:
             return sync_result
-        load_result = self.load_il(path, timeout=effective_timeout)
+        load_result = self.load_il(
+            path,
+            timeout=self._remaining_timeout(deadline),
+        )
         if load_result.status != ExecutionStatus.SUCCESS or not save:
             return load_result
-        save_result = self.save_current_cellview(timeout=effective_timeout)
+        save_result = self.save_current_cellview(
+            timeout=self._remaining_timeout(deadline)
+        )
         save_result.metadata["load_result"] = load_result.model_dump(mode="json")
         return save_result
 
@@ -1490,7 +1649,12 @@ let((result winName ciwNum)
 
     # -- private helpers ----------------------------------------------------
 
-    def _prepare_il_path(self, path: str | Path) -> tuple[str, bool]:
+    def _prepare_il_path(
+        self,
+        path: str | Path,
+        *,
+        timeout: float | None = None,
+    ) -> tuple[str, bool]:
         """Return (remote_path, uploaded) where uploaded=False means cache hit."""
         p = Path(path)
         if self._tunnel is not None and p.is_file():
@@ -1518,7 +1682,12 @@ let((result winName ciwNum)
             cached = self._il_upload_cache.get(str(p))
             if cached and cached[0] == md5:
                 return cached[1], False
-            up = self._tunnel.upload_text(content.decode("utf-8"), remote_path)
+            up = self._tunnel.upload_text(
+                content.decode("utf-8"),
+                remote_path,
+                timeout=timeout,
+                retry_transport_errors=False,
+            )
             if up.returncode != 0:
                 raise RuntimeError(f"Failed to upload IL file {p.name}: {up.stderr.strip()}")
             remote_posix = _path_to_posix(remote_path)
@@ -1534,7 +1703,8 @@ let((result winName ciwNum)
         *,
         request_id: str,
         operation_class: OperationClass,
-    ) -> str:
+        protocol_version: int = 3,
+    ) -> bytes:
         dispatched = False
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1553,7 +1723,8 @@ let((result winName ciwNum)
                 )
                 payload = json.dumps(
                     {
-                        "protocol_version": 2,
+                        "protocol_version": protocol_version,
+                        "supported_protocol_versions": [3, 2],
                         "request_id": request_id,
                         "operation_class": operation_class.value,
                         "auth_token": self._auth_token,
@@ -1568,17 +1739,26 @@ let((result winName ciwNum)
                 s.sendall(payload)
                 s.shutdown(socket.SHUT_WR)
                 chunks: list[bytes] = []
+                received_bytes = 0
                 while True:
                     s.settimeout(self._remaining_timeout(deadline))
                     chunk = s.recv(_RECV_BUF_SIZE)
                     if not chunk:
                         break
+                    received_bytes += len(chunk)
+                    if received_bytes > _MAX_CLIENT_RESPONSE_BYTES:
+                        raise OSError(
+                            getattr(errno, "EMSGSIZE", 90),
+                            "Bridge response exceeded the client size limit",
+                        )
                     chunks.append(chunk)
-                raw = b"".join(chunks).decode("utf-8", errors="ignore")
+                raw = b"".join(chunks)
                 logger.debug("TCP received %d bytes", len(raw))
                 return raw
         except socket.timeout as exc:
             raise _SkillRequestTimeout(dispatched=dispatched) from exc
+        except OSError as exc:
+            raise _SkillRequestTransportError(exc, dispatched=dispatched) from exc
 
     @staticmethod
     def _remaining_timeout(deadline: float) -> float:
@@ -1600,55 +1780,205 @@ let((result winName ciwNum)
 
     @staticmethod
     def _parse_response(
-        raw: str,
+        raw: bytes | str,
         elapsed: float,
         *,
         operation_class: OperationClass = OperationClass.UNKNOWN,
         request_id: str | None = None,
+        request_digest_sha256: str | None = None,
     ) -> VirtuosoResult:
+        raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw
+        base_metadata: dict[str, Any] = {
+            "request_digest_sha256": request_digest_sha256,
+        }
         if not raw:
             return VirtuosoResult(
                 status=ExecutionStatus.ERROR,
                 errors=["Empty response from daemon"],
                 execution_time=elapsed,
+                metadata=base_metadata,
                 operation_class=operation_class,
+                completion=CompletionStatus.TIMED_OUT_UNKNOWN,
                 request_id=request_id,
-                protocol_version=2,
+                protocol_version=3,
             )
-        if "TimeoutError" in raw:
+
+        if raw_bytes.startswith(_V3_MAGIC):
+            try:
+                header, payload_bytes = _parse_v3_frame(
+                    raw_bytes, expected_request_id=str(request_id or "")
+                )
+                daemon_request_digest = str(
+                    header.get("request_digest_sha256") or ""
+                )
+                if (
+                    request_digest_sha256
+                    and daemon_request_digest != request_digest_sha256
+                ):
+                    raise _V3FrameError("VBR3 request digest mismatch")
+                payload = payload_bytes.decode("utf-8")
+            except (_V3FrameError, UnicodeDecodeError) as exc:
+                metadata = dict(base_metadata)
+                metadata.update({
+                    "frame_integrity": "invalid",
+                    "frame_error": str(exc),
+                })
+                return VirtuosoResult(
+                    status=ExecutionStatus.ERROR,
+                    errors=[f"Invalid protocol-v3 response frame: {exc}"],
+                    execution_time=elapsed,
+                    metadata=metadata,
+                    operation_class=operation_class,
+                    completion=CompletionStatus.TIMED_OUT_UNKNOWN,
+                    request_id=request_id,
+                    protocol_version=3,
+                )
+
+            response_status = str(header.get("status") or "")
+            metadata = dict(base_metadata)
+            metadata.update({
+                "frame_integrity": "verified",
+                "daemon_epoch": header.get("daemon_epoch"),
+                "daemon_build_sha256": header.get("daemon_build_sha256"),
+                "supported_protocol_versions": header.get(
+                    "supported_protocol_versions"
+                ),
+                "daemon_capabilities": header.get("capabilities"),
+                "response_status": response_status,
+                "response_marker": header.get("marker"),
+                "payload_length": header.get("payload_length"),
+                "payload_sha256": header.get("payload_sha256"),
+            })
+            for key in ("retry_after", "queue_depth", "queue_capacity"):
+                if key in header:
+                    metadata[key] = header.get(key)
+            if header.get("request_digest_sha256"):
+                metadata["daemon_request_digest_sha256"] = header.get(
+                    "request_digest_sha256"
+                )
+            if response_status in {"succeeded", "succeeded_after_timeout"}:
+                warnings = (
+                    ["Response was replayed after the original client timeout"]
+                    if response_status == "succeeded_after_timeout"
+                    else []
+                )
+                return VirtuosoResult(
+                    status=ExecutionStatus.SUCCESS,
+                    output=payload,
+                    warnings=warnings,
+                    execution_time=elapsed,
+                    metadata=metadata,
+                    operation_class=operation_class,
+                    completion=CompletionStatus.CONFIRMED,
+                    request_id=request_id,
+                    protocol_version=3,
+                )
+            if response_status in {"failed", "failed_after_timeout"}:
+                return VirtuosoResult(
+                    status=ExecutionStatus.ERROR,
+                    errors=[payload],
+                    execution_time=elapsed,
+                    metadata=metadata,
+                    operation_class=operation_class,
+                    completion=CompletionStatus.CONFIRMED,
+                    request_id=request_id,
+                    protocol_version=3,
+                )
+            if response_status in {"busy", "rejected"}:
+                return VirtuosoResult(
+                    status=ExecutionStatus.ERROR,
+                    errors=[payload or response_status],
+                    execution_time=elapsed,
+                    metadata=metadata,
+                    operation_class=operation_class,
+                    completion=CompletionStatus.NOT_DISPATCHED,
+                    request_id=request_id,
+                    protocol_version=3,
+                )
             return VirtuosoResult(
                 status=ExecutionStatus.ERROR,
-                errors=["SKILL execution timeout in Virtuoso"],
+                errors=[payload or response_status or "Unknown protocol-v3 response status"],
                 execution_time=elapsed,
+                metadata=metadata,
+                operation_class=operation_class,
+                completion=CompletionStatus.TIMED_OUT_UNKNOWN,
+                request_id=request_id,
+                protocol_version=3,
+            )
+
+        try:
+            raw_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            metadata = dict(base_metadata)
+            metadata.update({"frame_integrity": "invalid", "frame_error": str(exc)})
+            return VirtuosoResult(
+                status=ExecutionStatus.ERROR,
+                errors=["Legacy daemon response was not valid UTF-8"],
+                execution_time=elapsed,
+                metadata=metadata,
                 operation_class=operation_class,
                 completion=CompletionStatus.TIMED_OUT_UNKNOWN,
                 request_id=request_id,
                 protocol_version=2,
             )
-        if raw.startswith(_STX):
+        base_metadata["frame_integrity"] = "legacy_unframed"
+        if "TimeoutError" in raw_text:
+            return VirtuosoResult(
+                status=ExecutionStatus.ERROR,
+                errors=["SKILL execution timeout in Virtuoso"],
+                execution_time=elapsed,
+                metadata=base_metadata,
+                operation_class=operation_class,
+                completion=CompletionStatus.TIMED_OUT_UNKNOWN,
+                request_id=request_id,
+                protocol_version=2,
+            )
+        if raw_text.startswith(_STX):
             return VirtuosoResult(
                 status=ExecutionStatus.SUCCESS,
-                output=raw[1:],
+                output=raw_text[1:],
                 execution_time=elapsed,
+                metadata=base_metadata,
                 operation_class=operation_class,
                 request_id=request_id,
                 protocol_version=2,
             )
-        if raw.startswith(_NAK):
+        if raw_text.startswith(_NAK):
+            error_text = raw_text[1:]
+            if error_text in {
+                "REQUEST_ALREADY_SEEN_NO_CACHED_RESPONSE",
+                "RESPONSE_DRAIN_TIMEOUT_DAEMON_RETIRED",
+                "RESPONSE_TOO_LARGE",
+            }:
+                completion = CompletionStatus.TIMED_OUT_UNKNOWN
+            elif error_text.startswith("BRIDGE_BUSY") or error_text in {
+                "AUTH_REQUIRED",
+                "PROTOCOL_V2_REQUIRED",
+                "BRIDGE_RETIRED",
+                "REQUEST_ID_CONFLICT",
+                "REQUEST_TOO_LARGE",
+                "REQUEST_READ_TIMEOUT",
+            }:
+                completion = CompletionStatus.NOT_DISPATCHED
+            else:
+                completion = CompletionStatus.CONFIRMED
             return VirtuosoResult(
                 status=ExecutionStatus.ERROR,
-                errors=[raw[1:]],
+                errors=[error_text],
                 execution_time=elapsed,
+                metadata=base_metadata,
                 operation_class=operation_class,
+                completion=completion,
                 request_id=request_id,
                 protocol_version=2,
             )
         return VirtuosoResult(
-            status=ExecutionStatus.SUCCESS,
-            output=raw,
+            status=ExecutionStatus.ERROR,
+            errors=["Legacy daemon response did not contain a complete status marker"],
             execution_time=elapsed,
-            warnings=["Response did not contain a standard status marker"],
+            metadata=base_metadata,
             operation_class=operation_class,
+            completion=CompletionStatus.TIMED_OUT_UNKNOWN,
             request_id=request_id,
             protocol_version=2,
         )

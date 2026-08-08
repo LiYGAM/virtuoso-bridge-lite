@@ -99,6 +99,79 @@ def test_control_path_is_bounded_for_long_remote_identity(monkeypatch) -> None:
         assert len(control_path) + 18 < 104
 
 
+def test_common_ssh_options_enable_server_keepalive_by_default(monkeypatch) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh")
+
+    options = runner._common_ssh_options()
+    assert "ServerAliveInterval=30" in options
+    assert "ServerAliveCountMax=3" in options
+
+
+def test_common_ssh_options_allow_server_keepalive_to_be_disabled(monkeypatch) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+
+    runner = SSHRunner(
+        host="eda-host",
+        user="designer",
+        ssh_cmd="ssh",
+        server_alive_interval=0,
+    )
+
+    options = runner._common_ssh_options()
+    assert not any(option.startswith("ServerAlive") for option in options)
+
+
+def test_control_master_can_be_disabled_per_runner(monkeypatch) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    monkeypatch.delenv("VB_DISABLE_CONTROL_MASTER", raising=False)
+    monkeypatch.setenv("VB_FORCE_CONTROL_MASTER", "1")
+
+    runner = SSHRunner(
+        host="eda-host",
+        user="designer",
+        ssh_cmd="ssh",
+        control_master=False,
+    )
+
+    options = runner._common_ssh_options()
+    assert not any(option.startswith("Control") for option in options)
+
+
+def test_port_forward_options_do_not_share_control_master(monkeypatch) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    monkeypatch.delenv("VB_DISABLE_CONTROL_MASTER", raising=False)
+
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh")
+
+    options = runner._common_ssh_options(include_control_master=False)
+    assert "ServerAliveInterval=30" in options
+    assert "ServerAliveCountMax=3" in options
+    assert not any(option.startswith("Control") for option in options)
+
+
+@pytest.mark.parametrize(
+    ("name", "kwargs"),
+    [
+        ("server_alive_interval", {"server_alive_interval": -1}),
+        ("server_alive_count_max", {"server_alive_count_max": -1}),
+    ],
+)
+def test_server_keepalive_rejects_negative_values(
+    monkeypatch, name: str, kwargs: dict[str, int]
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+
+    with pytest.raises(ValueError, match=name):
+        SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh", **kwargs)
+
+
 def test_macos_unix_listener_path_too_long_is_controlmaster_failure() -> None:
     stderr = (
         'unix_listener: path "/var/folders/x/y/T/'
@@ -569,6 +642,72 @@ def test_retrying_public_calls_share_one_timeout_budget(
 
     assert attempt_timeouts == pytest.approx([0.05, 0.01])
     assert clock.now == pytest.approx(0.05)
+
+
+def test_run_command_can_disable_transport_retries_for_mutating_commands(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs) -> subprocess.CompletedProcess:
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            255,
+            b"",
+            b"Connection reset by peer",
+        )
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.run",
+        fake_run,
+    )
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh")
+
+    result = runner.run_command(
+        "mkdir -p /remote/output",
+        timeout=30,
+        retry_transport_errors=False,
+    )
+
+    assert result.returncode == 255
+    assert "Connection reset" in result.stderr
+    assert len(commands) == 1
+
+
+def test_upload_text_can_disable_transport_retries_for_mutating_transfers(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs) -> subprocess.CompletedProcess:
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            255,
+            b"",
+            b"Connection reset by peer",
+        )
+
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.subprocess.run",
+        fake_run,
+    )
+    runner = SSHRunner(host="eda-host", user="designer", ssh_cmd="ssh")
+
+    result = runner.upload_text(
+        "payload",
+        "/remote/input.txt",
+        timeout=30,
+        retry_transport_errors=False,
+    )
+
+    assert result.returncode == 255
+    assert len(commands) == 1
 
 
 def test_scp_download_cm_fallback_uses_remaining_timeout(

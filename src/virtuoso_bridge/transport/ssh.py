@@ -18,6 +18,7 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple
@@ -203,6 +204,9 @@ class SSHRunner:
         ssh_cmd: str | None = None,
         timeout: int = 600,
         connect_timeout: int = 30,
+        server_alive_interval: int = 30,
+        server_alive_count_max: int = 3,
+        control_master: bool | None = None,
         persistent_shell: bool = False,
         verbose: bool = False,
     ) -> None:
@@ -220,6 +224,12 @@ class SSHRunner:
         self._ssh_config_path = Path(env_ssh_config) if env_ssh_config else ssh_config_path
         self._timeout = timeout
         self._connect_timeout = connect_timeout
+        if server_alive_interval < 0:
+            raise ValueError("server_alive_interval must be non-negative")
+        if server_alive_count_max < 0:
+            raise ValueError("server_alive_count_max must be non-negative")
+        self._server_alive_interval = server_alive_interval
+        self._server_alive_count_max = server_alive_count_max
         self._verbose = verbose
 
         env_ssh_cmd = _tool_override_from_env("VB_SSH_CMD")
@@ -236,7 +246,10 @@ class SSHRunner:
         # to opt out if a specific platform trips mux errors.
         _disable_cm = os.environ.get("VB_DISABLE_CONTROL_MASTER", "").strip().lower() in ("1", "true", "yes")
         _force_cm = os.environ.get("VB_FORCE_CONTROL_MASTER", "").strip().lower() in ("1", "true", "yes")
-        self._use_control_master = _force_cm or (not _disable_cm)
+        if control_master is None:
+            self._use_control_master = _force_cm or (not _disable_cm)
+        else:
+            self._use_control_master = bool(control_master)
 
         self._control_path = _short_control_path(host, user, jump_host)
 
@@ -307,11 +320,10 @@ class SSHRunner:
             remote_port = port
 
         cmd: list[str] = [self._ssh_cmd]
-        # Use ControlMaster options — if a master already exists, the slave
-        # will request port-forwarding from it and then exit.  The master
-        # keeps the forward alive.  If no master exists, this becomes the
-        # master (ControlMaster=auto).
-        cmd += self._common_ssh_options()
+        # Keep the long-lived tunnel independent from short-lived command
+        # multiplexing.  A stale/broken ControlMaster can otherwise make the
+        # forward exit immediately even though a fresh SSH connection works.
+        cmd += self._common_ssh_options(include_control_master=False)
         cmd += [
             "-o", "ExitOnForwardFailure=yes",
             "-N",
@@ -437,7 +449,11 @@ class SSHRunner:
         process.
         """
         # Try ControlMaster exit first
-        if self._use_control_master and Path(self._control_path).exists():
+        if (
+            self._tunnel_using_external
+            and self._use_control_master
+            and Path(self._control_path).exists()
+        ):
             cmd = [self._ssh_cmd, "-o", f"ControlPath={self._control_path}", "-O", "exit"]
             if self._user:
                 cmd.append(f"{self._user}@{self._host}")
@@ -543,10 +559,21 @@ class SSHRunner:
             logger.error("SSH connection error: %s", exc)
             return False
 
-    def run_command(self, command: str, timeout: float | None = None) -> CommandResult:
-        """Execute a command on the remote host via SSH."""
+    def run_command(
+        self,
+        command: str,
+        timeout: float | None = None,
+        *,
+        retry_transport_errors: bool = True,
+    ) -> CommandResult:
+        """Execute a command on the remote host via SSH.
+
+        Set ``retry_transport_errors`` to ``False`` for commands that may
+        mutate remote state.  An SSH reset can happen after the remote shell
+        has started the command, so automatically replaying it is unsafe.
+        """
         budget = _TimeoutBudget.start(timeout, self._timeout)
-        if self._persistent_shell_enabled:
+        if self._persistent_shell_enabled and retry_transport_errors:
             try:
                 return self._run_via_persistent_shell_with_retry(
                     command,
@@ -557,7 +584,11 @@ class SSHRunner:
             except Exception as exc:  # noqa: BLE001
                 self._log_persistent_shell_fallback("Persistent SSH shell failed", exc)
 
-        return self._run_command_once(command, _budget=budget)
+        return self._run_command_once(
+            command,
+            _budget=budget,
+            retry_transport_errors=retry_transport_errors,
+        )
 
     def _print_cmd(self, cmd: list[str]) -> None:
         logger.info("[local] %s", " ".join(cmd))
@@ -632,6 +663,7 @@ class SSHRunner:
         budget: _TimeoutBudget,
         command: object,
         max_attempts: int = 3,
+        retry_transport_errors: bool = True,
     ) -> tuple[int, bytes, bytes]:
         """Repeatedly call ``run_one`` (which builds + runs one ssh/scp/tar
         attempt and returns ``(rc, stdout, stderr)``) until success or
@@ -653,18 +685,19 @@ class SSHRunner:
         rc: int = -1
         out: bytes = b""
         err: bytes = b""
-        for attempt in range(max_attempts):
+        attempts = max_attempts if retry_transport_errors else 1
+        for attempt in range(attempts):
             budget.remaining(command)
             rc, out, err = run_one()
             if rc == 0:
                 return rc, out, err
             err_text = err.decode("utf-8", errors="replace") if isinstance(err, bytes) else str(err)
-            if self._is_cm_failure(rc, err_text):
+            if retry_transport_errors and self._is_cm_failure(rc, err_text):
                 stderr_first = err_text.strip().splitlines()[0] if err_text.strip() else ""
                 self._disable_cm_for_session(stderr_first)
                 continue
-            if self._is_transient_ssh_error(rc, err_text):
-                if attempt + 1 < max_attempts:
+            if retry_transport_errors and self._is_transient_ssh_error(rc, err_text):
+                if attempt + 1 < attempts:
                     logger.info(
                         "Transient SSH error on %s (rc=%d); retrying",
                         self._host, rc,
@@ -679,6 +712,7 @@ class SSHRunner:
         timeout: float | None = None,
         *,
         _budget: _TimeoutBudget | None = None,
+        retry_transport_errors: bool = True,
     ) -> CommandResult:
         budget = _budget or _TimeoutBudget.start(timeout, self._timeout)
         # Pipe the command to `ssh host sh -l` via stdin so it always runs in
@@ -706,7 +740,7 @@ class SSHRunner:
         #     fail the same way; instead we disable CM for the session
         #     and rebuild cmd without the mux options, then retry.
         # 3 attempts = 1 initial + 1 transient retry + 1 post-CM-fallback retry.
-        attempts = 3
+        attempts = 3 if retry_transport_errors else 1
         last: subprocess.CompletedProcess[bytes] | None = None
         for attempt in range(attempts):
             cmd = self._build_ssh_base() + ["sh", "-l"]
@@ -753,6 +787,8 @@ class SSHRunner:
         remote_path: str,
         recursive: bool = False,
         timeout: float | None = None,
+        *,
+        retry_transport_errors: bool = True,
     ) -> CommandResult:
         """Upload a file or directory to the remote host via tar pipe."""
         budget = _TimeoutBudget.start(timeout, self._timeout)
@@ -763,6 +799,7 @@ class SSHRunner:
             local_path,
             remote_path,
             _budget=budget,
+            retry_transport_errors=retry_transport_errors,
         )
         if result.returncode != 0:
             logger.warning("tar upload failed (rc=%d): %s", result.returncode, result.stderr.strip())
@@ -774,6 +811,8 @@ class SSHRunner:
         self,
         files: list[tuple[Path, str]],
         timeout: float | None = None,
+        *,
+        retry_transport_errors: bool = True,
     ) -> CommandResult:
         """Upload multiple files in a single tar pipe (all to the same remote dir)."""
         if not files:
@@ -873,7 +912,14 @@ class SSHRunner:
 
         return CommandResult(returncode=0, stdout="", stderr="")
 
-    def upload_text(self, text: str, remote_path: str, timeout: float | None = None) -> CommandResult:
+    def upload_text(
+        self,
+        text: str,
+        remote_path: str,
+        timeout: float | None = None,
+        *,
+        retry_transport_errors: bool = True,
+    ) -> CommandResult:
         """Upload a UTF-8 text string as a file to the remote host via SSH."""
         budget = _TimeoutBudget.start(timeout, self._timeout)
         if self._persistent_shell_enabled:
@@ -893,10 +939,13 @@ class SSHRunner:
                 return self._run_via_persistent_shell_with_retry(
                     command,
                     _budget=budget,
+                    retry_transport_errors=retry_transport_errors,
                 )
             except subprocess.TimeoutExpired:
                 raise
             except Exception as exc:  # noqa: BLE001
+                if not retry_transport_errors:
+                    raise
                 self._log_persistent_shell_fallback("Persistent SSH text upload failed", exc)
 
         remote_dir = str(Path(remote_path).parent).replace("\\", "/")
@@ -931,6 +980,7 @@ class SSHRunner:
             _attempt,
             budget=budget,
             command=remote_cmd,
+            retry_transport_errors=retry_transport_errors,
         )
         if rc != 0:
             err_text = _as_text(err).strip()
@@ -1108,6 +1158,7 @@ class SSHRunner:
         *,
         timeout: float | None = None,
         _budget: _TimeoutBudget | None = None,
+        retry_transport_errors: bool = True,
     ) -> CommandResult:
         budget = _budget or _TimeoutBudget.start(timeout, self._timeout)
         remote_dir = str(Path(remote_path).parent).replace("\\", "/")
@@ -1176,12 +1227,27 @@ class SSHRunner:
             _attempt,
             budget=budget,
             command=remote_path,
+            retry_transport_errors=retry_transport_errors,
         )
         return CommandResult(
             returncode=rc,
             stdout=_as_text(out),
             stderr=_as_text(err),
         )
+
+    @contextmanager
+    def _shell_lock_with_budget(
+        self,
+        budget: _TimeoutBudget,
+        command: object,
+    ):
+        remaining = budget.remaining(command)
+        if not self._shell_lock.acquire(timeout=remaining):
+            raise subprocess.TimeoutExpired(command, budget.timeout)
+        try:
+            yield
+        finally:
+            self._shell_lock.release()
 
     def ensure_persistent_shell(
         self,
@@ -1194,7 +1260,7 @@ class SSHRunner:
             return
 
         budget = _budget or _TimeoutBudget.start(timeout, self._connect_timeout)
-        with self._shell_lock:
+        with self._shell_lock_with_budget(budget, "persistent-shell-start"):
             if self._shell_proc is not None and self._shell_proc.poll() is None:
                 return
 
@@ -1324,13 +1390,15 @@ class SSHRunner:
         timeout: float | None = None,
         *,
         _budget: _TimeoutBudget | None = None,
+        retry_transport_errors: bool = True,
     ) -> CommandResult:
         budget = _budget or _TimeoutBudget.start(timeout, self._timeout)
         last_exc: Exception | None = None
-        for attempt in range(2):
+        attempts = 2 if retry_transport_errors else 1
+        for attempt in range(attempts):
             budget.remaining(command)
             try:
-                with self._shell_lock:
+                with self._shell_lock_with_budget(budget, command):
                     self.ensure_persistent_shell(_budget=budget)
                     return self._run_command_via_persistent_shell_locked(
                         command,
@@ -1340,9 +1408,13 @@ class SSHRunner:
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
-                with self._shell_lock:
+                with self._shell_lock_with_budget(budget, command):
                     self._close_persistent_shell_locked(_budget=budget)
-                if attempt == 0 and self._is_retryable_persistent_shell_error(exc):
+                if (
+                    retry_transport_errors
+                    and attempt == 0
+                    and self._is_retryable_persistent_shell_error(exc)
+                ):
                     logger.info(
                         "Retrying persistent SSH shell for %s after recoverable protocol error: %s",
                         self._host,
@@ -1522,7 +1594,9 @@ class SSHRunner:
         self._shell_queue = None
         self._shell_reader = None
 
-    def _common_ssh_options(self) -> list[str]:
+    def _common_ssh_options(
+        self, *, include_control_master: bool = True
+    ) -> list[str]:
         """SSH options shared by both ssh and scp commands."""
         opts: list[str] = [
             "-o", "BatchMode=yes",
@@ -1541,7 +1615,12 @@ class SSHRunner:
             # risk of a slow reverse-DNS / IdentityFile probe).
             "-o", "HostbasedAuthentication=no",
         ]
-        if self._use_control_master:
+        if self._server_alive_interval > 0:
+            opts += [
+                "-o", f"ServerAliveInterval={self._server_alive_interval}",
+                "-o", f"ServerAliveCountMax={self._server_alive_count_max}",
+            ]
+        if self._use_control_master and include_control_master:
             opts += [
                 "-o", "ControlMaster=auto",
                 "-o", f"ControlPath={self._control_path}",
@@ -1608,6 +1687,7 @@ def run_remote_task(
     """Run a remote task: upload files, execute command."""
     timings: dict[str, float] = {}
     remote_dir = f"{work_dir_base}/{run_id}"
+    budget = _TimeoutBudget.start(timeout, timeout)
 
     for local_path, _ in uploads:
         if not local_path.exists():
@@ -1618,7 +1698,11 @@ def run_remote_task(
             )
 
     started = time.perf_counter()
-    upload_result = runner.upload_batch(uploads)
+    upload_result = runner.upload_batch(
+        uploads,
+        timeout=budget.remaining("remote-task-upload"),
+        retry_transport_errors=False,
+    )
     timings["upload_total"] = time.perf_counter() - started
     if upload_result.returncode != 0:
         return RemoteTaskResult(
@@ -1629,7 +1713,11 @@ def run_remote_task(
         )
     try:
         started = time.perf_counter()
-        exec_result = runner.run_command(command, timeout=timeout)
+        exec_result = runner.run_command(
+            command,
+            timeout=budget.remaining(command),
+            retry_transport_errors=False,
+        )
         timings["remote_exec"] = time.perf_counter() - started
     except subprocess.TimeoutExpired:
         return RemoteTaskResult(

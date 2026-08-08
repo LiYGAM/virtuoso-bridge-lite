@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import time
 
 from virtuoso_bridge.models import ExecutionStatus, VirtuosoResult
 from virtuoso_bridge.transport.ssh import CommandResult
@@ -17,13 +19,21 @@ class _FakeRunner:
     def __init__(self) -> None:
         self.commands: list[str] = []
         self.uploads: dict[str, str] = {}
+        self.command_options: list[dict[str, object]] = []
+        self.upload_options: list[dict[str, object]] = []
 
-    def run_command(self, command: str, timeout=None) -> CommandResult:
+    def run_command(self, command: str, timeout=None, **kwargs) -> CommandResult:
         self.commands.append(command)
+        self.command_options.append(dict(kwargs))
+        for path, text in self.uploads.items():
+            if path in command and "sha256" in command:
+                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                return CommandResult(returncode=0, stdout=f"{digest}  {path}\n", stderr="")
         return CommandResult(returncode=0, stdout="", stderr="")
 
-    def upload_text(self, text: str, remote_path: str, timeout=None) -> CommandResult:
+    def upload_text(self, text: str, remote_path: str, timeout=None, **kwargs) -> CommandResult:
         self.uploads[remote_path] = text
+        self.upload_options.append(dict(kwargs))
         return CommandResult(returncode=0, stdout="", stderr="")
 
 
@@ -74,8 +84,13 @@ def test_remote_setup_path_and_port_are_profile_scoped(monkeypatch) -> None:
     client.ensure_remote_setup()
 
     assert client.remote_work_dir == "/tmp/virtuoso_bridge_designer/90590/virtuoso_bridge_t28_digital"
-    setup_path = "/tmp/virtuoso_bridge_designer/90590/virtuoso_bridge_t28_digital/virtuoso_setup.il"
+    setup_path = client.setup_path
     setup = fake.uploads[setup_path]
+    compat_setup_path = (
+        "/tmp/virtuoso_bridge_designer/90590/"
+        "virtuoso_bridge_t28_digital/virtuoso_setup.il"
+    )
+    assert fake.uploads[compat_setup_path] == setup
     assert 'setShellEnvVar("RB_PORT" "65263")' in setup
     assert 'setShellEnvVar("RB_BIND_HOST" "127.0.0.1")' in setup
     assert 'setShellEnvVar("RB_PROFILE" "t28_digital")' in setup
@@ -86,7 +101,9 @@ def test_remote_setup_path_and_port_are_profile_scoped(monkeypatch) -> None:
         command.startswith("chmod 700 ") and "&& chmod 600" in command
         for command in fake.commands
     )
-    assert '/tmp/virtuoso_bridge_designer/90590/virtuoso_bridge_t28_digital/ramic_bridge.il' in setup
+    assert '/tmp/virtuoso_bridge_designer/90590/virtuoso_bridge_t28_digital/ramic_bridge.' in setup
+    assert len(client._deployment_id or "") == 64
+    assert all(call.get("retry_transport_errors") is False for call in fake.upload_options)
 
 
 def test_remote_bind_requires_explicit_opt_in(monkeypatch) -> None:
@@ -137,6 +154,55 @@ def test_read_request_status_filters_local_ledger(monkeypatch, tmp_path) -> None
         "daemon_epoch": "epoch-1",
         "request": {"request_id": "req-2", "state": "timed_out_pending"},
     }
+
+
+def test_deployment_status_verifies_actual_local_bytes_and_fresh_runtime(
+    monkeypatch, tmp_path
+) -> None:
+    daemon = tmp_path / "ramic_bridge_daemon_3.py"
+    daemon.write_bytes(b"print('bridge')\n")
+    legacy_daemon = tmp_path / "ramic_bridge_daemon_27.py"
+    legacy_daemon.write_bytes(b"print 'bridge'\n")
+    il = tmp_path / "ramic_bridge.il"
+    il.write_bytes(b"t\n")
+    daemon_sha = hashlib.sha256(daemon.read_bytes()).hexdigest()
+    il_sha = hashlib.sha256(il.read_bytes()).hexdigest()
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel._find_ramic_bridge_daemon",
+        lambda major: daemon if major == 3 else legacy_daemon,
+    )
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.tunnel._find_ramic_bridge_il", lambda: il
+    )
+    monkeypatch.setattr(
+        SSHClient,
+        "read_state",
+        staticmethod(lambda profile=None: {
+            "mode": "local",
+            "daemon_filename": daemon.name,
+            "deployed_daemon_sha256": daemon_sha,
+            "deployed_daemon_path": str(daemon),
+            "deployed_il_sha256": il_sha,
+        }),
+    )
+    monkeypatch.setattr(
+        SSHClient,
+        "read_request_status",
+        classmethod(lambda cls, profile=None, request_id=None, timeout=10.0: {
+            "daemon_epoch": "epoch-current",
+            "daemon_build_sha256": daemon_sha,
+            "heartbeat_at_epoch": time.time(),
+            "protocol_versions": [2, 3],
+            "capabilities": ["protocol-v3-frame-v1"],
+        }),
+    )
+
+    status = SSHClient.deployment_status("v231")
+
+    assert status["actual_deployed_daemon_sha256"] == daemon_sha
+    assert status["local_matches_deployed"] is True
+    assert status["deployed_matches_running"] is True
+    assert status["running_heartbeat_fresh"] is True
 
 
 def test_status_infers_profile_scoped_setup_path(monkeypatch, capsys) -> None:
@@ -375,3 +441,20 @@ def test_status_allows_cross_user_with_explicit_override(monkeypatch, capsys) ->
     out = capsys.readouterr().out
     assert rc == 0
     assert "[daemon identity] FAILED" not in out
+
+
+def test_tunnel_run_command_only_retries_explicit_read_only_operations() -> None:
+    calls: list[bool] = []
+
+    class _Runner:
+        def run_command(self, command, timeout=None, *, retry_transport_errors=True):
+            calls.append(retry_transport_errors)
+            return CommandResult(returncode=0, stdout=command, stderr="")
+
+    client = SSHClient(remote_host="thu-wei", remote_user="designer")
+    client._ssh_runner = _Runner()
+
+    client.run_command("touch /tmp/marker", operation_class="mutating")
+    client.run_command("test -f /tmp/marker", operation_class="read_only")
+
+    assert calls == [False, True]

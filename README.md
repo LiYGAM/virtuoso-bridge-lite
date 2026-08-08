@@ -154,6 +154,7 @@ All commands take `-p PROFILE` / `--env PATH` to pick a non-default config; run 
 | `dismiss-window WINDOW_ID [--action enter\|escape\|alt-y\|alt-n]` | X11 path: send an explicit action to one window ID returned by `list-windows` |
 | `window-input WINDOW_ID --expect-title TEXT --action move\|click\|drag --x X --y Y --allow-live` | X11 path: send one bounds-checked pointer action to an explicitly confirmed current child window |
 | `request-status [REQUEST_ID]` | Read the daemon's request ledger over SSH/local filesystem without using the CIW request channel |
+| `deployment-status` | Compare packaged, staged, and running daemon SHA/protocol/capability identity |
 | `snapshot [-o DIR] [--history H]` | Dump the focused Virtuoso window (maestro/schematic/...) — brief by default, full disk dump with `-o` |
 | **Export** | |
 | `export-visio LIB CELL -o OUT.vsdx` | Render a Virtuoso schematic to Microsoft Visio (Windows + pywin32) |
@@ -179,12 +180,25 @@ available only through the explicit `start --allow-remote-bind` or
 `restart --allow-remote-bind` opt-in. The remote work directory is mode 700 and
 its token file is mode 600.
 
-Every protocol-v2 SKILL request carries a UUID, operation class, and token. The
-daemon keeps a bounded, atomic status ledger without storing SKILL source or
-the token. Reusing an ID with different content is rejected; same-daemon
-duplicates replay the cached response, while post-restart duplicates are
-rejected when an exact response is no longer available. Query a timeout without
-occupying the CIW channel with `request-status REQUEST_ID`.
+Protocol v3 is preferred and returns a length-delimited response containing the
+request ID, daemon epoch/build SHA, payload length/SHA-256, explicit status, and
+footer. A client falls back to protocol v2 only after the exact pre-dispatch
+`PROTOCOL_V2_REQUIRED` sentinel; malformed/truncated v3 frames never trigger a
+retry. Every request also carries an operation class and per-profile token.
+
+The daemon keeps a bounded, atomic status ledger without storing SKILL source
+or the token. Reusing an ID with different content is rejected; same-daemon
+duplicates replay only a protocol-compatible cached response. Validated
+requests enter a bounded FIFO serviced by one serial CIW worker. A full queue
+returns `BUSY` as `not_dispatched`, while ledger heartbeat, queue depth/capacity,
+active request, build SHA, supported protocols, and capabilities remain
+available through `request-status`.
+
+Deployment uses full-SHA versioned daemon/SKILL/setup filenames, verifies the
+actual remote file digest, and atomically records the staged identity. Use
+`deployment-status` to compare packaged, staged, and running builds. Staging
+does not replace an already-running daemon; activation remains an explicit
+restart/load action.
 
 Prefix any command with `--json-envelope` to emit one stable JSON object with
 command/profile, timestamps, exit status, normalized data, errors, warnings,

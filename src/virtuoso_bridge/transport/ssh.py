@@ -938,8 +938,6 @@ class SSHRunner:
         prelude: list[str] = []
         if create_parent:
             prelude.append(f"mkdir -p {quoted_dir} && chmod 755 {quoted_dir}")
-        if exclusive_create:
-            prelude.append("umask 077 && set -C")
         command_prefix = " && ".join(prelude)
         if command_prefix:
             command_prefix += " && "
@@ -947,10 +945,13 @@ class SSHRunner:
             if not text.endswith("\n"):
                 text = text + "\n"
             payload_token = f"__vb_PAYLOAD_{uuid.uuid4().hex}__"
+            exclusive_prefix = "(umask 077 && set -C && " if exclusive_create else ""
+            exclusive_suffix = ")" if exclusive_create else ""
             command = (
-                f"{command_prefix}cat > {quoted_path} <<'{payload_token}'\n"
+                f"{command_prefix}{exclusive_prefix}cat > {quoted_path} <<'{payload_token}'\n"
                 f"{text}"
                 f"{payload_token}\n"
+                f"{exclusive_suffix}\n"
             )
             try:
                 return self._run_via_persistent_shell_with_retry(
@@ -966,12 +967,10 @@ class SSHRunner:
                     raise
                 self._log_persistent_shell_fallback("Persistent SSH text upload failed", exc)
 
-        remote_cmd = (
-            "sh -lc "
-            + shlex.quote(
-                f"{command_prefix}cat > {quoted_path}"
-            )
-        )
+        write_command = f"cat > {quoted_path}"
+        if exclusive_create:
+            write_command = f"(umask 077 && set -C && {write_command})"
+        remote_cmd = "sh -lc " + shlex.quote(f"{command_prefix}{write_command}")
         logger.debug("Uploading text payload (%d chars) -> %s:%s", len(text), self._host, remote_path)
         text_bytes = text.encode("utf-8")
 

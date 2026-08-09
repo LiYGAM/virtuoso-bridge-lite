@@ -792,9 +792,45 @@ def test_exclusive_text_upload_does_not_chmod_existing_parent(monkeypatch) -> No
 
     assert result.returncode == 0
     remote_command = commands[0][-1]
-    assert "set -C" in remote_command
+    assert "(umask 077 && set -C && cat >" in remote_command
     assert "chmod 755" not in remote_command
     assert "mkdir -p" not in remote_command
+
+
+def test_exclusive_persistent_text_upload_scopes_noclobber(monkeypatch) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    commands: list[str] = []
+
+    runner = SSHRunner(
+        host="eda-host",
+        user="designer",
+        control_master=False,
+        persistent_shell=True,
+    )
+
+    def fake_persistent(command: str, **kwargs) -> CommandResult:
+        commands.append(command)
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        runner,
+        "_run_via_persistent_shell_with_retry",
+        fake_persistent,
+    )
+    result = runner.upload_text(
+        "managed cdsinit\n",
+        "/home/designer/.cdsinit.tmp",
+        create_parent=False,
+        exclusive_create=True,
+        retry_transport_errors=False,
+    )
+
+    assert result.returncode == 0
+    assert len(commands) == 1
+    remote_command = commands[0]
+    assert remote_command.startswith("(umask 077 && set -C && cat >")
+    assert remote_command.rstrip().endswith(")")
 
 
 def test_scp_download_cm_fallback_uses_remaining_timeout(

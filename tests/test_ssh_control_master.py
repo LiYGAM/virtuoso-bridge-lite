@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import shlex
 import subprocess
 from pathlib import Path
@@ -708,6 +709,92 @@ def test_upload_text_can_disable_transport_retries_for_mutating_transfers(
 
     assert result.returncode == 255
     assert len(commands) == 1
+
+
+def test_persistent_text_upload_redacts_payload_from_command_log(
+    monkeypatch,
+    caplog,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    runner = SSHRunner(
+        host="eda-host",
+        user="designer",
+        persistent_shell=True,
+    )
+
+    class _Stdin:
+        def __init__(self) -> None:
+            self.payload = b""
+
+        def write(self, payload: bytes) -> None:
+            self.payload += payload
+
+        def flush(self) -> None:
+            pass
+
+    class _Process:
+        def __init__(self) -> None:
+            self.stdin = _Stdin()
+
+        def poll(self):
+            return None
+
+    proc = _Process()
+    runner._shell_proc = proc
+    runner._shell_queue = queue.Queue()
+    token = "fixedtoken"
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.uuid.uuid4",
+        lambda: type("UUID", (), {"hex": token})(),
+    )
+    for line in (
+        f"__vb_STDOUT_B64_BEGIN_{token}__\n",
+        "b2s=\n",
+        f"__vb_STDERR_B64_BEGIN_{token}__\n",
+        "\n",
+        f"__vb_RC_{token}__0\n",
+    ):
+        runner._shell_queue.put(line)
+
+    secret = "bridge-token-DO-NOT-LOG"
+    with caplog.at_level("INFO", logger="virtuoso_bridge.transport.ssh"):
+        result = runner._run_command_via_persistent_shell_locked(
+            f"cat > /tmp/auth.token <<'EOF'\n{secret}\nEOF\n",
+            timeout=1.0,
+            log_command=False,
+        )
+
+    assert result == CommandResult(0, "ok", "")
+    assert secret.encode() in proc.stdin.payload
+    assert secret not in caplog.text
+    assert "redacted SSH text upload" in caplog.text
+
+
+def test_exclusive_text_upload_does_not_chmod_existing_parent(monkeypatch) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh._setup_command_log", lambda: None)
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.subprocess.run", fake_run)
+    runner = SSHRunner(host="eda-host", user="designer", persistent_shell=False)
+    result = runner.upload_text(
+        "managed cdsinit\n",
+        "/home/designer/.cdsinit.tmp",
+        create_parent=False,
+        exclusive_create=True,
+        retry_transport_errors=False,
+    )
+
+    assert result.returncode == 0
+    remote_command = commands[0][-1]
+    assert "set -C" in remote_command
+    assert "chmod 755" not in remote_command
+    assert "mkdir -p" not in remote_command
 
 
 def test_scp_download_cm_fallback_uses_remaining_timeout(

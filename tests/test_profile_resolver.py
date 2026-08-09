@@ -43,6 +43,20 @@ def test_resolve_profile_prefers_explicit(monkeypatch, tmp_path) -> None:
     assert info.source == "explicit"
 
 
+@pytest.mark.parametrize(
+    "profile",
+    ("../escape", "..\\escape", "two words", "..", "/absolute"),
+)
+def test_profile_rejects_path_or_environment_escape_names(
+    monkeypatch,
+    tmp_path,
+    profile,
+) -> None:
+    _isolate_profile_env(monkeypatch, tmp_path)
+    with pytest.raises(ValueError, match="profile must be"):
+        resolve_profile(profile)
+
+
 def test_resolve_profile_prefers_environment_over_venv(monkeypatch, tmp_path) -> None:
     _isolate_profile_env(monkeypatch, tmp_path)
     venv = tmp_path / ".venv"

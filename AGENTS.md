@@ -76,9 +76,9 @@ users and across local machines sharing the same remote scratch root:
 load("/tmp/virtuoso_bridge_<remote_user>/<client_id>/virtuoso_bridge/virtuoso_setup.il")
 ```
 
-(Run `virtuoso-bridge status` again at any time to re-print this line.
-Add it to your remote `~/.cdsinit` to auto-load on every Virtuoso
-startup.)
+(Run `virtuoso-bridge status` again at any time to re-print this line, or use
+`virtuoso-bridge autoload install` to install the profile-specific guarded
+block in remote `~/.cdsinit` atomically.)
 
 Loading the setup file does not replace an already-running daemon in the same
 CIW; stop the old daemon with `RBStop()` or `RBStopAll()` before loading another
@@ -266,7 +266,10 @@ M0 (VOUT VIN VSS VSS) nch_ulvt_mac l=30n w=1u nf=1
 virtuoso-bridge init [user@host] [-J user@jump] [--force]   # write ~/.virtuoso-bridge/.env
 virtuoso-bridge start [--bind-venv]  # start SSH tunnel + deploy daemon
 virtuoso-bridge stop            # stop the SSH tunnel
-virtuoso-bridge restart         # force-restart and refresh deployed daemon setup
+virtuoso-bridge restart         # guarded one-shot daemon activation + identity verification
+virtuoso-bridge autoload status # inspect the profile-specific .cdsinit block
+virtuoso-bridge autoload install   # stage and atomically install the managed block
+virtuoso-bridge autoload uninstall # remove only the managed block
 virtuoso-bridge status          # check tunnel + Virtuoso daemon + Spectre
 virtuoso-bridge license         # check Spectre license availability
 virtuoso-bridge profile show    # print resolved profile, source, and venv binding path

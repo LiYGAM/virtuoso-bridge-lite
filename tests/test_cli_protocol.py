@@ -10,6 +10,59 @@ from virtuoso_bridge.transport.tunnel import SSHClient
 
 pytestmark = pytest.mark.unit
 
+_EXPECTED_DIGEST = "a" * 64
+_EXPECTED_BUILD = "b" * 64
+_EXPECTED_EPOCH = "epoch-proof"
+_EXPECTED_GENERATION = "generation-proof"
+
+
+def _reconcile_cli_args(request_id: str, timeout: str = "1") -> list[str]:
+    return [
+        "request-reconcile", request_id, "-p", "v231",
+        "--timeout", timeout, "--poll-interval", "0.01",
+        "--expected-request-digest-sha256", _EXPECTED_DIGEST,
+        "--expected-operation-class", "mutating",
+        "--expected-daemon-epoch", _EXPECTED_EPOCH,
+        "--expected-daemon-build-sha256", _EXPECTED_BUILD,
+        "--expected-request-generation", _EXPECTED_GENERATION,
+        "--expected-protocol-version", "3",
+    ]
+
+
+def _proven_terminal_request(request_id: str) -> dict[str, object]:
+    return {
+        "request_id": request_id,
+        "state": "succeeded_after_timeout",
+        "request_digest_sha256": _EXPECTED_DIGEST,
+        "operation_class": "mutating",
+        "protocol_version": 3,
+        "request_generation": _EXPECTED_GENERATION,
+        "admitted_daemon_epoch": _EXPECTED_EPOCH,
+        "admitted_daemon_build_sha256": _EXPECTED_BUILD,
+        "response_marker": "STX",
+        "response_digest_sha256": "c" * 64,
+        "payload_digest_sha256": "d" * 64,
+        "response_size_bytes": 2,
+        "finished_at_epoch": 123.5,
+        "terminal_proof": {
+            "schema_version": 1,
+            "complete_frame": True,
+            "state": "succeeded_after_timeout",
+            "request_id": request_id,
+            "request_digest_sha256": _EXPECTED_DIGEST,
+            "operation_class": "mutating",
+            "protocol_version": 3,
+            "request_generation": _EXPECTED_GENERATION,
+            "daemon_epoch": _EXPECTED_EPOCH,
+            "daemon_build_sha256": _EXPECTED_BUILD,
+            "response_marker": "STX",
+            "response_digest_sha256": "c" * 64,
+            "payload_digest_sha256": "d" * 64,
+            "response_size_bytes": 2,
+            "finished_at_epoch": 123.5,
+        },
+    }
+
 
 def test_request_status_command_prints_filtered_ledger(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli, "_load_cli_env", lambda: None)
@@ -96,6 +149,157 @@ def test_request_await_polls_until_known_terminal_state(monkeypatch, capsys) -> 
     assert payload["reconciliation"]["safe_to_clear_quarantine"] is True
 
 
+
+def test_request_reconcile_requires_two_identical_complete_terminal_proofs(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(cli, "_load_cli_env", lambda: None)
+    calls = 0
+
+    def read_status(cls, profile=None, request_id=None, timeout=10.0):
+        nonlocal calls
+        calls += 1
+        return {
+            "schema_version": 1,
+            "daemon_epoch": _EXPECTED_EPOCH,
+            "daemon_build_sha256": _EXPECTED_BUILD,
+            "heartbeat_at_epoch": 123.5,
+            "request": _proven_terminal_request(request_id),
+        }
+
+    monkeypatch.setattr(SSHClient, "read_request_status", classmethod(read_status))
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+    rc = cli.main(_reconcile_cli_args("req-proven"))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == 2
+    assert payload["reconciliation"]["outcome"] == "known_terminal"
+    assert payload["reconciliation"]["stable_reads"] == 2
+    assert payload["reconciliation"]["safe_to_clear_quarantine"] is True
+    assert payload["reconciliation"]["proof_errors"] == []
+
+
+def test_request_reconcile_rejects_conflicting_terminal_proof(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "_load_cli_env", lambda: None)
+
+    def read_status(cls, profile=None, request_id=None, timeout=10.0):
+        request = _proven_terminal_request(request_id)
+        request["terminal_proof"]["daemon_epoch"] = "epoch-conflict"
+        return {
+            "schema_version": 1,
+            "daemon_epoch": _EXPECTED_EPOCH,
+            "daemon_build_sha256": _EXPECTED_BUILD,
+            "request": request,
+        }
+
+    monkeypatch.setattr(SSHClient, "read_request_status", classmethod(read_status))
+
+    rc = cli.main(_reconcile_cli_args("req-conflict"))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    reconciliation = payload["reconciliation"]
+    assert reconciliation["outcome"] == "terminal_proof_invalid"
+    assert reconciliation["safe_to_clear_quarantine"] is False
+    assert "terminal-proof-daemon-epoch-mismatch" in reconciliation["proof_errors"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_error"),
+    (
+        ("finished_at_epoch", float("nan"), "terminal-proof-finished-at-invalid"),
+        ("response_size_bytes", True, "terminal-proof-response-size-invalid"),
+    ),
+)
+def test_request_reconcile_rejects_nonfinite_or_noninteger_proof_numbers(
+    monkeypatch,
+    capsys,
+    field,
+    value,
+    expected_error,
+) -> None:
+    monkeypatch.setattr(cli, "_load_cli_env", lambda: None)
+
+    def read_status(cls, profile=None, request_id=None, timeout=10.0):
+        request = _proven_terminal_request(request_id)
+        request[field] = value
+        request["terminal_proof"][field] = value
+        return {
+            "schema_version": 1,
+            "daemon_epoch": _EXPECTED_EPOCH,
+            "daemon_build_sha256": _EXPECTED_BUILD,
+            "heartbeat_at_epoch": 123.5,
+            "request": request,
+        }
+
+    monkeypatch.setattr(SSHClient, "read_request_status", classmethod(read_status))
+    rc = cli.main(_reconcile_cli_args("req-bad-number"))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    reconciliation = payload["reconciliation"]
+    assert reconciliation["safe_to_clear_quarantine"] is False
+    assert expected_error in reconciliation["proof_errors"]
+
+
+
+
+
+def test_request_reconcile_stability_resets_after_missing_snapshot(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "_load_cli_env", lambda: None)
+    proven = {
+        "schema_version": 1,
+        "daemon_epoch": _EXPECTED_EPOCH,
+        "daemon_build_sha256": _EXPECTED_BUILD,
+        "request": _proven_terminal_request("req-consecutive"),
+    }
+    snapshots = iter([proven, None, proven, proven])
+    calls = 0
+
+    def read_status(cls, profile=None, request_id=None, timeout=10.0):
+        nonlocal calls
+        calls += 1
+        return next(snapshots)
+
+    monkeypatch.setattr(SSHClient, "read_request_status", classmethod(read_status))
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+    rc = cli.main(_reconcile_cli_args("req-consecutive"))
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == 4
+    assert payload["reconciliation"]["stable_reads"] == 2
+    assert payload["reconciliation"]["safe_to_clear_quarantine"] is True
+def test_request_reconcile_without_expected_anchor_fails_closed(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "_load_cli_env", lambda: None)
+    monkeypatch.setattr(
+        SSHClient,
+        "read_request_status",
+        classmethod(lambda cls, profile=None, request_id=None, timeout=10.0: {
+            "schema_version": 1,
+            "daemon_epoch": _EXPECTED_EPOCH,
+            "daemon_build_sha256": _EXPECTED_BUILD,
+            "request": _proven_terminal_request(request_id),
+        }),
+    )
+
+    rc = cli.main([
+        "request-reconcile", "req-no-anchor", "-p", "v231",
+        "--timeout", "1", "--poll-interval", "0.01",
+    ])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    reconciliation = payload["reconciliation"]
+    assert reconciliation["outcome"] == "terminal_proof_invalid"
+    assert reconciliation["safe_to_clear_quarantine"] is False
+    assert any(
+        error.startswith("missing-expected-")
+        for error in reconciliation["proof_errors"]
+    )
 def test_request_reconcile_preserves_indeterminate_restart_state(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli, "_load_cli_env", lambda: None)
     monkeypatch.setattr(
@@ -111,10 +315,7 @@ def test_request_reconcile_preserves_indeterminate_restart_state(monkeypatch, ca
         }),
     )
 
-    rc = cli.main([
-        "request-reconcile", "req-orphan", "-p", "v231",
-        "--timeout", "1", "--poll-interval", "0.01",
-    ])
+    rc = cli.main(_reconcile_cli_args("req-orphan"))
 
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
@@ -122,7 +323,10 @@ def test_request_reconcile_preserves_indeterminate_restart_state(monkeypatch, ca
     assert payload["reconciliation"]["safe_to_clear_quarantine"] is False
 
 
-@pytest.mark.parametrize("state", ["queued", "response_too_large", "duplicate_replayed"])
+@pytest.mark.parametrize(
+    "state",
+    ["queued", "late_waiting_operator", "response_too_large", "duplicate_replayed"],
+)
 def test_request_reconcile_never_clears_unsafe_queue_or_transport_states(
     monkeypatch, capsys, state: str
 ) -> None:
@@ -137,13 +341,10 @@ def test_request_reconcile_never_clears_unsafe_queue_or_transport_states(
         }),
     )
 
-    rc = cli.main([
-        "request-reconcile", "req-unsafe", "-p", "v231",
-        "--timeout", "0.05", "--poll-interval", "0.01",
-    ])
+    rc = cli.main(_reconcile_cli_args("req-unsafe", timeout="0.05"))
 
     payload = json.loads(capsys.readouterr().out)
-    if state == "queued":
+    if state in {"queued", "late_waiting_operator"}:
         assert rc == 2
         assert payload["reconciliation"]["outcome"] == "wait_timeout"
     else:

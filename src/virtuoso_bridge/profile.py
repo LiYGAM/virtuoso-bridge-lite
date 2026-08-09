@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ from dotenv import dotenv_values
 from virtuoso_bridge.env import default_user_env_path, get_runtime_env_file
 
 PROFILE_BINDING_FILENAME = ".virtuoso-bridge-profile"
+_PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 @dataclass(frozen=True)
@@ -23,7 +25,14 @@ class ProfileResolution:
 
 def _clean_profile(value: str | None) -> str | None:
     profile = (value or "").strip()
-    return profile or None
+    if not profile:
+        return None
+    if profile in {".", ".."} or not _PROFILE_RE.fullmatch(profile):
+        raise ValueError(
+            "profile must be 1-64 characters using letters, digits, '.', '_', "
+            "or '-', and must start with a letter or digit"
+        )
+    return profile
 
 
 def venv_profile_path(venv: str | Path | None = None) -> Path | None:

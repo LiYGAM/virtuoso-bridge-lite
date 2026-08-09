@@ -92,10 +92,13 @@ DAEMON_CAPABILITIES = (
     "auth-token-v1",
     "bounded-queue-v1",
     "daemon-heartbeat-v1",
+    "exclusive-admission-v1",
+    "late-completion-witness-v1",
     "operation-class-v1",
     "protocol-v3-frame-v1",
     "request-idempotency-v1",
     "request-ledger-v1",
+    "terminal-proof-v1",
     "timeout-drain-v1",
 )
 _V3_MAGIC = b"VBR3\x00"
@@ -198,17 +201,39 @@ _REQUEST_READ_TIMEOUT_SECONDS = _bounded_env_number(
 _CLIENT_WRITE_TIMEOUT_SECONDS = _bounded_env_number(
     "VB_CLIENT_WRITE_TIMEOUT", 5, 1, 300, as_float=True
 )
-_RESPONSE_DRAIN_GRACE_SECONDS = _bounded_env_number(
+_RESPONSE_DRAIN_WARNING_SECONDS = _bounded_env_number(
     "VB_RESPONSE_DRAIN_GRACE", 120, 1, 3600, as_float=True
 )
+# Kept as an alias for callers/tests that used the old internal name.  The
+# value is now only the late-wait warning threshold; it never retires the
+# daemon or discards the response stream.
+_RESPONSE_DRAIN_GRACE_SECONDS = _RESPONSE_DRAIN_WARNING_SECONDS
 _MAX_EXECUTION_TIMEOUT_SECONDS = _bounded_env_number(
     "VB_MAX_EXECUTION_TIMEOUT", 86400, 1, 86400, as_float=True
 )
 _QUEUE_CAPACITY = _bounded_env_number("VB_QUEUE_DEPTH", 4, 1, 64)
 _REQUEST_QUEUE = _queue.Queue(maxsize=_QUEUE_CAPACITY)
+_EXCLUSIVE_REQUEST_ID = None
+_EXCLUSIVE_REQUEST_GENERATION = None
 _monotonic = getattr(time, "monotonic", time.time)
-_ACTIVE_STATES = ("running", "timed_out_pending")
-_RECOVER_AS_ORPHANED_STATES = ("queued", "running", "timed_out_pending")
+_ACTIVE_STATES = ("running", "timed_out_pending", "late_waiting_operator")
+_RECOVER_AS_ORPHANED_STATES = (
+    "queued", "running", "timed_out_pending", "late_waiting_operator"
+)
+_TERMINAL_STATES = (
+    "succeeded",
+    "failed",
+    "succeeded_after_timeout",
+    "failed_after_timeout",
+    "response_too_large",
+    "failed_internal",
+    "orphaned_unknown_after_daemon_restart",
+    "orphaned_unknown_response_drain_timeout",
+    "orphaned_unknown_response_stream_closed",
+)
+_EXCLUSIVE_RELEASE_STATES = (
+    "succeeded", "failed", "succeeded_after_timeout", "failed_after_timeout"
+)
 
 
 class RequestProtocolError(Exception):
@@ -216,6 +241,9 @@ class RequestProtocolError(Exception):
 
 
 class ResponseDrainTimeout(Exception):
+    pass
+
+class ResponseStreamClosed(Exception):
     pass
 
 
@@ -274,6 +302,13 @@ def _write_request_state():
         "profile": PROFILE or None,
         "auth_enabled": bool(AUTH_TOKEN),
         "active_request_id": _ACTIVE_REQUEST_ID,
+        "exclusive_request_id": _EXCLUSIVE_REQUEST_ID,
+        "exclusive_request_generation": _EXCLUSIVE_REQUEST_GENERATION,
+        "late_waiting_request_id": (
+            _ACTIVE_REQUEST_ID
+            if _ACTIVE_REQUEST_ID in _REQUESTS and _REQUESTS[_ACTIVE_REQUEST_ID].get("state") == "late_waiting_operator"
+            else None
+        ),
         "heartbeat_at_epoch": _HEARTBEAT_AT_EPOCH,
         "queue_depth": _REQUEST_QUEUE.qsize(),
         "queue_capacity": _QUEUE_CAPACITY,
@@ -398,6 +433,57 @@ def _mark_request_timed_out(request_id, request_generation):
         return True
 
 
+def _mark_request_late_waiting(request_id, request_generation):
+    """Keep the serial CIW reader alive after the warning threshold."""
+    with _STATE_LOCK:
+        entry = _REQUESTS.get(request_id)
+        if (
+            not entry
+            or entry.get("request_generation") != request_generation
+            or entry.get("state") not in ("running", "timed_out_pending")
+        ):
+            return False
+        entry = dict(entry)
+        entry["state"] = "late_waiting_operator"
+        entry["late_waiting_at_epoch"] = time.time()
+        entry["updated_at_epoch"] = time.time()
+        _REQUESTS[request_id] = entry
+        _write_request_state()
+        return True
+
+
+def _build_terminal_proof(
+    state,
+    request_id,
+    request_digest_sha256,
+    operation_class,
+    protocol_version,
+    request_generation,
+    response_marker,
+    response_digest_sha256,
+    payload_digest_sha256,
+    response_size_bytes,
+    finished_at_epoch,
+):
+    return {
+        "schema_version": 1,
+        "complete_frame": True,
+        "state": state,
+        "request_id": request_id,
+        "request_digest_sha256": request_digest_sha256,
+        "operation_class": operation_class,
+        "protocol_version": protocol_version,
+        "request_generation": request_generation,
+        "daemon_epoch": DAEMON_EPOCH,
+        "daemon_build_sha256": DAEMON_BUILD_SHA256 or None,
+        "response_marker": response_marker,
+        "response_digest_sha256": response_digest_sha256,
+        "payload_digest_sha256": payload_digest_sha256,
+        "response_size_bytes": response_size_bytes,
+        "finished_at_epoch": finished_at_epoch,
+    }
+
+
 def _store_cached_response_locked(request_id, response_bytes):
     global _RESPONSE_CACHE_BYTES
     previous = _RESPONSE_CACHE.pop(request_id, None)
@@ -419,7 +505,7 @@ def _store_cached_response_locked(request_id, response_bytes):
 
 def _finalize_request(request_id, request_generation, state, response_bytes=None, **fields):
     """Commit one terminal state; a late watchdog cannot overwrite it."""
-    global _ACTIVE_REQUEST_ID
+    global _ACTIVE_REQUEST_ID, _RESPONSE_CACHE_BYTES
     with _STATE_LOCK:
         entry = _REQUESTS.get(request_id)
         if (
@@ -436,11 +522,29 @@ def _finalize_request(request_id, request_generation, state, response_bytes=None
             entry["response_cached"] = _store_cached_response_locked(
                 request_id, response_bytes
             )
+        if state == "orphaned_unknown_response_stream_closed":
+            cached = _RESPONSE_CACHE.pop(request_id, None)
+            if cached is not None:
+                _RESPONSE_CACHE_BYTES -= len(cached)
+            entry.pop("response_cached", None)
+            entry.pop("terminal_proof", None)
         _REQUESTS[request_id] = entry
         if _ACTIVE_REQUEST_ID == request_id:
             _ACTIVE_REQUEST_ID = None
         _write_request_state()
         return True
+
+
+def _handle_stream_closed(request_id, request_generation):
+    finalized = _finalize_request(
+        request_id,
+        request_generation,
+        "orphaned_unknown_response_stream_closed",
+        finished_at_epoch=time.time(),
+        response_stream_closed=True,
+    )
+    _RETIRE_EVENT.set()
+    return finalized
 
 
 def _record_duplicate(request_id, replayed):
@@ -492,6 +596,11 @@ def _safe_close_connection(conn):
         conn.close()
     except OSError:
         pass
+
+
+def late_wait_warning_callback(request_id, request_generation, late_wait_event):
+    late_wait_event.set()
+    return _mark_request_late_waiting(request_id, request_generation)
 
 def watchdog_callback(request_id, request_generation, timed_out_event):
     """Mark the request timed out without asynchronously interrupting CIW.
@@ -547,11 +656,23 @@ def _validate_request(request_data):
     operation_class = str(request_data.get("operation_class") or "unknown")
     if operation_class not in ("unknown", "read_only", "mutating"):
         raise RequestProtocolError("INVALID_OPERATION_CLASS")
+    exclusive = request_data.get("exclusive", False)
+    if exclusive is None:
+        exclusive = False
+    if not isinstance(exclusive, bool):
+        raise RequestProtocolError("INVALID_EXCLUSIVE_FLAG")
     try:
         protocol_version = int(request_data.get("protocol_version") or 1)
     except (TypeError, ValueError):
         raise RequestProtocolError("PROTOCOL_V2_REQUIRED")
-    return skill_code, timeout_seconds, request_id, operation_class, protocol_version
+    return (
+        skill_code,
+        timeout_seconds,
+        request_id,
+        operation_class,
+        protocol_version,
+        exclusive,
+    )
 
 
 def read_until_delimiter(
@@ -560,13 +681,17 @@ def read_until_delimiter(
     start_ok=0x02,
     start_err=0x15,
     end=0x1e,
+    late_wait_callback=None,
 ):
     """Read one complete response, even after the request watchdog expires.
 
     A timed-out SKILL callback may still return later, especially when it is
     blocked by a modal form.  The response must be drained before accepting
     another request or that late response will be mistaken for the next one.
+
     """
+    late_wait_notified = False
+
     if max_response_bytes is None:
         max_response_bytes = _MAX_RESPONSE_BYTES
     result = bytearray()
@@ -575,13 +700,20 @@ def read_until_delimiter(
 
     # Wait for start marker
     while True:
-        if _monotonic() >= deadline:
-            raise ResponseDrainTimeout("RESPONSE_DRAIN_TIMEOUT")
+        if deadline is not None and _monotonic() >= deadline:
+            if late_wait_callback is None:
+                raise ResponseDrainTimeout("RESPONSE_DRAIN_TIMEOUT")
+            if not late_wait_notified:
+                late_wait_notified = True
+                late_wait_callback()
+            deadline = None
         try:
             ch = sys.stdin.buffer.read(1)
-            if not ch:
+            if ch is None:
                 time.sleep(0.001)
                 continue
+            if ch == b"":
+                raise ResponseStreamClosed("RESPONSE_STREAM_CLOSED")
             if ch[0] in (start_ok, start_err):
                 result.extend(ch)
                 break
@@ -593,13 +725,20 @@ def read_until_delimiter(
 
     # Read content until end marker
     while True:
-        if _monotonic() >= deadline:
-            raise ResponseDrainTimeout("RESPONSE_DRAIN_TIMEOUT")
+        if deadline is not None and _monotonic() >= deadline:
+            if late_wait_callback is None:
+                raise ResponseDrainTimeout("RESPONSE_DRAIN_TIMEOUT")
+            if not late_wait_notified:
+                late_wait_notified = True
+                late_wait_callback()
+            deadline = None
         try:
             ch = sys.stdin.buffer.read(1)
-            if not ch:
+            if ch is None:
                 time.sleep(0.001)
                 continue
+            if ch == b"":
+                raise ResponseStreamClosed("RESPONSE_STREAM_CLOSED")
             if ch[0] == end:
                 break
             response_bytes_seen += len(ch)
@@ -633,9 +772,26 @@ def _busy_response(protocol_version, request_id, request_digest):
     return b"\x15BRIDGE_BUSY"
 
 
+def _late_completion_response(protocol_version, request_id, request_digest):
+    if protocol_version == 3:
+        return _format_client_response(
+            3,
+            request_id,
+            "busy",
+            "NAK",
+            "BRIDGE_LATE_COMPLETION_PENDING",
+            request_digest_sha256=request_digest,
+            retry_after=1.0,
+            queue_depth=_REQUEST_QUEUE.qsize(),
+            queue_capacity=_QUEUE_CAPACITY,
+        )
+    return b"\x15BRIDGE_BUSY"
+
+
 def _admit_external_connection(conn, addr):
     """Validate and enqueue one request without touching the CIW stream."""
-    global _REJECTED_BUSY_COUNT
+    global _REJECTED_BUSY_COUNT, _EXCLUSIVE_REQUEST_ID
+    global _EXCLUSIVE_REQUEST_GENERATION
     request_id = ""
     protocol_version = 2
     request_digest = None
@@ -651,6 +807,7 @@ def _admit_external_connection(conn, addr):
             request_id,
             operation_class,
             protocol_version,
+            exclusive,
         ) = _validate_request(request_data)
         if protocol_version not in PROTOCOL_VERSIONS:
             _safe_sendall(conn, b"\x15PROTOCOL_V2_REQUIRED")
@@ -675,6 +832,7 @@ def _admit_external_connection(conn, addr):
             protocol_version,
             request_digest,
             request_generation,
+            exclusive,
         )
         response = None
         with _STATE_LOCK:
@@ -716,7 +874,46 @@ def _admit_external_connection(conn, addr):
                 )
                 _write_request_state()
             else:
-                if _REQUEST_QUEUE.full():
+                exclusive_busy = False
+                if exclusive:
+                    if _ACTIVE_REQUEST_ID or _REQUEST_QUEUE.qsize() != 0:
+                        exclusive_busy = True
+                    else:
+                        for entry in _REQUESTS.values():
+                            if not isinstance(entry, dict):
+                                exclusive_busy = True
+                                break
+                            state = entry.get("state")
+                            if state in _RECOVER_AS_ORPHANED_STATES:
+                                exclusive_busy = True
+                                break
+                            if state not in _TERMINAL_STATES:
+                                exclusive_busy = True
+                                break
+                late_waiting = (
+                    _ACTIVE_REQUEST_ID in _REQUESTS
+                    and (_REQUESTS.get(_ACTIVE_REQUEST_ID) or {}).get("state")
+                    == "late_waiting_operator"
+                )
+                if _EXCLUSIVE_REQUEST_ID:
+                    _REJECTED_BUSY_COUNT += 1
+                    response = _busy_response(
+                        protocol_version, request_id, request_digest
+                    )
+                    _write_request_state()
+                elif exclusive_busy:
+                    _REJECTED_BUSY_COUNT += 1
+                    response = _busy_response(
+                        protocol_version, request_id, request_digest
+                    )
+                    _write_request_state()
+                elif late_waiting:
+                    _REJECTED_BUSY_COUNT += 1
+                    response = _late_completion_response(
+                        protocol_version, request_id, request_digest
+                    )
+                    _write_request_state()
+                elif _REQUEST_QUEUE.full():
                     _REJECTED_BUSY_COUNT += 1
                     response = _busy_response(
                         protocol_version, request_id, request_digest
@@ -728,7 +925,10 @@ def _admit_external_connection(conn, addr):
                         "request_id": request_id,
                         "state": "queued",
                         "operation_class": operation_class,
+                        "exclusive": exclusive,
                         "request_digest_sha256": request_digest,
+                        "admitted_daemon_epoch": DAEMON_EPOCH,
+                        "admitted_daemon_build_sha256": DAEMON_BUILD_SHA256 or None,
                         "queued_at_epoch": now,
                         "heartbeat_at_epoch": now,
                         "queue_position": _REQUEST_QUEUE.qsize() + 1,
@@ -737,14 +937,29 @@ def _admit_external_connection(conn, addr):
                         "updated_at_epoch": now,
                     }
                     _REQUEST_ORDER.append(request_id)
+                    if exclusive:
+                        _EXCLUSIVE_REQUEST_ID = request_id
+                        _EXCLUSIVE_REQUEST_GENERATION = request_generation
                     _trim_request_history_locked()
-                    _write_request_state()
+                    try:
+                        _write_request_state()
+                    except Exception:
+                        _REQUESTS.pop(request_id, None)
+                        if request_id in _REQUEST_ORDER:
+                            _REQUEST_ORDER.remove(request_id)
+                        if _EXCLUSIVE_REQUEST_ID == request_id:
+                            _EXCLUSIVE_REQUEST_ID = None
+                            _EXCLUSIVE_REQUEST_GENERATION = None
+                        raise
                     try:
                         _REQUEST_QUEUE.put_nowait(admitted)
                     except _queue.Full:
                         _REQUESTS.pop(request_id, None)
                         if request_id in _REQUEST_ORDER:
                             _REQUEST_ORDER.remove(request_id)
+                        if _EXCLUSIVE_REQUEST_ID == request_id:
+                            _EXCLUSIVE_REQUEST_ID = None
+                            _EXCLUSIVE_REQUEST_GENERATION = None
                         _REJECTED_BUSY_COUNT += 1
                         response = _busy_response(
                             protocol_version, request_id, request_digest
@@ -782,9 +997,11 @@ def handle_external_connection(admitted):
         protocol_version,
         request_digest,
         request_generation,
+        exclusive,
     ) = admitted
     watchdog_timer = None
     timed_out_event = threading.Event()
+    late_wait_event = threading.Event()
     tmp_il_path = None
 
     try:
@@ -830,11 +1047,14 @@ def handle_external_connection(admitted):
         watchdog_timer.daemon = True
         watchdog_timer.start()
 
-        drain_deadline = _monotonic() + timeout_seconds + _RESPONSE_DRAIN_GRACE_SECONDS
+        drain_deadline = _monotonic() + timeout_seconds + _RESPONSE_DRAIN_WARNING_SECONDS
         returnData, response_too_large, response_bytes_seen = read_until_delimiter(
-            drain_deadline
+            drain_deadline,
+            late_wait_callback=lambda: late_wait_warning_callback(
+                request_id, request_generation, late_wait_event
+            ),
         )
-        was_timed_out = timed_out_event.is_set()
+        was_timed_out = timed_out_event.is_set() or late_wait_event.is_set()
         watchdog_timer.cancel()
 
         response_digest = (
@@ -870,17 +1090,40 @@ def handle_external_connection(admitted):
                 if was_timed_out
                 else response_for_cache
             )
+        finished_at_epoch = time.time()
+        terminal_proof = None
+        if not response_too_large:
+            terminal_proof = _build_terminal_proof(
+                final_state,
+                request_id,
+                request_digest,
+                operation_class,
+                protocol_version,
+                request_generation,
+                marker,
+                response_digest,
+                payload_digest,
+                response_bytes_seen,
+                finished_at_epoch,
+            )
+        finalize_fields = {
+            "response_bytes": response_for_cache,
+            "finished_at_epoch": finished_at_epoch,
+            "response_marker": marker,
+            "response_digest_sha256": response_digest,
+            "payload_digest_sha256": (
+                None if response_too_large else payload_digest
+            ),
+            "response_size_bytes": response_bytes_seen,
+            "response_too_large": response_too_large,
+        }
+        if terminal_proof is not None:
+            finalize_fields["terminal_proof"] = terminal_proof
         _finalize_request(
             request_id,
             request_generation,
             final_state,
-            response_bytes=response_for_cache,
-            finished_at_epoch=time.time(),
-            response_marker=marker,
-            response_digest_sha256=response_digest,
-            payload_digest_sha256=(None if response_too_large else payload_digest),
-            response_size_bytes=response_bytes_seen,
-            response_too_large=response_too_large,
+            **finalize_fields
         )
 
         _safe_sendall(conn, response_for_client)
@@ -905,6 +1148,18 @@ def handle_external_connection(admitted):
         _safe_sendall(conn, ("\x15%s" % e).encode("utf-8"))
     except json.JSONDecodeError as e:
         _safe_sendall(conn, f"\x15JSONDecodeError: {e}".encode("utf-8"))
+    except ResponseStreamClosed:
+        if request_id and request_generation:
+            _handle_stream_closed(request_id, request_generation)
+        _safe_sendall(conn, _format_client_response(
+            protocol_version if "protocol_version" in locals() else 2,
+            request_id, "transport_unknown", "NAK",
+            "RESPONSE_STREAM_CLOSED",
+            request_digest_sha256=(request_digest if "request_digest" in locals() else None),
+        ))
+        sys.stderr.write("ERROR: CIW response stream closed; retiring daemon.\n")
+        sys.stderr.flush()
+        _RETIRE_EVENT.set()
     except ResponseDrainTimeout:
         if request_id and request_generation:
             _finalize_request(
@@ -950,14 +1205,51 @@ def handle_external_connection(admitted):
         _safe_close_connection(conn)
 
 
+def _finish_exclusive_request(request_id, request_generation):
+    """Release a generation-scoped gate only after a proved terminal frame."""
+    global _EXCLUSIVE_REQUEST_ID, _EXCLUSIVE_REQUEST_GENERATION
+    with _STATE_LOCK:
+        if (
+            not request_id
+            or _EXCLUSIVE_REQUEST_ID != request_id
+            or _EXCLUSIVE_REQUEST_GENERATION != request_generation
+        ):
+            return False
+        entry = _REQUESTS.get(request_id)
+        if (
+            isinstance(entry, dict)
+            and entry.get("request_generation") == request_generation
+            and entry.get("state") in _EXCLUSIVE_RELEASE_STATES
+        ):
+            _EXCLUSIVE_REQUEST_ID = None
+            _EXCLUSIVE_REQUEST_GENERATION = None
+            try:
+                _write_request_state()
+            except Exception:
+                _EXCLUSIVE_REQUEST_ID = request_id
+                _EXCLUSIVE_REQUEST_GENERATION = request_generation
+                _RETIRE_EVENT.set()
+                raise
+            return True
+        # An exclusive lifecycle request with no complete terminal proof must
+        # never reopen admission.  Retire this daemon and keep the gate visible
+        # until process replacement.
+        _RETIRE_EVENT.set()
+        _write_request_state()
+        return False
+
+
 def _request_worker():
     while True:
         admitted = _REQUEST_QUEUE.get()
+        request_id = admitted[4] if len(admitted) > 4 else None
+        request_generation = admitted[8] if len(admitted) > 8 else None
         try:
             handle_external_connection(admitted)
         except BaseException:
             traceback.print_exc()
         finally:
+            _finish_exclusive_request(request_id, request_generation)
             _REQUEST_QUEUE.task_done()
 
 def start_server():

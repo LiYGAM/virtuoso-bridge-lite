@@ -8,15 +8,22 @@ localhost:port TCP endpoint; SSHClient makes that endpoint available.
 from __future__ import annotations
 
 import importlib.resources
+import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
+import math
 import os
+import posixpath
 import re
 import secrets
 import shlex
+import shutil
 import socket
+import stat
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -33,7 +40,454 @@ from virtuoso_bridge.transport.ssh import SSHRunner, CommandResult, _TimeoutBudg
 
 logger = logging.getLogger(__name__)
 
+
+def _strict_json_loads(raw: str) -> Any:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant: {value}")
+
+    payload = json.loads(raw, parse_constant=reject_constant)
+
+    def validate(value: Any) -> None:
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("non-finite JSON number")
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError("non-string JSON key")
+                validate(item)
+        elif isinstance(value, list):
+            for item in value:
+                validate(item)
+
+    validate(payload)
+    return payload
+
 _TUNNEL_STARTUP_SETTLE_SECONDS = 1.0
+
+# ``.cdsinit`` is user-authored configuration.  Keep the bridge's managed
+# fragment deliberately small and identify it by both profile and a stable
+# digest so two profiles cannot accidentally remove one another's block.
+_AUTOLOAD_START_PREFIX = "; >>> virtuoso-bridge autoload profile "
+_AUTOLOAD_END_PREFIX = "; <<< virtuoso-bridge autoload profile "
+_AUTOLOAD_LEGACY_PREFIX = "; Auto-load virtuoso-bridge-lite profile "
+
+
+def _autoload_profile_label(profile: str | None) -> str:
+    return profile or "default"
+
+
+def _autoload_profile_key(profile: str | None) -> str:
+    label = _autoload_profile_label(profile)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", label).strip("._-") or "default"
+    digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:12]
+    return f"{safe[:48]}-{digest}"
+
+
+def _autoload_markers(profile: str | None) -> tuple[str, str]:
+    key = _autoload_profile_key(profile)
+    return (
+        f"{_AUTOLOAD_START_PREFIX}{key} >>>",
+        f"{_AUTOLOAD_END_PREFIX}{key} <<<",
+    )
+
+
+def _skill_path(path: str | os.PathLike[str]) -> str:
+    """Render a filesystem path as a SKILL string literal payload."""
+    return str(path).replace("\\", "/").replace('"', '\\"')
+
+
+def _autoload_when_line(setup_path: str | os.PathLike[str]) -> str:
+    rendered = _skill_path(setup_path)
+    return f'when(isFile("{rendered}") load("{rendered}"))'
+
+
+def _autoload_legacy_marker(profile: str | None) -> str:
+    return f"{_AUTOLOAD_LEGACY_PREFIX}{_autoload_profile_label(profile)}"
+
+
+def _line_without_ending(line: str) -> str:
+    return line.rstrip("\r\n")
+
+
+def _line_ending_for(text: str) -> str:
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def _find_autoload_ranges(
+    text: str,
+    profile: str | None,
+    *,
+    expected_setup_path: str | os.PathLike[str] | None = None,
+    include_legacy: bool = False,
+) -> dict[str, Any]:
+    """Inspect/remove-ready ranges without normalizing unrelated text.
+
+    The returned line ranges are half-open indexes into ``splitlines``.  A
+    malformed/incomplete managed marker is intentionally left untouched; a
+    user may have written it while editing the file and deleting arbitrary
+    text after it would be unsafe.
+    """
+    lines = text.splitlines(keepends=True)
+    start, end = _autoload_markers(profile)
+    managed: list[tuple[int, int]] = []
+    managed_exact = 0
+    for index, line in enumerate(lines):
+        if _line_without_ending(line) != start:
+            continue
+        close = None
+        for candidate in range(index + 1, len(lines)):
+            candidate_line = _line_without_ending(lines[candidate])
+            if candidate_line == start:
+                # Do not let an incomplete marker consume user text or a
+                # later complete managed block.
+                break
+            if candidate_line == end:
+                close = candidate
+                break
+        if close is None:
+            continue
+        managed.append((index, close + 1))
+        if expected_setup_path is not None:
+            expected = (
+                start,
+                _autoload_when_line(expected_setup_path),
+                end,
+            )
+            actual = tuple(_line_without_ending(item) for item in lines[index : close + 1])
+            if actual == expected:
+                managed_exact += 1
+
+    legacy: list[tuple[int, int]] = []
+    legacy_exact = 0
+    if include_legacy and expected_setup_path is not None:
+        legacy_marker = _autoload_legacy_marker(profile)
+        legacy_when = _autoload_when_line(expected_setup_path)
+        expected_path = _skill_path(expected_setup_path)
+        legacy_when_open = f'when(isFile("{expected_path}")'
+        legacy_load = re.compile(rf'^\s*load\("{re.escape(expected_path)}"\)\s*$')
+        for index, line in enumerate(lines[:-1]):
+            if _line_without_ending(line) != legacy_marker:
+                continue
+            if _line_without_ending(lines[index + 1]) == legacy_when:
+                legacy.append((index, index + 2))
+                legacy_exact += 1
+                continue
+            if index + 3 < len(lines):
+                if (
+                    _line_without_ending(lines[index + 1]) == legacy_when_open
+                    and legacy_load.match(_line_without_ending(lines[index + 2]))
+                    and _line_without_ending(lines[index + 3]) == ")"
+                ):
+                    legacy.append((index, index + 4))
+                    legacy_exact += 1
+
+    return {
+        "lines": lines,
+        "managed_ranges": managed,
+        "managed_count": len(managed),
+        "managed_exact_count": managed_exact,
+        "legacy_ranges": legacy,
+        "legacy_count": len(legacy),
+        "legacy_exact_count": legacy_exact,
+    }
+
+
+def _remove_autoload_ranges(
+    text: str,
+    profile: str | None,
+    *,
+    expected_setup_path: str | os.PathLike[str] | None = None,
+    include_legacy: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    inspection = _find_autoload_ranges(
+        text,
+        profile,
+        expected_setup_path=expected_setup_path,
+        include_legacy=include_legacy,
+    )
+    ranges = list(inspection["managed_ranges"])
+    if include_legacy:
+        ranges.extend(inspection["legacy_ranges"])
+    if ranges:
+        remove_indexes = {
+            index
+            for first, last in ranges
+            for index in range(first, last)
+        }
+        lines = inspection["lines"]
+        text = "".join(line for index, line in enumerate(lines) if index not in remove_indexes)
+    return text, inspection
+
+
+def _autoload_block(
+    profile: str | None,
+    setup_path: str | os.PathLike[str],
+    *,
+    line_ending: str = "\n",
+) -> str:
+    start, end = _autoload_markers(profile)
+    return line_ending.join((start, _autoload_when_line(setup_path), end)) + line_ending
+
+
+def _autoload_render_install(
+    text: str,
+    profile: str | None,
+    setup_path: str | os.PathLike[str],
+) -> tuple[str, dict[str, Any]]:
+    line_ending = _line_ending_for(text)
+    cleaned, inspection = _remove_autoload_ranges(
+        text,
+        profile,
+        expected_setup_path=setup_path,
+        include_legacy=True,
+    )
+    if cleaned and not cleaned.endswith(("\n", "\r")):
+        cleaned += line_ending
+    rendered = cleaned + _autoload_block(profile, setup_path, line_ending=line_ending)
+    return rendered, inspection
+
+
+def _autoload_render_uninstall(
+    text: str,
+    profile: str | None,
+) -> tuple[str, dict[str, Any]]:
+    return _remove_autoload_ranges(text, profile)
+
+
+def _owner_identity_is_safe(path: Path) -> bool:
+    if path.is_symlink():
+        return False
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return False
+    if hasattr(os, "getuid"):
+        try:
+            return stat_result.st_uid == os.getuid()
+        except (AttributeError, OSError):
+            return False
+    return True
+
+
+def _local_cdsinit_path(profile: str | None = None) -> Path:
+    suffix = f"_{profile}" if profile else ""
+    configured = os.getenv(f"VB_CDSINIT_PATH{suffix}", "").strip()
+    if not configured:
+        configured = os.getenv("VB_CDSINIT_PATH", "").strip()
+    if configured:
+        return Path(os.path.expandvars(os.path.expanduser(configured)))
+    return Path.home() / ".cdsinit"
+
+
+def _next_backup_path(path: Path, profile: str | None = None) -> Path:
+    stamp = time.time_ns()
+    stem = f"{path.name}.virtuoso-bridge.{_autoload_profile_key(profile)}.{stamp}"
+    candidate = path.with_name(stem + ".bak")
+    suffix = 0
+    while candidate.exists() or candidate.is_symlink():
+        suffix += 1
+        candidate = path.with_name(f"{stem}.{suffix}.bak")
+    return candidate
+
+
+def _copy_private_backup(source: Path, backup: Path) -> None:
+    """Copy *source* to a new private, non-following backup path."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(backup, flags, 0o600)
+    try:
+        with source.open("rb") as source_handle, os.fdopen(fd, "wb") as backup_handle:
+            fd = -1
+            shutil.copyfileobj(source_handle, backup_handle)
+            backup_handle.flush()
+            os.fsync(backup_handle.fileno())
+        try:
+            backup.chmod(0o600)
+        except OSError:
+            pass
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    expected_current: bytes | None = None,
+    expected_exists: bool | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
+        if expected_exists is True:
+            if path.is_symlink() or not path.is_file():
+                raise RuntimeError(f"Refusing changed .cdsinit target: {path}")
+            try:
+                current = path.read_bytes()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Unable to re-read .cdsinit before replacement: {path}"
+                ) from exc
+            if expected_current is None or current != expected_current:
+                raise RuntimeError(
+                    f"Refusing concurrent .cdsinit change before replacement: {path}"
+                )
+        elif expected_exists is False and (path.exists() or path.is_symlink()):
+            raise RuntimeError(
+                f"Refusing newly created .cdsinit target before replacement: {path}"
+            )
+        os.replace(tmp, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+@contextmanager
+def _local_autoload_lock(path: Path):
+    """Serialize direct-CLI .cdsinit writers without trusting wrapper locks."""
+    lock_path = path.with_name(f"{path.name}.virtuoso-bridge.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise RuntimeError(f"Unable to open .cdsinit mutation lock: {lock_path}") from exc
+    locked = False
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"Unsafe .cdsinit mutation lock: {lock_path}")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise RuntimeError(f"Non-owned .cdsinit mutation lock: {lock_path}")
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        if os.name == "nt":
+            import msvcrt
+
+            if metadata.st_size == 0:
+                os.write(fd, b"0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Another .cdsinit mutation is already running: {path}"
+                ) from exc
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Another .cdsinit mutation is already running: {path}"
+                ) from exc
+        locked = True
+        yield
+    finally:
+        if locked:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
+def _local_autoload_snapshot(
+    profile: str | None,
+    expected_setup_path: str | os.PathLike[str] | None,
+) -> dict[str, Any]:
+    path = _local_cdsinit_path(profile)
+    exists = path.exists() or path.is_symlink()
+    symlink = path.is_symlink()
+    owned = False
+    mode: int | None = None
+    text = ""
+    error: str | None = None
+    if exists:
+        try:
+            stat_result = path.lstat()
+            mode = stat_result.st_mode & 0o777
+            owned = not symlink and _owner_identity_is_safe(path)
+            if not symlink and path.is_file():
+                text = path.read_bytes().decode("utf-8")
+            elif not symlink:
+                error = "target is not a regular file"
+        except (OSError, UnicodeError) as exc:
+            error = str(exc)
+    expected = str(expected_setup_path) if expected_setup_path else None
+    expected_exists = bool(expected and Path(expected).is_file()) if expected else None
+    inspection = _find_autoload_ranges(
+        text,
+        profile,
+        expected_setup_path=expected_setup_path,
+        include_legacy=True,
+    )
+    exact = (
+        inspection["managed_count"] == 1
+        and inspection["managed_exact_count"] == 1
+        and inspection["legacy_count"] == 0
+    )
+    return {
+        "path": str(path),
+        "target_exists": exists,
+        "target_is_symlink": symlink,
+        "target_owned": owned if exists else True,
+        "mode": mode,
+        "mode_octal": f"{mode:04o}" if mode is not None else None,
+        # Windows ACLs do not map reliably to POSIX mode bits; ownership and
+        # symlink safety remain meaningful, while the result is explicitly
+        # marked best-effort through ``permission_safety`` below.
+        "permission_safe": (not exists) or (
+            owned and (mode == 0o600 or os.name == "nt")
+        ),
+        "permission_safety": (
+            "best-effort-windows" if os.name == "nt" else "0600-required"
+        ),
+        "installed": exact,
+        "exact_match": exact,
+        "duplicate_block_count": inspection["managed_count"],
+        "legacy_exact_match": bool(inspection["legacy_exact_count"]),
+        "legacy_block_count": inspection["legacy_count"],
+        "expected_setup_path": expected,
+        "expected_setup_exists": expected_exists,
+        "error": error,
+        "_text": text,
+    }
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -89,6 +543,37 @@ def _auth_token_file(profile: str | None = None) -> Path:
     return config_dir() / "auth" / name
 
 
+def _read_auth_token_file(path: Path) -> str:
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing symlink Bridge auth token file: {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError(f"Unable to read Bridge auth token file: {path}") from exc
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"Bridge auth token path is not a regular file: {path}")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise RuntimeError(f"Bridge auth token file is not owned by this user: {path}")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            value = handle.read().strip()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not value:
+        raise RuntimeError(f"Bridge auth token file is empty: {path}")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return value
+
+
 def resolve_auth_token(profile: str | None = None, *, create: bool = False) -> str:
     """Resolve the per-profile daemon token without exposing it in evidence."""
     load_vb_env()
@@ -98,13 +583,8 @@ def resolve_auth_token(profile: str | None = None, *, create: bool = False) -> s
         if value:
             return value
     path = _auth_token_file(profile)
-    if path.is_file():
-        try:
-            value = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            value = ""
-        if value:
-            return value
+    if path.exists() or path.is_symlink():
+        return _read_auth_token_file(path)
     if not create:
         return ""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,10 +595,7 @@ def resolve_auth_token(profile: str | None = None, *, create: bool = False) -> s
             flags |= os.O_NOFOLLOW
         fd = os.open(path, flags, 0o600)
     except FileExistsError:
-        existing = path.read_text(encoding="utf-8").strip()
-        if not existing:
-            raise RuntimeError(f"Bridge auth token file is empty: {path}")
-        return existing
+        return _read_auth_token_file(path)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(value + "\n")
         handle.flush()
@@ -232,6 +709,27 @@ def _profiled_env_key(base: str, profile: str | None) -> str:
     return f"{base}_{profile}" if profile else base
 
 
+def _profile_identity_matches(
+    saved: dict[str, Any],
+    *,
+    remote_host: str,
+    remote_user: str | None,
+    remote_port: int,
+    jump_host: str | None,
+    jump_user: str | None,
+    allow_remote_bind: bool,
+) -> bool:
+    expected = {
+        "remote_host": remote_host,
+        "remote_user": remote_user,
+        "remote_port": remote_port,
+        "jump_host": jump_host,
+        "jump_user": jump_user,
+        "allow_remote_bind": allow_remote_bind,
+    }
+    return all(key in saved and saved.get(key) == value for key, value in expected.items())
+
+
 # ---------------------------------------------------------------------------
 # SSHClient
 # ---------------------------------------------------------------------------
@@ -266,7 +764,9 @@ class SSHClient:
         self._timeout = timeout
         self._keep_remote_files = keep_remote_files
         self._profile = profile
-        self._auth_token = auth_token or secrets.token_urlsafe(32)
+        self._auth_token = (
+            auth_token if auth_token is not None else secrets.token_urlsafe(32)
+        )
         self._allow_remote_bind = bool(allow_remote_bind)
         self._request_state_path: str | None = None
         self._deployed_daemon_sha256: str | None = None
@@ -341,6 +841,37 @@ class SSHClient:
             except (ValueError, TypeError):
                 pass
 
+        effective_allow_remote_bind = (
+            remote_bind_allowed(profile)
+            if allow_remote_bind is None
+            else bool(allow_remote_bind)
+        )
+        if local_port is None:
+            # Preserve a previously auto-switched local port only when the
+            # saved tunnel identity still matches every connection endpoint.
+            # This avoids both needless second tunnels and host A -> host B
+            # state corruption after profile edits.
+            previous_state = cls.read_state(profile) or {}
+            saved_config = previous_state.get("profile_config")
+            if isinstance(saved_config, dict) and _profile_identity_matches(
+                saved_config,
+                remote_host=remote_host,
+                remote_user=remote_user,
+                remote_port=port,
+                jump_host=jump_host,
+                jump_user=jump_user,
+                allow_remote_bind=effective_allow_remote_bind,
+            ):
+                try:
+                    candidate = int(
+                        saved_config.get("local_port")
+                        or previous_state.get("port")
+                    )
+                except (TypeError, ValueError):
+                    candidate = 0
+                if 1 <= candidate <= 65535:
+                    local_port = candidate
+
         return cls(
             remote_host=remote_host,
             remote_user=remote_user,
@@ -350,15 +881,8 @@ class SSHClient:
             jump_user=jump_user,
             keep_remote_files=keep_remote_files,
             profile=profile,
-            auth_token=(
-                resolve_auth_token(profile, create=create_auth_token)
-                or secrets.token_urlsafe(32)
-            ),
-            allow_remote_bind=(
-                remote_bind_allowed(profile)
-                if allow_remote_bind is None
-                else allow_remote_bind
-            ),
+            auth_token=resolve_auth_token(profile, create=create_auth_token),
+            allow_remote_bind=effective_allow_remote_bind,
         )
 
     # -- properties ---------------------------------------------------------
@@ -396,6 +920,11 @@ class SSHClient:
     @property
     def setup_path(self) -> str | None:
         return self._remote_virtuoso_setup_path
+
+    @property
+    def compat_setup_path(self) -> str | None:
+        """Stable setup path intended for CIW/.cdsinit bootstrap loading."""
+        return self._compat_setup_path
 
     @property
     def auth_token(self) -> str:
@@ -704,12 +1233,10 @@ class SSHClient:
 
         local_il.write_bytes(il_text.encode("utf-8"))
 
-        local_token.parent.mkdir(parents=True, exist_ok=True)
-        local_token.write_text(self._auth_token + "\n", encoding="utf-8")
-        try:
-            local_token.chmod(0o600)
-        except OSError:
-            pass
+        _atomic_write_bytes(
+            local_token,
+            (self._auth_token + "\n").encode("utf-8"),
+        )
 
         setup_content = _generate_virtuoso_setup_il(
             str(local_daemon),
@@ -744,7 +1271,504 @@ class SSHClient:
             local_setup, python_cmd,
         )
 
+    # -- .cdsinit autoload -------------------------------------------------
+
+    def _remote_cdsinit_snapshot(
+        self,
+        expected_setup_path: str | os.PathLike[str] | None = None,
+        *,
+        timeout: float | None = None,
+        retry_transport_errors: bool = True,
+    ) -> dict[str, Any]:
+        """Read remote ``~/.cdsinit`` and safety metadata.
+
+        The first two records are a private framing protocol; the UTF-8 payload
+        is base64 so marker-like user text is not mistaken for bridge metadata.
+        This operation is
+        intentionally a read-only shell command.  Mutating callers pass
+        ``retry_transport_errors=False`` for the same fail-closed semantics as
+        file uploads and atomic replacement.
+        """
+        runner = self._require_runner()
+        setup_literal = shlex.quote(str(expected_setup_path or ""))
+        command = (
+            'p="$HOME/.cdsinit"; '
+            'printf "__VB_PATH__ %s\\n" "$p"; '
+            'printf "__VB_UID__ %s\\n" "$(id -u)"; '
+            'if [ -L "$p" ]; then printf "__VB_SYMLINK__\\n"; exit 0; fi; '
+            'if [ -e "$p" ] && [ ! -f "$p" ]; then printf "__VB_UNSAFE__\\n"; exit 0; fi; '
+            'if [ -e "$p" ] && [ ! -r "$p" ]; then printf "__VB_UNREADABLE__\\n"; exit 0; fi; '
+            'if [ ! -e "$p" ]; then printf "__VB_MISSING__\\n"; '
+            'else '
+            'owner=$(stat -c %u -- "$p" 2>/dev/null || stat -f %u -- "$p" 2>/dev/null || printf "?"); '
+            'mode=$(stat -c %a -- "$p" 2>/dev/null || stat -f %Lp -- "$p" 2>/dev/null || printf "?"); '
+            'printf "__VB_EXISTS__ %s %s\\n" "$owner" "$mode"; '
+            'if ! command -v base64 >/dev/null 2>&1; then exit 49; fi; '
+            'printf "__VB_BASE64__\\n"; base64 < "$p" | tr -d "\\n"; printf "\\n"; '
+            'fi; '
+            f'e={setup_literal}; '
+            'if [ -n "$e" ] && [ -f "$e" ]; then printf "__VB_SETUP_EXISTS__ 1\\n"; '
+            'else printf "__VB_SETUP_EXISTS__ 0\\n"; fi'
+        )
+        result = runner.run_command(
+            command,
+            timeout=timeout or self._timeout,
+            retry_transport_errors=retry_transport_errors,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "Unable to inspect remote .cdsinit")
+        output = result.stdout or ""
+        first, separator, rest = output.partition("\n")
+        if not separator or not first.startswith("__VB_PATH__ "):
+            raise RuntimeError("Malformed remote .cdsinit inspection result")
+        target_path = first[len("__VB_PATH__ ") :].strip()
+        if not target_path.startswith("/"):
+            raise RuntimeError("Malformed remote .cdsinit target path")
+        uid_line, separator, rest = rest.partition("\n")
+        if not separator or not uid_line.startswith("__VB_UID__ "):
+            raise RuntimeError("Malformed remote .cdsinit uid result")
+        remote_uid = uid_line[len("__VB_UID__ ") :].strip()
+        if not remote_uid.isdigit():
+            raise RuntimeError("Malformed remote .cdsinit uid value")
+        second, separator, rest = rest.partition("\n")
+        if not separator:
+            raise RuntimeError("Malformed remote .cdsinit safety framing")
+        status = second.strip()
+        payload = ""
+        owner: str | None = None
+        mode: int | None = None
+        setup_line = ""
+        if status.startswith("__VB_EXISTS__ "):
+            fields = status.split()
+            if len(fields) != 3 or not fields[1].isdigit():
+                raise RuntimeError("Malformed remote .cdsinit owner/mode result")
+            owner = fields[1]
+            try:
+                mode = int(fields[2], 8)
+            except ValueError as exc:
+                raise RuntimeError("Malformed remote .cdsinit mode result") from exc
+            framing, separator, body = rest.partition("\n")
+            if not separator:
+                raise RuntimeError("Malformed remote .cdsinit payload framing")
+            body_without_setup, setup_separator, setup_tail = body.rpartition(
+                "\n__VB_SETUP_EXISTS__ "
+            )
+            setup_values = setup_tail.splitlines()
+            if (
+                not setup_separator
+                or len(setup_values) != 1
+                or setup_values[0] not in {"0", "1"}
+            ):
+                raise RuntimeError("Malformed remote setup-exists trailer")
+            setup_line = "__VB_SETUP_EXISTS__ " + setup_values[0]
+            body = body_without_setup
+            if framing.strip() == "__VB_BASE64__":
+                try:
+                    text = base64.b64decode(body.strip() or "", validate=True).decode(
+                        "utf-8"
+                    )
+                except (ValueError, UnicodeError) as exc:
+                    raise RuntimeError(f"Unable to decode remote .cdsinit: {exc}") from exc
+            else:
+                raise RuntimeError("Malformed remote .cdsinit payload framing")
+            exists = True
+        elif status == "__VB_MISSING__":
+            text = ""
+            exists = False
+            setup_lines = rest.splitlines()
+            if setup_lines not in (
+                ["__VB_SETUP_EXISTS__ 0"],
+                ["__VB_SETUP_EXISTS__ 1"],
+            ):
+                raise RuntimeError("Malformed remote setup-exists trailer")
+            setup_line = setup_lines[0]
+        elif status in {"__VB_SYMLINK__", "__VB_UNSAFE__", "__VB_UNREADABLE__"}:
+            text = ""
+            exists = True
+        else:
+            raise RuntimeError("Malformed remote .cdsinit safety result")
+        setup_exists = setup_line.strip() == "__VB_SETUP_EXISTS__ 1"
+        expected = str(expected_setup_path) if expected_setup_path else None
+        inspection = _find_autoload_ranges(
+            text,
+            self._profile,
+            expected_setup_path=expected_setup_path,
+            include_legacy=True,
+        )
+        exact = (
+            inspection["managed_count"] == 1
+            and inspection["managed_exact_count"] == 1
+            and inspection["legacy_count"] == 0
+        )
+        owner_safe = status == "__VB_MISSING__"
+        permission_safe = status == "__VB_MISSING__"
+        if status.startswith("__VB_EXISTS__ "):
+            owner_safe = bool(
+                owner
+                and remote_uid
+                and owner.strip() == remote_uid.strip()
+                and remote_uid.strip() not in {"", "?"}
+            )
+            if mode is not None:
+                permission_safe = mode == 0o600
+            else:
+                permission_safe = False
+        return {
+            "path": target_path,
+            "target_exists": exists,
+            "target_is_symlink": status == "__VB_SYMLINK__",
+            "target_owned": owner_safe,
+            "mode": mode,
+            "mode_octal": f"{mode:04o}" if mode is not None else None,
+            "permission_safe": permission_safe,
+            "permission_safety": "0600-required",
+            "installed": exact,
+            "exact_match": exact,
+            "duplicate_block_count": inspection["managed_count"],
+            "legacy_exact_match": bool(inspection["legacy_exact_count"]),
+            "legacy_block_count": inspection["legacy_count"],
+            "expected_setup_path": expected,
+            "expected_setup_exists": setup_exists if expected else None,
+            "_text": text,
+        }
+
+    def _remote_autoload_mutate(
+        self,
+        *,
+        action: str,
+        expected_setup_path: str | os.PathLike[str] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        if action not in {"install", "uninstall"}:
+            raise ValueError("action must be install or uninstall")
+        expected = expected_setup_path or self._compat_setup_path
+        if action == "install" and not expected:
+            raise RuntimeError("No compatible bridge setup path is staged")
+        snapshot = self._remote_cdsinit_snapshot(
+            expected,
+            timeout=timeout,
+            retry_transport_errors=False,
+        )
+        if snapshot["target_is_symlink"] or (
+            snapshot["target_exists"] and not snapshot["target_owned"]
+        ):
+            raise RuntimeError(
+                "Refusing unsafe remote .cdsinit target "
+                f"({snapshot['path'] or '$HOME/.cdsinit'}): symlink, non-owned, "
+                "non-regular, or unreadable target"
+            )
+        text = str(snapshot.get("_text") or "")
+        if action == "install":
+            rendered, _ = _autoload_render_install(text, self._profile, str(expected))
+        else:
+            rendered, _ = _autoload_render_uninstall(text, self._profile)
+        runner = self._require_runner()
+        profile_key = _autoload_profile_key(self._profile)
+        nonce = f"{os.getpid()}.{time.time_ns()}"
+        target_path = str(snapshot.get("path") or "")
+        if not target_path.startswith("/"):
+            raise RuntimeError("Remote .cdsinit inspection did not return an absolute target path")
+        target_dir = posixpath.dirname(target_path) or "/"
+        target_name = posixpath.basename(target_path) or ".cdsinit"
+        hidden_target_name = (
+            target_name if target_name.startswith(".") else f".{target_name}"
+        )
+        tmp_path = posixpath.join(
+            target_dir,
+            f"{hidden_target_name}.virtuoso-bridge.{profile_key}.{nonce}.tmp",
+        )
+        backup_path = posixpath.join(
+            target_dir,
+            f"{target_name}.virtuoso-bridge.{profile_key}.{nonce}.bak",
+        )
+        lock_path = target_path + ".virtuoso-bridge.lock"
+        quoted_lock = shlex.quote(lock_path)
+        lock_prefix = (
+            'command -v flock >/dev/null 2>&1 || exit 53; '
+            f'lock={quoted_lock}; umask 077; '
+            'exec 9>> "$lock" || exit 53; flock -n 9 || exit 54; '
+        )
+        if rendered == text and (
+            not snapshot["target_exists"] or snapshot.get("mode") == 0o600
+        ):
+            if snapshot["target_exists"]:
+                expected_digest = _sha256_bytes(text.encode("utf-8"))
+                noop_guard = (
+                    '[ -f "$p" ] && [ ! -L "$p" ] || exit 42; '
+                    'owner=$(stat -c %u -- "$p" 2>/dev/null || stat -f %u -- "$p" 2>/dev/null || printf "?"); '
+                    'uid=$(id -u); [ "$owner" = "$uid" ] || exit 44; '
+                    'if command -v sha256sum >/dev/null 2>&1; then '
+                    'current=$(sha256sum -- "$p") || exit 47; current=${current%% *}; '
+                    'elif command -v shasum >/dev/null 2>&1; then '
+                    'current=$(shasum -a 256 "$p") || exit 47; current=${current%% *}; '
+                    'elif command -v openssl >/dev/null 2>&1; then '
+                    'current=$(openssl dgst -sha256 "$p") || exit 47; current=${current##* }; '
+                    'else exit 47; fi; '
+                    'current=$(printf "%s" "$current" | tr "A-F" "a-f"); '
+                    f'[ "$current" = {shlex.quote(expected_digest)} ] || exit 48; '
+                    'mode=$(stat -c %a -- "$p" 2>/dev/null || stat -f %Lp -- "$p" 2>/dev/null || printf "?"); '
+                    '[ "$mode" = "600" ] || exit 52; '
+                )
+            else:
+                noop_guard = '[ ! -e "$p" ] && [ ! -L "$p" ] || exit 43; '
+            result = runner.run_command(
+                f'p={shlex.quote(target_path)}; {lock_prefix}{noop_guard}',
+                timeout=timeout or self._timeout,
+                retry_transport_errors=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    result.stderr.strip()
+                    or "Remote .cdsinit changed during no-op verification"
+                )
+            final = self._remote_cdsinit_snapshot(
+                expected,
+                timeout=timeout,
+                retry_transport_errors=False,
+            )
+            final.pop("_text", None)
+            goal_met = (
+                bool(final.get("exact_match"))
+                if action == "install"
+                else not final.get("installed")
+                and int(final.get("duplicate_block_count") or 0) == 0
+                and int(final.get("legacy_block_count") or 0) == 0
+            )
+            if not goal_met or not final.get("permission_safe"):
+                raise RuntimeError(
+                    "Remote .cdsinit changed after no-op verification"
+                )
+            final["backup_path"] = None
+            return final
+        upload = runner.upload_text(
+            rendered,
+            tmp_path,
+            timeout=timeout or self._timeout,
+            retry_transport_errors=False,
+            create_parent=False,
+            exclusive_create=True,
+        )
+        if upload.returncode != 0:
+            raise RuntimeError(upload.stderr.strip() or "Unable to stage remote .cdsinit")
+        quoted_tmp = shlex.quote(tmp_path)
+        quoted_backup = shlex.quote(backup_path)
+        if snapshot["target_exists"]:
+            expected_digest = _sha256_bytes(text.encode("utf-8"))
+            existing_guard = (
+                '[ -e "$p" ] || exit 43; '
+                'owner=$(stat -c %u -- "$p" 2>/dev/null || stat -f %u -- "$p" 2>/dev/null || printf "?"); '
+                'uid=$(id -u); [ "$owner" = "$uid" ] || exit 44; '
+                f'[ ! -e {quoted_backup} ] && [ ! -L {quoted_backup} ] || exit 45; '
+                'umask 077; set -C; '
+                f'exec 3> {quoted_backup} || exit 45; set +C; '
+                f'cat -- "$p" >&3 || {{ exec 3>&-; rm -f -- {quoted_backup}; exit 46; }}; '
+                f'exec 3>&-; chmod 600 -- {quoted_backup} || '
+                f'{{ rm -f -- {quoted_backup}; exit 46; }}; '
+                'if command -v sha256sum >/dev/null 2>&1; then '
+                f'current=$(sha256sum -- {quoted_backup}) || {{ rm -f -- {quoted_backup}; exit 47; }}; '
+                'current=${current%% *}; '
+                'elif command -v shasum >/dev/null 2>&1; then '
+                f'current=$(shasum -a 256 {quoted_backup}) || {{ rm -f -- {quoted_backup}; exit 47; }}; '
+                'current=${current%% *}; '
+                'elif command -v openssl >/dev/null 2>&1; then '
+                f'current=$(openssl dgst -sha256 {quoted_backup}) || {{ rm -f -- {quoted_backup}; exit 47; }}; '
+                'current=${current##* }; '
+                f'else rm -f -- {quoted_backup}; exit 47; fi; '
+                'current=$(printf "%s" "$current" | tr "A-F" "a-f"); '
+                f'[ "$current" = {shlex.quote(expected_digest)} ] || '
+                f'{{ rm -f -- {quoted_backup}; exit 48; }}; '
+                f'cmp -s -- "$p" {quoted_backup} || '
+                f'{{ rm -f -- {quoted_backup}; exit 49; }}; '
+            )
+        else:
+            existing_guard = '[ ! -e "$p" ] || exit 43; '
+        command = (
+            f'p={shlex.quote(target_path)}; '
+            f'{lock_prefix}'
+            'if [ -L "$p" ]; then exit 41; fi; '
+            'if [ -e "$p" ] && [ ! -f "$p" ]; then exit 42; fi; '
+            f'{existing_guard}'
+            f'[ -f {quoted_tmp} ] && [ ! -L {quoted_tmp} ] || exit 50; '
+            f'chmod 600 -- {quoted_tmp} || exit 50; '
+            f'mv -f -- {quoted_tmp} "$p" || exit 51; '
+            'chmod 600 -- "$p" || exit 52'
+        )
+        try:
+            result = runner.run_command(
+                command,
+                timeout=timeout or self._timeout,
+                retry_transport_errors=False,
+            )
+        except Exception:
+            try:
+                runner.run_command(
+                    f"rm -f -- {quoted_tmp}",
+                    timeout=timeout or self._timeout,
+                    retry_transport_errors=False,
+                )
+            except Exception:
+                pass
+            raise
+        if result.returncode != 0:
+            try:
+                runner.run_command(
+                    f"rm -f -- {quoted_tmp}",
+                    timeout=timeout or self._timeout,
+                    retry_transport_errors=False,
+                )
+            except Exception:
+                pass
+            raise RuntimeError(result.stderr.strip() or "Unable to atomically update remote .cdsinit")
+        final = self._remote_cdsinit_snapshot(
+            expected,
+            timeout=timeout,
+            retry_transport_errors=False,
+        )
+        final.pop("_text", None)
+        final["backup_path"] = backup_path if snapshot["target_exists"] else None
+        return final
+
+    def autoload_status(
+        self,
+        *,
+        expected_setup_path: str | os.PathLike[str] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Return .cdsinit autoload state without staging or token creation."""
+        expected = expected_setup_path or self._compat_setup_path
+        if _is_localhost(self._remote_host):
+            snapshot = _local_autoload_snapshot(self._profile, expected)
+        else:
+            snapshot = self._remote_cdsinit_snapshot(expected, timeout=timeout)
+        snapshot.pop("_text", None)
+        snapshot["profile"] = self._profile
+        return snapshot
+
+    def autoload_install(
+        self,
+        *,
+        expected_setup_path: str | os.PathLike[str] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Install/update only this profile's managed .cdsinit block."""
+        expected = expected_setup_path or self._compat_setup_path
+        if not expected:
+            raise RuntimeError("No compatible bridge setup path is staged")
+        if _is_localhost(self._remote_host):
+            path = _local_cdsinit_path(self._profile)
+            with _local_autoload_lock(path):
+                snapshot = _local_autoload_snapshot(self._profile, expected)
+                if snapshot.get("error") or snapshot["target_is_symlink"] or (
+                    snapshot["target_exists"] and not snapshot["target_owned"]
+                ):
+                    raise RuntimeError(
+                        f"Refusing unsafe .cdsinit target {snapshot['path']}: "
+                        "symlink, non-owned, non-regular, or unreadable target"
+                    )
+                text = str(snapshot.get("_text") or "")
+                rendered, _ = _autoload_render_install(
+                    text, self._profile, str(expected)
+                )
+                backup_path = None
+                mode_ok = snapshot.get("mode") == 0o600 or os.name == "nt"
+                if rendered != text or not mode_ok or not path.exists():
+                    if path.exists():
+                        backup = _next_backup_path(path, self._profile)
+                        _copy_private_backup(path, backup)
+                        backup_path = str(backup)
+                    _atomic_write_bytes(
+                        path,
+                        rendered.encode("utf-8"),
+                        expected_current=text.encode("utf-8"),
+                        expected_exists=bool(snapshot["target_exists"]),
+                    )
+                final = _local_autoload_snapshot(self._profile, expected)
+            final.pop("_text", None)
+            if backup_path:
+                final["backup_path"] = backup_path
+            final["profile"] = self._profile
+            return final
+        result = self._remote_autoload_mutate(
+            action="install",
+            expected_setup_path=expected,
+            timeout=timeout,
+        )
+        result["profile"] = self._profile
+        return result
+
+    def autoload_uninstall(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Remove only this profile's managed block, never touching CIW."""
+        expected = self._compat_setup_path
+        if _is_localhost(self._remote_host):
+            path = _local_cdsinit_path(self._profile)
+            with _local_autoload_lock(path):
+                snapshot = _local_autoload_snapshot(self._profile, expected)
+                if snapshot.get("error") or snapshot["target_is_symlink"] or (
+                    snapshot["target_exists"] and not snapshot["target_owned"]
+                ):
+                    raise RuntimeError(
+                        f"Refusing unsafe .cdsinit target {snapshot['path']}: "
+                        "symlink, non-owned, non-regular, or unreadable target"
+                    )
+                text = str(snapshot.get("_text") or "")
+                rendered, _ = _autoload_render_uninstall(text, self._profile)
+                backup_path = None
+                mode_ok = snapshot.get("mode") == 0o600 or os.name == "nt"
+                if path.exists() and (rendered != text or not mode_ok):
+                    backup = _next_backup_path(path, self._profile)
+                    _copy_private_backup(path, backup)
+                    backup_path = str(backup)
+                    _atomic_write_bytes(
+                        path,
+                        rendered.encode("utf-8"),
+                        expected_current=text.encode("utf-8"),
+                        expected_exists=True,
+                    )
+                final = _local_autoload_snapshot(self._profile, expected)
+            final.pop("_text", None)
+            if backup_path:
+                final["backup_path"] = backup_path
+            final["profile"] = self._profile
+            return final
+        result = self._remote_autoload_mutate(
+            action="uninstall",
+            expected_setup_path=expected,
+            timeout=timeout,
+        )
+        result["profile"] = self._profile
+        return result
+
     # -- SSH tunnel (delegated to SSHRunner) ----------------------------------
+
+    def _saved_tunnel_identity_matches(self, state: dict[str, Any] | None) -> bool:
+        if not isinstance(state, dict) or state.get("mode") != "remote":
+            return False
+        if state.get("profile") != self._profile:
+            return False
+        try:
+            if int(state.get("port")) != self._local_port:
+                return False
+        except (TypeError, ValueError):
+            return False
+        saved = state.get("profile_config")
+        if not isinstance(saved, dict) or not _profile_identity_matches(
+            saved,
+            remote_host=self._remote_host,
+            remote_user=self._remote_user,
+            remote_port=self._port,
+            jump_host=self._jump_host,
+            jump_user=self._jump_user,
+            allow_remote_bind=self._allow_remote_bind,
+        ):
+            return False
+        try:
+            return int(saved.get("local_port")) == self._local_port
+        except (TypeError, ValueError):
+            return False
 
     def ensure_tunnel(
         self,
@@ -760,10 +1784,28 @@ class SSHClient:
         if runner.is_tunnel_alive:
             return
         if SSHRunner.can_reach_port(self._local_port):
-            # Port reachable (external tunnel) — load PID from state if available
             state = self.read_state(self._profile)
-            if state and state.get("tunnel_pid"):
-                runner.tunnel_pid = state["tunnel_pid"]
+            if not self._saved_tunnel_identity_matches(state):
+                raise RuntimeError(
+                    f"Refusing to reuse reachable localhost:{self._local_port}: "
+                    "the saved tunnel identity does not match this profile. "
+                    "Stop the old profile tunnel or choose another VB_LOCAL_PORT."
+                )
+            try:
+                tunnel_pid = int(state.get("tunnel_pid"))
+            except (AttributeError, TypeError, ValueError):
+                tunnel_pid = 0
+            if tunnel_pid <= 0:
+                raise RuntimeError(
+                    f"Refusing to reuse reachable localhost:{self._local_port}: "
+                    "the owning tunnel PID is unavailable."
+                )
+            runner.tunnel_pid = tunnel_pid
+            if not runner.is_tunnel_alive:
+                raise RuntimeError(
+                    f"Refusing to reuse reachable localhost:{self._local_port}: "
+                    "the saved tunnel process is no longer alive."
+                )
             return
 
         max_attempts = 10
@@ -901,12 +1943,24 @@ class SSHClient:
             "deployed_daemon_path": self._deployed_daemon_path,
             "deployed_il_path": self._deployed_il_path,
             "compat_setup_path": self._compat_setup_path,
+            # Alias retained as an explicit bootstrap field for callers that
+            # do not know the historical ``compat_setup_path`` name.
+            "bootstrap_path": self._compat_setup_path,
             "deployment_id": self._deployment_id,
             "daemon_filename": self._daemon_filename,
             "previous_deployed_daemon_sha256": previous_daemon_sha256,
             "bind_policy": "remote-explicit" if self._allow_remote_bind else "loopback",
             "auth_enabled": bool(self._auth_token),
             "profile": self._profile,
+            "profile_config": {
+                "remote_host": self._remote_host,
+                "remote_user": self._remote_user,
+                "remote_port": self._port,
+                "local_port": self._local_port,
+                "jump_host": self._jump_host,
+                "jump_user": self._jump_user,
+                "allow_remote_bind": self._allow_remote_bind,
+            },
             "started_at": time.time(),
         }
         _atomic_write_json(_state_file(self._profile), state)
@@ -928,8 +1982,8 @@ class SSHClient:
             return None
         if state.get("mode") == "local":
             try:
-                payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                payload = _strict_json_loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
                 return None
         else:
             client = cls.from_env(
@@ -944,14 +1998,21 @@ class SSHClient:
                 )
                 if result.returncode != 0:
                     return None
-                payload = json.loads(result.stdout)
+                payload = _strict_json_loads(result.stdout)
             except (OSError, ValueError, json.JSONDecodeError):
                 return None
             finally:
                 client.close()
+        if not isinstance(payload, dict):
+            return None
+        requests = payload.get("requests", [])
+        if not isinstance(requests, list) or any(
+            not isinstance(entry, dict) for entry in requests
+        ):
+            return None
         if not request_id:
             return payload
-        for entry in payload.get("requests", []):
+        for entry in requests:
             if entry.get("request_id") == request_id:
                 filtered = {
                     "schema_version": payload.get("schema_version"),
@@ -966,6 +2027,8 @@ class SSHClient:
                     "daemon_started_at_epoch",
                     "heartbeat_at_epoch",
                     "active_request_id",
+                    "exclusive_request_id",
+                    "exclusive_request_generation",
                     "queue_depth",
                     "queue_capacity",
                 ):
@@ -985,12 +2048,200 @@ class SSHClient:
             "daemon_started_at_epoch",
             "heartbeat_at_epoch",
             "active_request_id",
+            "exclusive_request_id",
+            "exclusive_request_generation",
             "queue_depth",
             "queue_capacity",
         ):
             if key in payload:
                 filtered[key] = payload.get(key)
         return filtered
+
+    @classmethod
+    def verify_staged_files(
+        cls,
+        profile: str | None,
+        state: dict[str, Any],
+        *,
+        timeout: float = 10.0,
+    ) -> tuple[bool, str]:
+        """Verify exact staged daemon, IL, and setup bytes before activation."""
+        expected = {
+            str(state.get("deployed_daemon_path") or ""): str(
+                state.get("deployed_daemon_sha256") or ""
+            ).lower(),
+            str(state.get("deployed_il_path") or ""): str(
+                state.get("deployed_il_sha256") or ""
+            ).lower(),
+            str(state.get("setup_path") or ""): str(
+                state.get("deployed_setup_sha256") or ""
+            ).lower(),
+        }
+        if any(
+            not path or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            for path, digest in expected.items()
+        ):
+            return False, "staged file identity is incomplete"
+        budget = _TimeoutBudget.start(timeout, timeout)
+        if state.get("mode") == "local":
+            for raw_path, expected_digest in expected.items():
+                path = Path(raw_path)
+                if path.is_symlink() or not path.is_file():
+                    return False, f"staged file is missing or unsafe: {path}"
+                try:
+                    actual = _sha256_bytes(path.read_bytes())
+                except OSError as exc:
+                    return False, f"unable to read staged file {path}: {exc}"
+                if actual != expected_digest:
+                    return False, f"staged file digest mismatch: {path}"
+            return True, "verified"
+
+        client = cls.from_env(
+            keep_remote_files=True,
+            profile=profile,
+            create_auth_token=False,
+        )
+        try:
+            runner = client._require_runner()
+            for raw_path, expected_digest in expected.items():
+                quoted = shlex.quote(raw_path)
+                command = (
+                    f"p={quoted}; [ -f \"$p\" ] && [ ! -L \"$p\" ] || exit 41; "
+                    "if command -v sha256sum >/dev/null 2>&1; then "
+                    'value=$(sha256sum -- "$p") || exit 42; value=${value%% *}; '
+                    "elif command -v shasum >/dev/null 2>&1; then "
+                    'value=$(shasum -a 256 "$p") || exit 42; value=${value%% *}; '
+                    "elif command -v openssl >/dev/null 2>&1; then "
+                    'value=$(openssl dgst -sha256 "$p") || exit 42; value=${value##* }; '
+                    "else exit 43; fi; printf '%s\\n' \"$value\""
+                )
+                result = runner.run_command(
+                    command,
+                    timeout=budget.remaining("verify staged Bridge files"),
+                    retry_transport_errors=True,
+                )
+                actual = (result.stdout or "").strip().lower()
+                if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{64}", actual):
+                    details = result.stderr.strip() or result.stdout.strip()
+                    return False, details or f"unable to verify staged file: {raw_path}"
+                if actual != expected_digest:
+                    return False, f"staged file digest mismatch: {raw_path}"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"staged file verification failed: {exc}"
+        finally:
+            client.close()
+        return True, "verified"
+
+    @classmethod
+    def staged_profile_config_matches_current(
+        cls,
+        profile: str | None = None,
+    ) -> bool:
+        """Return whether saved tunnel endpoints match the current profile.
+
+        Legacy remote state without a complete ``profile_config`` fails
+        closed.  A saved auto-selected local port remains valid when no
+        explicit ``VB_LOCAL_PORT`` override was added later.
+        """
+        profile = resolve_profile(profile)
+        load_vb_env()
+        state = cls.read_state(profile)
+        if not isinstance(state, dict):
+            return False
+        saved = state.get("profile_config")
+        if not isinstance(saved, dict):
+            return False
+        suffix = f"_{profile}" if profile else ""
+        remote_host = os.getenv(f"VB_REMOTE_HOST{suffix}", "").strip()
+        remote_user = os.getenv(f"VB_REMOTE_USER{suffix}", "").strip() or None
+        jump_host = os.getenv(f"VB_JUMP_HOST{suffix}", "").strip() or None
+        jump_user = os.getenv(f"VB_JUMP_USER{suffix}", "").strip() or None
+        from virtuoso_bridge.virtuoso.basic.bridge import _default_remote_port
+        try:
+            remote_port = int(
+                os.getenv(f"VB_REMOTE_PORT{suffix}", "").strip()
+                or _default_remote_port(remote_user)
+            )
+        except (TypeError, ValueError):
+            return False
+        allow_remote = remote_bind_allowed(profile)
+        if not _profile_identity_matches(
+            saved,
+            remote_host=remote_host,
+            remote_user=remote_user,
+            remote_port=remote_port,
+            jump_host=jump_host,
+            jump_user=jump_user,
+            allow_remote_bind=allow_remote,
+        ):
+            return False
+        local_port_raw = os.getenv(f"VB_LOCAL_PORT{suffix}", "").strip()
+        try:
+            local_port = (
+                int(local_port_raw)
+                if local_port_raw
+                else int(saved.get("local_port"))
+            )
+            state_port = int(state.get("port"))
+        except (TypeError, ValueError):
+            return False
+        expected_mode = "local" if _is_localhost(remote_host) else "remote"
+        return (
+            state.get("mode") == expected_mode
+            and state.get("profile") == profile
+            and local_port == state_port
+        )
+
+    @classmethod
+    def staged_resources_match_current(
+        cls,
+        profile: str | None = None,
+    ) -> bool:
+        """Compare packaged resources/profile inputs with saved staged state.
+
+        This check deliberately avoids opening CIW or restarting anything.  A
+        missing legacy field is treated as unknown (and therefore compatible)
+        so state files written by older bridge versions retain their fast-path
+        behavior; newly written state files include ``profile_config`` for a
+        stricter comparison.
+        """
+        profile = resolve_profile(profile)
+        state = cls.read_state(profile)
+        if not state:
+            return False
+        if not cls.staged_profile_config_matches_current(profile):
+            return False
+        daemon_name = str(state.get("daemon_filename") or "")
+        if daemon_name:
+            daemon_hash = None
+            for major in (2, 3):
+                try:
+                    candidate = _find_ramic_bridge_daemon(major)
+                except (FileNotFoundError, OSError):
+                    continue
+                if candidate.name == daemon_name:
+                    daemon_hash = _sha256_bytes(
+                        _canonical_resource_text(candidate).encode("utf-8")
+                    )
+                    break
+            if daemon_hash is None:
+                return False
+            if state.get("deployed_daemon_sha256") not in {None, daemon_hash}:
+                return False
+        elif state.get("deployed_daemon_sha256"):
+            # There is no safe way to identify which Python-major resource was
+            # staged in a legacy state lacking ``daemon_filename``.
+            return False
+        try:
+            il_hash = _sha256_bytes(
+                _canonical_resource_text(_find_ramic_bridge_il()).encode("utf-8")
+            )
+        except (FileNotFoundError, OSError):
+            return False
+        if state.get("deployed_il_sha256") not in {None, il_hash}:
+            return False
+
+        return True
 
     @classmethod
     def deployment_status(
@@ -1070,6 +2321,8 @@ class SSHClient:
             "profile": profile,
             "deployment_id": state.get("deployment_id"),
             "setup_path": state.get("setup_path"),
+            "compat_setup_path": state.get("compat_setup_path") or state.get("bootstrap_path"),
+            "bootstrap_path": state.get("bootstrap_path") or state.get("compat_setup_path"),
             "previous_setup_path": state.get("previous_setup_path"),
             "daemon_filename": selected_name or None,
             "local_daemon_sha256": local_daemon_sha256,
@@ -1098,6 +2351,11 @@ class SSHClient:
             "running_heartbeat_fresh": bool(
                 heartbeat_age_seconds is not None and heartbeat_age_seconds <= 5.0
             ),
+            "staged_update_pending": bool(
+                state.get("deployed_daemon_sha256")
+                and local_daemon_sha256
+                and state.get("deployed_daemon_sha256") != local_daemon_sha256
+            ),
         }
 
     @staticmethod
@@ -1107,8 +2365,9 @@ class SSHClient:
             if not sf.is_file():
                 continue
             try:
-                return json.loads(sf.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                payload = _strict_json_loads(sf.read_text(encoding="utf-8"))
+                return payload if isinstance(payload, dict) else None
+            except (OSError, ValueError, json.JSONDecodeError):
                 continue
         return None
 
@@ -1172,6 +2431,8 @@ class SSHClient:
         timeout: int | None = None,
         *,
         retry_transport_errors: bool = False,
+        create_parent: bool = True,
+        exclusive_create: bool = False,
     ) -> CommandResult:
         runner = self._require_runner()
         return runner.upload_text(
@@ -1179,6 +2440,8 @@ class SSHClient:
             remote_path,
             timeout=timeout or self._timeout,
             retry_transport_errors=retry_transport_errors,
+            create_parent=create_parent,
+            exclusive_create=exclusive_create,
         )
 
     def run_command(

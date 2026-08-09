@@ -136,7 +136,10 @@ All commands take `-p PROFILE` / `--env PATH` to pick a non-default config; run 
 | `init [user@host] [-J jump]` | Write a starter `.env` (no args = empty template) |
 | `start [--bind-venv]` | Start SSH tunnel + deploy daemon; `--bind-venv` (with `-p X`) also binds the active virtualenv to profile `X` |
 | `stop` | Stop the SSH tunnel |
-| `restart` | Restart tunnel and refresh the deployed daemon setup |
+| `restart [--timeout 30]` | Stage/reuse the tunnel, require exclusive admission on an idle daemon, restart once, and verify the attributed epoch/build/heartbeat |
+| `autoload install` | Stage/reuse the tunnel and atomically install this profile's managed `.cdsinit` block (does not restart CIW) |
+| `autoload status` | Read-only report of the managed block, duplicates, expected stable setup path, and target permissions |
+| `autoload uninstall` | Atomically remove only this profile's managed block (does not stop/restart CIW) |
 | `status` | Tunnel + daemon health + Spectre availability |
 | `license` | Check Spectre license availability |
 | **Profile binding** | |
@@ -194,11 +197,43 @@ returns `BUSY` as `not_dispatched`, while ledger heartbeat, queue depth/capacity
 active request, build SHA, supported protocols, and capabilities remain
 available through `request-status`.
 
+After the request watchdog, the daemon keeps the serial CIW reader attached.
+Crossing the late-response warning threshold records `late_waiting_operator`
+and rejects new unique work before dispatch, but does not discard the original
+stream. A later complete frame is persisted as `succeeded_after_timeout` or
+`failed_after_timeout` with an identity-bound `terminal_proof`; restart or an
+incomplete/malformed frame remains indeterminate and is never safe to replay.
+A true CIW response-stream EOF records
+`orphaned_unknown_response_stream_closed`, drops any cache/proof, and retires
+the daemon instead of spinning indefinitely.
+
 Deployment uses full-SHA versioned daemon/SKILL/setup filenames, verifies the
 actual remote file digest, and atomically records the staged identity. Use
 `deployment-status` to compare packaged, staged, and running builds. Staging
 does not replace an already-running daemon; activation remains an explicit
-restart/load action.
+restart/load action. `restart` never replays its mutating request: it requires
+two idle ledger snapshots plus the running daemon's
+`exclusive-admission-v1` capability, admits one lifecycle request while
+blocking later work, and reports success only after a new daemon epoch exposes
+the staged build, fresh heartbeat, and matching exclusive request identity.
+Unknown exclusive completion retires the old daemon without reopening its CIW
+queue. A daemon predating this capability is refused; activate this release
+once with an operator-controlled `RBStop()` plus the printed versioned setup
+path, then later CLI restarts use the guarded flow.
+
+`autoload install` targets the stable compatibility setup path
+`<workdir>/virtuoso_setup.il` and writes a profile-specific, uniquely delimited
+block of the form
+`when(isFile("<workdir>/virtuoso_setup.il") load("<workdir>/virtuoso_setup.il"))`.
+It replaces only its own managed block (and adopts the exact historical
+`Auto-load virtuoso-bridge-lite profile ...` block), creates a sibling backup,
+uses an atomic replacement under a target-wide mutation lock, and normalizes
+`.cdsinit` to mode 0600. Symlink or non-owned targets are rejected, and a
+content change observed after inspection fails closed instead of overwriting
+it. `autoload status` never stages files or creates an auth token; `autoload
+uninstall` has the same no-CIW/no-daemon guarantee. Do not hand-edit `.cdsinit`
+concurrently with a managed install/uninstall, because unrelated editors do not
+necessarily honor the Bridge sidecar lock.
 
 Prefix any command with `--json-envelope` to emit one stable JSON object with
 command/profile, timestamps, exit status, normalized data, errors, warnings,

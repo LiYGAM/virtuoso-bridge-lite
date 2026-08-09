@@ -401,9 +401,33 @@ def test_execute_skill_gives_daemon_time_to_return_timeout(
     assert request["supported_protocol_versions"] == [3, 2]
     assert request["request_id"] == "req-fixed-001"
     assert request["operation_class"] == "read_only"
+    assert "exclusive" not in request
     assert request["auth_token"] == "test-token"
     assert result.request_id == "req-fixed-001"
     assert result.protocol_version == 2
+
+
+def test_execute_skill_marks_lifecycle_request_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    connected = _FakeSocket(
+        clock,
+        recv_results=((0.0, b"\x02t"), (0.0, b"")),
+    )
+    factory = _SocketFactory([connected])
+    _use_fake_network(monkeypatch, clock, factory)
+
+    VirtuosoClient().execute_skill(
+        "RBStop()",
+        timeout=5.0,
+        operation_class=OperationClass.MUTATING,
+        request_id="req-exclusive",
+        exclusive=True,
+    )
+
+    request = json.loads(connected.sent_payloads[0].decode("utf-8"))
+    assert request["exclusive"] is True
 
 
 def test_execute_skill_daemon_timeout_is_unknown_commit_for_mutating_request(
@@ -513,7 +537,7 @@ def test_protocol_v3_falls_back_only_on_exact_legacy_rejection(
     _use_fake_network(monkeypatch, clock, factory)
 
     result = VirtuosoClient().execute_skill(
-        "1+2", timeout=1.0, request_id="req-v3-fallback"
+        "1+2", timeout=1.0, request_id="req-v3-fallback", exclusive=True
     )
 
     first = json.loads(rejected.sent_payloads[0].decode("utf-8"))
@@ -523,6 +547,8 @@ def test_protocol_v3_falls_back_only_on_exact_legacy_rejection(
     assert first["protocol_version"] == 3
     assert second["protocol_version"] == 2
     assert first["request_id"] == second["request_id"] == "req-v3-fallback"
+    assert first["operation_class"] == second["operation_class"] == "unknown"
+    assert first["exclusive"] is second["exclusive"] is True
     assert len(factory.created) == 2
 
 

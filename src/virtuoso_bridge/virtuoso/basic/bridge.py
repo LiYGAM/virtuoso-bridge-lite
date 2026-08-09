@@ -445,12 +445,16 @@ class VirtuosoClient(VirtuosoInterface):
         timeout: float | None = None,
         operation_class: OperationClass = OperationClass.UNKNOWN,
         request_id: str | None = None,
+        exclusive: bool = False,
     ) -> VirtuosoResult:
         """Execute SKILL code in Virtuoso via the RAMIC Bridge daemon.
 
         A timeout after request delivery is deliberately reported as
         ``timed_out_unknown``: the daemon or Virtuoso may still complete a
         mutating request, so callers must not automatically retry it.
+        ``exclusive=True`` asks a supporting daemon to admit the request only
+        while CIW is idle and to reject later requests until it finishes; this
+        is reserved for lifecycle operations such as guarded restart.
         """
         effective_timeout = timeout if timeout is not None else self._timeout
         request_id = request_id or str(uuid.uuid4())
@@ -486,6 +490,7 @@ class VirtuosoClient(VirtuosoInterface):
                         request_id=request_id,
                         operation_class=operation_class,
                         protocol_version=protocol_version,
+                        exclusive=exclusive,
                     )
                     if (
                         protocol_version == 3
@@ -1704,6 +1709,7 @@ let((result winName ciwNum)
         request_id: str,
         operation_class: OperationClass,
         protocol_version: int = 3,
+        exclusive: bool = False,
     ) -> bytes:
         dispatched = False
         try:
@@ -1721,17 +1727,22 @@ let((result winName ciwNum)
                     0.01,
                     min(timeout, remaining - return_grace),
                 )
-                payload = json.dumps(
-                    {
-                        "protocol_version": protocol_version,
-                        "supported_protocol_versions": [3, 2],
-                        "request_id": request_id,
-                        "operation_class": operation_class.value,
-                        "auth_token": self._auth_token,
-                        "skill": skill_code,
-                        "timeout": request_timeout,
-                    }
-                ).encode("utf-8")
+                request_payload = {
+                    "protocol_version": protocol_version,
+                    "supported_protocol_versions": [3, 2],
+                    "request_id": request_id,
+                    "operation_class": operation_class.value,
+                    "auth_token": self._auth_token,
+                    "skill": skill_code,
+                    "timeout": request_timeout,
+                }
+                # Keep ordinary request bytes compatible with older daemons.
+                # The lifecycle-only flag is sent only when the caller asks for
+                # exclusive admission, and the CLI verifies daemon capability
+                # before relying on it.
+                if exclusive:
+                    request_payload["exclusive"] = True
+                payload = json.dumps(request_payload).encode("utf-8")
                 s.settimeout(self._remaining_timeout(deadline))
                 # ``sendall`` can time out after a partial send.  Once invoked,
                 # delivery is no longer provably absent and must be quarantined.

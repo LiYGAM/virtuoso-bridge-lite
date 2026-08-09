@@ -4,15 +4,42 @@ import json
 import hashlib
 import time
 
+import pytest
+
 from virtuoso_bridge.models import ExecutionStatus, VirtuosoResult
 from virtuoso_bridge.transport.ssh import CommandResult
 from virtuoso_bridge.transport.tunnel import (
     SSHClient,
+    _copy_private_backup,
     _profiled_bridge_leaf,
     _profiled_env_key,
     resolve_auth_token,
 )
 from virtuoso_bridge import cli
+
+
+def _restart_state(profile="v231", *, build="a" * 64):
+    il_digest = "b" * 64
+    deployment_id = hashlib.sha256(
+        (build + "\x00" + il_digest).encode("ascii")
+    ).hexdigest()
+    root = "/tmp/virtuoso_bridge_release"
+    return {
+        "state_schema_version": 2,
+        "mode": "remote",
+        "profile": profile,
+        "port": 65271,
+        "setup_path": f"{root}/virtuoso_setup.{deployment_id}.il",
+        "deployed_daemon_sha256": build,
+        "deployed_il_sha256": il_digest,
+        "deployed_setup_sha256": "c" * 64,
+        "deployment_id": deployment_id,
+        "daemon_filename": "ramic_bridge_daemon_3.py",
+        "deployed_daemon_path": (
+            f"{root}/ramic_bridge_daemon_3.{build}.py"
+        ),
+        "deployed_il_path": f"{root}/ramic_bridge.{il_digest}.il",
+    }
 
 
 class _FakeRunner:
@@ -64,6 +91,28 @@ def test_auth_token_is_stable_and_profile_scoped(monkeypatch, tmp_path) -> None:
     assert (tmp_path / "auth" / "auth_v231.token").read_text(
         encoding="utf-8"
     ).strip() == first
+
+
+def test_auth_token_refuses_non_regular_existing_path(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.config_dir", lambda: tmp_path)
+    monkeypatch.delenv("VB_AUTH_TOKEN_v231", raising=False)
+    monkeypatch.delenv("VB_AUTH_TOKEN", raising=False)
+    token_path = tmp_path / "auth" / "auth_v231.token"
+    token_path.mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="auth token"):
+        resolve_auth_token("v231", create=True)
+
+
+def test_private_backup_never_overwrites_existing_path(tmp_path) -> None:
+    source = tmp_path / ".cdsinit"
+    source.write_text("source\n", encoding="utf-8")
+    backup = tmp_path / ".cdsinit.backup"
+    backup.write_text("keep\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        _copy_private_backup(source, backup)
+    assert backup.read_text(encoding="utf-8") == "keep\n"
 
 
 def test_remote_setup_path_and_port_are_profile_scoped(monkeypatch) -> None:
@@ -134,6 +183,8 @@ def test_read_request_status_filters_local_ledger(monkeypatch, tmp_path) -> None
     ledger.write_text(json.dumps({
         "schema_version": 1,
         "daemon_epoch": "epoch-1",
+        "exclusive_request_id": "req-2",
+        "exclusive_request_generation": "generation-2",
         "requests": [
             {"request_id": "req-1", "state": "succeeded"},
             {"request_id": "req-2", "state": "timed_out_pending"},
@@ -152,8 +203,202 @@ def test_read_request_status_filters_local_ledger(monkeypatch, tmp_path) -> None
     assert status == {
         "schema_version": 1,
         "daemon_epoch": "epoch-1",
+        "exclusive_request_id": "req-2",
+        "exclusive_request_generation": "generation-2",
         "request": {"request_id": "req-2", "state": "timed_out_pending"},
     }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        [],
+        {"requests": "not-a-list"},
+        {"requests": ["not-an-object"]},
+        {"heartbeat_at_epoch": float("nan"), "requests": []},
+    ),
+)
+def test_read_request_status_rejects_malformed_or_nonfinite_ledger(
+    monkeypatch,
+    tmp_path,
+    payload,
+) -> None:
+    ledger = tmp_path / "request-status.json"
+    ledger.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        SSHClient,
+        "read_state",
+        classmethod(
+            lambda cls, profile=None: {
+                "mode": "local",
+                "request_state_path": str(ledger),
+            }
+        ),
+    )
+    assert SSHClient.read_request_status("v231") is None
+
+
+@pytest.mark.parametrize(
+    ("ledger", "reason"),
+    (
+        ({"queue_depth": -1, "requests": []}, "malformed queue depth"),
+        ({"queue_depth": 0, "requests": "bad"}, "malformed request ledger"),
+        (
+            {
+                "queue_depth": 0,
+                "requests": [{"request_id": "req", "state": "future_waiting"}],
+            },
+            "request req has unknown state future_waiting",
+        ),
+        (
+            {
+                "exclusive_request_id": "restart",
+                "exclusive_request_generation": "generation-1",
+                "queue_depth": 0,
+                "requests": [],
+            },
+            "exclusive request restart",
+        ),
+        (
+            {
+                "exclusive_request_generation": "orphaned-generation",
+                "queue_depth": 0,
+                "requests": [],
+            },
+            "orphaned exclusive request generation",
+        ),
+    ),
+)
+def test_restart_busy_guard_fails_closed_on_malformed_or_future_ledger(
+    ledger,
+    reason,
+) -> None:
+    assert cli._restart_busy_reason(ledger) == reason
+
+
+def test_restart_requires_capability_and_exclusive_dispatch_attribution() -> None:
+    ledger = {
+        "capabilities": ["exclusive-admission-v1"],
+        "requests": [
+            {
+                "request_id": "req-restart",
+                "request_digest_sha256": "e" * 64,
+                "operation_class": "mutating",
+                "admitted_daemon_epoch": "old-epoch",
+                "exclusive": True,
+            }
+        ],
+    }
+    assert cli._restart_has_exclusive_admission(ledger) is True
+    assert cli._restart_has_exclusive_admission({"capabilities": []}) is False
+    assert cli._restart_dispatch_attributed(
+        ledger, "req-restart", "e" * 64, "old-epoch"
+    ) is True
+    ledger["requests"][0]["exclusive"] = False
+    assert cli._restart_dispatch_attributed(
+        ledger, "req-restart", "e" * 64, "old-epoch"
+    ) is False
+
+
+def test_ensure_tunnel_refuses_foreign_reachable_listener(monkeypatch) -> None:
+    class _Runner:
+        is_tunnel_alive = False
+        tunnel_pid = None
+
+    client = SSHClient(
+        remote_host="new-host",
+        remote_user="designer",
+        port=65271,
+        local_port=65271,
+        profile="v231",
+        auth_token="opaque",
+    )
+    client._ssh_runner = _Runner()
+    monkeypatch.setattr(
+        "virtuoso_bridge.transport.ssh.SSHRunner.can_reach_port",
+        staticmethod(lambda port: True),
+    )
+    monkeypatch.setattr(
+        client,
+        "read_state",
+        lambda profile=None: {
+            "mode": "remote",
+            "profile": "v231",
+            "port": 65271,
+            "tunnel_pid": 123,
+            "profile_config": {
+                "remote_host": "old-host",
+                "remote_user": "designer",
+                "remote_port": 65271,
+                "local_port": 65271,
+                "jump_host": None,
+                "jump_user": None,
+                "allow_remote_bind": False,
+            },
+        },
+    )
+    with pytest.raises(RuntimeError, match="saved tunnel identity does not match"):
+        client.ensure_tunnel()
+
+
+def test_saved_auto_switched_local_port_remains_part_of_profile_identity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.load_vb_env", lambda: None)
+    monkeypatch.setenv("VB_REMOTE_HOST_v231", "eda-host")
+    monkeypatch.setenv("VB_REMOTE_USER_v231", "designer")
+    monkeypatch.setenv("VB_REMOTE_PORT_v231", "65271")
+    monkeypatch.delenv("VB_LOCAL_PORT_v231", raising=False)
+    state = {
+        "mode": "remote",
+        "profile": "v231",
+        "port": 65272,
+        "profile_config": {
+            "remote_host": "eda-host",
+            "remote_user": "designer",
+            "remote_port": 65271,
+            "local_port": 65272,
+            "jump_host": None,
+            "jump_user": None,
+            "allow_remote_bind": False,
+        },
+    }
+    monkeypatch.setattr(
+        SSHClient,
+        "read_state",
+        classmethod(lambda cls, profile=None: state),
+    )
+
+    assert SSHClient.staged_profile_config_matches_current("v231") is True
+    client = SSHClient.from_env(profile="v231", create_auth_token=False)
+    assert client.port == 65272
+
+    monkeypatch.setenv("VB_REMOTE_HOST_v231", "different-host")
+    assert SSHClient.staged_profile_config_matches_current("v231") is False
+
+
+def test_verify_staged_files_checks_exact_local_bytes(tmp_path) -> None:
+    daemon = tmp_path / "daemon.py"
+    il = tmp_path / "bridge.il"
+    setup = tmp_path / "setup.il"
+    daemon.write_bytes(b"daemon\n")
+    il.write_bytes(b"il\n")
+    setup.write_bytes(b"setup\n")
+    state = {
+        "mode": "local",
+        "deployed_daemon_path": str(daemon),
+        "deployed_daemon_sha256": hashlib.sha256(daemon.read_bytes()).hexdigest(),
+        "deployed_il_path": str(il),
+        "deployed_il_sha256": hashlib.sha256(il.read_bytes()).hexdigest(),
+        "setup_path": str(setup),
+        "deployed_setup_sha256": hashlib.sha256(setup.read_bytes()).hexdigest(),
+    }
+
+    assert SSHClient.verify_staged_files("v231", state) == (True, "verified")
+    setup.write_bytes(b"tampered\n")
+    ok, reason = SSHClient.verify_staged_files("v231", state)
+    assert ok is False
+    assert "digest mismatch" in reason
 
 
 def test_deployment_status_verifies_actual_local_bytes_and_fresh_runtime(
@@ -276,13 +521,67 @@ def test_status_no_response_prints_stale_daemon_hint(monkeypatch, capsys) -> Non
 
 def test_restart_daemon_loads_current_setup_and_accepts_disconnect(monkeypatch, capsys) -> None:
     class _FakeSSHClient:
+        statuses = [
+            {
+                "daemon_epoch": "old-epoch",
+                "daemon_build_sha256": "d" * 64,
+                "capabilities": ["exclusive-admission-v1"],
+                "heartbeat_at_epoch": time.time(),
+                "active_request_id": None,
+                "queue_depth": 0,
+                "requests": [],
+            },
+            {
+                "daemon_epoch": "old-epoch",
+                "daemon_build_sha256": "d" * 64,
+                "capabilities": ["exclusive-admission-v1"],
+                "heartbeat_at_epoch": time.time(),
+                "active_request_id": None,
+                "queue_depth": 0,
+                "requests": [],
+            },
+            {
+                "daemon_epoch": "old-epoch",
+                "daemon_build_sha256": "d" * 64,
+                "capabilities": ["exclusive-admission-v1"],
+                "heartbeat_at_epoch": time.time(),
+                "active_request_id": None,
+                "queue_depth": 0,
+                "requests": [],
+            },
+            {
+                "daemon_epoch": "new-epoch",
+                "daemon_build_sha256": "a" * 64,
+                "capabilities": ["exclusive-admission-v1"],
+                "heartbeat_at_epoch": time.time(),
+                "active_request_id": None,
+                "queue_depth": 0,
+                "requests": [
+                    {
+                        "request_id": "req-restart",
+                        "request_digest_sha256": "e" * 64,
+                        "operation_class": "mutating",
+                        "admitted_daemon_epoch": "old-epoch",
+                        "exclusive": True,
+                        "state": "orphaned_unknown_after_daemon_restart",
+                    }
+                ],
+            },
+        ]
+
         @staticmethod
         def read_state(profile=None):
             assert profile == "t28_io"
-            return {
-                "port": 65271,
-                "setup_path": '/tmp/bridge path/virtuoso"setup.il',
-            }
+            return _restart_state("t28_io")
+
+        @staticmethod
+        def verify_staged_files(profile, state, timeout=10.0):
+            return True, "verified"
+
+        @classmethod
+        def read_request_status(cls, profile=None, timeout=10.0):
+            assert profile == "t28_io"
+            return cls.statuses.pop(0)
 
     class _FakeVirtuosoClient:
         instances: list["_FakeVirtuosoClient"] = []
@@ -295,11 +594,20 @@ def test_restart_daemon_loads_current_setup_and_accepts_disconnect(monkeypatch, 
             self.skill: str | None = None
             _FakeVirtuosoClient.instances.append(self)
 
-        def execute_skill(self, skill: str, timeout=5):
+        def execute_skill(
+            self,
+            skill: str,
+            timeout=5,
+            operation_class=None,
+            exclusive=False,
+        ):
             self.skill = skill
+            self.exclusive = exclusive
             return VirtuosoResult(
                 status=ExecutionStatus.ERROR,
                 errors=["Empty response from daemon"],
+                request_id="req-restart",
+                metadata={"request_digest_sha256": "e" * 64},
             )
 
     monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
@@ -309,23 +617,41 @@ def test_restart_daemon_loads_current_setup_and_accepts_disconnect(monkeypatch, 
         lambda client, profile, timeout=5: type("Check", (), {"ok": True, "error": ""})(),
     )
 
-    cli._restart_daemon_one("t28_io")
+    assert cli._restart_daemon_one("t28_io") is True
 
     out = capsys.readouterr().out
     client = _FakeVirtuosoClient.instances[0]
     assert client.host == "127.0.0.1"
     assert client.port == 65271
     assert client.log_to_ciw is False
-    assert client.skill == 'RBStop()\nload("/tmp/bridge path/virtuoso\\"setup.il")'
+    assert client.exclusive is True
+    assert client.skill.startswith('RBStop()\nload("/tmp/virtuoso_bridge_release/')
     assert "Restarting daemon [t28_io]" in out
-    assert "old daemon closed the connection while restarting" in out
+    assert "Restart request dispatched [t28_io]" in out
+    assert "Daemon restart verified [t28_io]" in out
 
 
 def test_restart_daemon_refuses_cross_user_daemon(monkeypatch, capsys) -> None:
     class _FakeSSHClient:
         @staticmethod
         def read_state(profile=None):
-            return {"port": 65271, "setup_path": "/tmp/virtuoso_setup.il"}
+            return _restart_state(profile)
+
+        @staticmethod
+        def verify_staged_files(profile, state, timeout=10.0):
+            return True, "verified"
+
+        @staticmethod
+        def read_request_status(profile=None, timeout=10.0):
+            return {
+                "daemon_epoch": "old-epoch",
+                "daemon_build_sha256": "d" * 64,
+                "capabilities": ["exclusive-admission-v1"],
+                "heartbeat_at_epoch": time.time(),
+                "active_request_id": None,
+                "queue_depth": 0,
+                "requests": [],
+            }
 
     class _FakeVirtuosoClient:
         def __init__(self, host, port, timeout, log_to_ciw=True, **kwargs):
@@ -345,12 +671,167 @@ def test_restart_daemon_refuses_cross_user_daemon(monkeypatch, capsys) -> None:
         )(),
     )
 
-    cli._restart_daemon_one(None)
+    assert cli._restart_daemon_one(None) is False
 
     out = capsys.readouterr().out
     assert "Refusing to restart daemon" in out
     assert "alice" in out
     assert "bob" in out
+
+
+def test_restart_daemon_refuses_busy_ledger_without_dispatch(monkeypatch, capsys) -> None:
+    class _FakeSSHClient:
+        @staticmethod
+        def read_state(profile=None):
+            return _restart_state(profile)
+
+        @staticmethod
+        def verify_staged_files(profile, state, timeout=10.0):
+            return True, "verified"
+
+        @staticmethod
+        def read_request_status(profile=None, timeout=10.0):
+            return {
+                "daemon_epoch": "old-epoch",
+                "daemon_build_sha256": "old-build",
+                "active_request_id": "req-live",
+                "queue_depth": 0,
+                "requests": [
+                    {"request_id": "req-live", "state": "late_waiting_operator"}
+                ],
+            }
+
+    class _UnexpectedVirtuosoClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("busy restart must not open the CIW client")
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+    monkeypatch.setattr(
+        "virtuoso_bridge.virtuoso.basic.bridge.VirtuosoClient",
+        _UnexpectedVirtuosoClient,
+    )
+
+    assert cli._restart_daemon_one("v231") is False
+    output = capsys.readouterr().out
+    assert "active request req-live" in output
+
+
+def test_restart_daemon_refuses_unavailable_ledger(monkeypatch, capsys) -> None:
+    class _FakeSSHClient:
+        @staticmethod
+        def read_state(profile=None):
+            return _restart_state(profile)
+
+        @staticmethod
+        def verify_staged_files(profile, state, timeout=10.0):
+            return True, "verified"
+
+        @staticmethod
+        def read_request_status(profile=None, timeout=10.0):
+            return None
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+    assert cli._restart_daemon_one("v231") is False
+    assert "request ledger is unavailable" in capsys.readouterr().out
+
+
+def test_restart_daemon_refuses_tampered_staged_state_before_dispatch(
+    monkeypatch,
+    capsys,
+) -> None:
+    class _FakeSSHClient:
+        @staticmethod
+        def read_state(profile=None):
+            state = _restart_state(profile)
+            state["setup_path"] = "/tmp/arbitrary-user-file.il"
+            return state
+
+        @staticmethod
+        def verify_staged_files(profile, state, timeout=10.0):
+            raise AssertionError("invalid staged state must fail before file probing")
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+    assert cli._restart_daemon_one("v231") is False
+    assert "staged files do not share one deployment directory" in capsys.readouterr().out
+
+
+def test_restart_daemon_does_not_replay_when_convergence_is_unverified(
+    monkeypatch, capsys
+) -> None:
+    class _FakeSSHClient:
+        @staticmethod
+        def read_state(profile=None):
+            return _restart_state(profile)
+
+        @staticmethod
+        def verify_staged_files(profile, state, timeout=10.0):
+            return True, "verified"
+
+        @staticmethod
+        def read_request_status(profile=None, timeout=10.0):
+            return {
+                "daemon_epoch": "old-epoch",
+                "daemon_build_sha256": "d" * 64,
+                "capabilities": ["exclusive-admission-v1"],
+                "heartbeat_at_epoch": time.time(),
+                "active_request_id": None,
+                "queue_depth": 0,
+                "requests": [],
+            }
+
+    class _FakeVirtuosoClient:
+        dispatch_count = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def execute_skill(
+            self,
+            skill: str,
+            timeout=5,
+            operation_class=None,
+            exclusive=False,
+        ):
+            type(self).dispatch_count += 1
+            return VirtuosoResult(status=ExecutionStatus.SUCCESS, output="t")
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+    monkeypatch.setattr(
+        "virtuoso_bridge.virtuoso.basic.bridge.VirtuosoClient",
+        _FakeVirtuosoClient,
+    )
+    monkeypatch.setattr(
+        "virtuoso_bridge.daemon_guard.check_daemon_user",
+        lambda client, profile, timeout=5: type(
+            "Check", (), {"ok": True, "error": ""}
+        )(),
+    )
+
+    assert cli._restart_daemon_one("v231", timeout=0.15) is False
+    assert _FakeVirtuosoClient.dispatch_count == 1
+    output = capsys.readouterr().out
+    assert "outcome is unverified" in output
+    assert "was not replayed" in output
+
+
+def test_restart_one_stages_before_guarded_activation(monkeypatch) -> None:
+    order: list[str] = []
+    monkeypatch.setattr(cli, "_CLI_PROFILE", ["v231"])
+    monkeypatch.setattr(
+        cli,
+        "_start_one_profile",
+        lambda profile, _deadline=None: order.append(f"stage:{profile}") or 0,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_restart_daemon_one",
+        lambda profile, timeout=30.0, _deadline=None: (
+            order.append(f"restart:{profile}") or True
+        ),
+    )
+
+    assert cli._restart_one(timeout=12.0) == 0
+    assert order == ["stage:v231", "restart:v231"]
 
 
 def test_status_fails_when_daemon_user_differs_from_tunnel_user(monkeypatch, capsys) -> None:

@@ -38,6 +38,14 @@ def _setup_command_log() -> None:
         log_file = command_log_file()
         log_file.parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_file, encoding="utf-8")
+        try:
+            os.chmod(log_file, 0o600)
+        except OSError:
+            # Windows chmod does not provide a complete ACL boundary, and
+            # some managed filesystems reject mode changes.  The command log
+            # remains optional, so a best-effort private POSIX mode is the
+            # safest portable behavior here.
+            pass
     except OSError as exc:
         logger.debug("Command file logging disabled: %s", exc)
         return
@@ -919,19 +927,28 @@ class SSHRunner:
         timeout: float | None = None,
         *,
         retry_transport_errors: bool = True,
+        create_parent: bool = True,
+        exclusive_create: bool = False,
     ) -> CommandResult:
         """Upload a UTF-8 text string as a file to the remote host via SSH."""
         budget = _TimeoutBudget.start(timeout, self._timeout)
+        remote_dir = str(Path(remote_path).parent).replace("\\", "/")
+        quoted_dir = shlex.quote(remote_dir)
+        quoted_path = shlex.quote(remote_path.replace("\\", "/"))
+        prelude: list[str] = []
+        if create_parent:
+            prelude.append(f"mkdir -p {quoted_dir} && chmod 755 {quoted_dir}")
+        if exclusive_create:
+            prelude.append("umask 077 && set -C")
+        command_prefix = " && ".join(prelude)
+        if command_prefix:
+            command_prefix += " && "
         if self._persistent_shell_enabled:
             if not text.endswith("\n"):
                 text = text + "\n"
-            remote_dir = str(Path(remote_path).parent).replace("\\", "/")
-            quoted_dir = shlex.quote(remote_dir)
-            quoted_path = shlex.quote(remote_path.replace("\\", "/"))
             payload_token = f"__vb_PAYLOAD_{uuid.uuid4().hex}__"
             command = (
-                f"mkdir -p {quoted_dir} && chmod 755 {quoted_dir}\n"
-                f"cat > {quoted_path} <<'{payload_token}'\n"
+                f"{command_prefix}cat > {quoted_path} <<'{payload_token}'\n"
                 f"{text}"
                 f"{payload_token}\n"
             )
@@ -940,6 +957,7 @@ class SSHRunner:
                     command,
                     _budget=budget,
                     retry_transport_errors=retry_transport_errors,
+                    log_command=False,
                 )
             except subprocess.TimeoutExpired:
                 raise
@@ -948,13 +966,10 @@ class SSHRunner:
                     raise
                 self._log_persistent_shell_fallback("Persistent SSH text upload failed", exc)
 
-        remote_dir = str(Path(remote_path).parent).replace("\\", "/")
-        quoted_dir = shlex.quote(remote_dir)
-        quoted_path = shlex.quote(remote_path.replace("\\", "/"))
         remote_cmd = (
             "sh -lc "
             + shlex.quote(
-                f"mkdir -p {quoted_dir} && chmod 755 {quoted_dir} && cat > {quoted_path}"
+                f"{command_prefix}cat > {quoted_path}"
             )
         )
         logger.debug("Uploading text payload (%d chars) -> %s:%s", len(text), self._host, remote_path)
@@ -1391,24 +1406,27 @@ class SSHRunner:
         *,
         _budget: _TimeoutBudget | None = None,
         retry_transport_errors: bool = True,
+        log_command: bool = True,
     ) -> CommandResult:
         budget = _budget or _TimeoutBudget.start(timeout, self._timeout)
+        command_context = command if log_command else "<redacted SSH text upload>"
         last_exc: Exception | None = None
         attempts = 2 if retry_transport_errors else 1
         for attempt in range(attempts):
-            budget.remaining(command)
+            budget.remaining(command_context)
             try:
-                with self._shell_lock_with_budget(budget, command):
+                with self._shell_lock_with_budget(budget, command_context):
                     self.ensure_persistent_shell(_budget=budget)
                     return self._run_command_via_persistent_shell_locked(
                         command,
                         _budget=budget,
+                        log_command=log_command,
                     )
             except subprocess.TimeoutExpired:
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
-                with self._shell_lock_with_budget(budget, command):
+                with self._shell_lock_with_budget(budget, command_context):
                     self._close_persistent_shell_locked(_budget=budget)
                 if (
                     retry_transport_errors
@@ -1441,14 +1459,19 @@ class SSHRunner:
         timeout: float | None = None,
         *,
         _budget: _TimeoutBudget | None = None,
+        log_command: bool = True,
     ) -> CommandResult:
         budget = _budget or _TimeoutBudget.start(timeout, self._timeout)
+        command_context = command if log_command else "<redacted SSH text upload>"
         proc = self._shell_proc
         out_queue = self._shell_queue
         if proc is None or proc.stdin is None or proc.poll() is not None or out_queue is None:
             raise RuntimeError("Persistent SSH shell is not running.")
 
-        logger.info("[server] %s", command)
+        if log_command:
+            logger.info("[server] %s", command)
+        else:
+            logger.info("[server] <redacted SSH text upload: %d chars>", len(command))
         if self._verbose:
             # Show a compact summary: first non-empty, non-mkdir, non-probe line
             lines = [l.strip() for l in command.splitlines() if l.strip()]
@@ -1482,7 +1505,7 @@ class SSHRunner:
             "rm -f \"$__vb_stdout\" \"$__vb_stderr\"\n"
         )
 
-        budget.remaining(command)
+        budget.remaining(command_context)
         try:
             proc.stdin.write(script.encode("utf-8"))
             proc.stdin.flush()
@@ -1499,12 +1522,18 @@ class SSHRunner:
             remaining = budget.available()
             if remaining <= 0:
                 self._close_persistent_shell_locked(_budget=budget)
-                raise subprocess.TimeoutExpired(cmd=command, timeout=budget.timeout)
+                raise subprocess.TimeoutExpired(
+                    cmd=command_context,
+                    timeout=budget.timeout,
+                )
             try:
                 line = out_queue.get(timeout=remaining)
             except queue.Empty as exc:
                 self._close_persistent_shell_locked(_budget=budget)
-                raise subprocess.TimeoutExpired(cmd=command, timeout=budget.timeout) from exc
+                raise subprocess.TimeoutExpired(
+                    cmd=command_context,
+                    timeout=budget.timeout,
+                ) from exc
 
             if line is None:
                 self._close_persistent_shell_locked(_budget=budget)

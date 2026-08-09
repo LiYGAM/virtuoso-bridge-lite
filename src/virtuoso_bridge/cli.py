@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import hashlib
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -186,7 +188,11 @@ def _format_ssh_failure(ssh_env) -> None:
     print(f"  For a local VM, use the VM's IP (run `ip addr` inside the VM).")
 
 
-def _start_one_profile(profile: str | None) -> int:
+def _start_one_profile(
+    profile: str | None,
+    *,
+    _deadline: float | None = None,
+) -> int:
     """Start tunnel for a single profile (thread-safe, uses explicit profile)."""
     suffix = f"_{profile}" if profile else ""
     remote_host = os.getenv(f"VB_REMOTE_HOST{suffix}", "").strip()
@@ -202,9 +208,70 @@ def _start_one_profile(profile: str | None) -> int:
     is_local = _is_localhost(remote_host)
 
     if SSHClient.is_running(profile):
-        msg = "Bridge already running." if is_local else "Tunnel already running."
-        print(msg)
-        return 0
+        profile_matcher = getattr(
+            SSHClient,
+            "staged_profile_config_matches_current",
+            None,
+        )
+        if profile_matcher is not None:
+            try:
+                profile_matches = bool(profile_matcher(profile))
+            except Exception:
+                profile_matches = False
+            if not profile_matches:
+                print(
+                    "[warning] Refusing to reuse the running Bridge endpoint: "
+                    "the saved host/user/port identity does not match the current "
+                    "profile. Stop the old profile tunnel before starting the "
+                    "changed profile."
+                )
+                return 1
+        # A running tunnel is reusable, but the packaged resources or profile
+        # inputs may have changed since the last stage.  Refresh immutable
+        # files/setup in place and leave CIW/daemon state untouched; only the
+        # explicit ``restart`` command may activate the new setup.
+        matches = True
+        matcher = getattr(SSHClient, "staged_resources_match_current", None)
+        if matcher is not None:
+            try:
+                matches = bool(matcher(profile))
+            except Exception:
+                matches = False
+        if matches:
+            msg = "Bridge already running." if is_local else "Tunnel already running."
+            print(msg)
+            return 0
+        label = f" [{profile}]" if profile else ""
+        print(
+            f"Tunnel already running{label}; packaged resources/profile changed. "
+            "Refreshing staged setup without restarting the daemon..."
+        )
+        ssh = SSHClient.from_env(
+            keep_remote_files=True,
+            profile=profile,
+            allow_remote_bind=_CLI_ALLOW_REMOTE_BIND[0],
+        )
+        try:
+            if _deadline is None:
+                ssh.warm()
+            else:
+                ssh.warm(
+                    timeout=_restart_remaining(_deadline, "resource staging")
+                )
+            print(
+                "Running daemon is unchanged; explicit `virtuoso-bridge restart` "
+                "is required to activate the staged update."
+            )
+            return 0
+        except Exception as exc:
+            if is_local:
+                print(f"Local bridge setup refresh failed: {exc}")
+            else:
+                _format_ssh_failure(remote_ssh_env_from_os(profile))
+                print(f"  Details: {str(exc).splitlines()[0] if str(exc) else exc}")
+            return 1
+        finally:
+            ssh.close()
 
     label = f" [{profile}]" if profile else ""
     if is_local:
@@ -224,7 +291,12 @@ def _start_one_profile(profile: str | None) -> int:
             # count and, on jump-host setups where cold banner exchange
             # easily exceeds 5 s, made the precheck false-negative while
             # the actual tunnel would have succeeded.
-            ssh.warm()
+            if _deadline is None:
+                ssh.warm()
+            else:
+                ssh.warm(
+                    timeout=_restart_remaining(_deadline, "resource staging")
+                )
         except Exception as exc:
             if not is_local:
                 _format_ssh_failure(remote_ssh_env_from_os(profile))
@@ -246,7 +318,10 @@ def _start_one_profile(profile: str | None) -> int:
                     print(f"  Load in Virtuoso CIW: load(\"{setup_path}\")")
             return 0
 
-        time.sleep(1.0)
+        settle = 1.0
+        if _deadline is not None:
+            settle = min(settle, _restart_remaining(_deadline, "tunnel settle"))
+        time.sleep(settle)
         if not SSHClient.is_running(profile):
             print("[warning] Tunnel process exited shortly after start.")
             print("Try starting the tunnel manually:")
@@ -308,85 +383,591 @@ def cli_stop() -> int:
 
 # -- restart ----------------------------------------------------------------
 
-def _restart_daemon_one(profile: str | None) -> None:
-    """Ask the CIW-side RAMIC loader to restart the daemon for this profile."""
+_RESTART_ACTIVE_STATES = frozenset(
+    {"queued", "running", "timed_out_pending", "late_waiting_operator"}
+)
+_RESTART_TERMINAL_STATES = frozenset(
+    {
+        "succeeded",
+        "failed",
+        "succeeded_after_timeout",
+        "failed_after_timeout",
+        "response_too_large",
+        "failed_internal",
+        "orphaned_unknown_after_daemon_restart",
+        "orphaned_unknown_response_drain_timeout",
+        "orphaned_unknown_response_stream_closed",
+    }
+)
+
+
+def _restart_busy_reason(ledger: dict[str, object]) -> str | None:
+    exclusive_raw = ledger.get("exclusive_request_id")
+    exclusive_generation = ledger.get("exclusive_request_generation")
+    if exclusive_raw is not None and not isinstance(exclusive_raw, str):
+        return "malformed exclusive request id"
+    exclusive_request_id = str(exclusive_raw or "").strip()
+    if exclusive_generation is not None and not isinstance(exclusive_generation, str):
+        return "malformed exclusive request generation"
+    if exclusive_request_id:
+        return f"exclusive request {exclusive_request_id}"
+    if exclusive_generation:
+        return "orphaned exclusive request generation"
+    active_raw = ledger.get("active_request_id")
+    if active_raw is not None and not isinstance(active_raw, str):
+        return "malformed active request id"
+    active_request_id = str(active_raw or "").strip()
+    if active_request_id:
+        return f"active request {active_request_id}"
+    queue_depth_raw = ledger.get("queue_depth", 0)
+    if isinstance(queue_depth_raw, bool):
+        return "malformed queue depth"
+    try:
+        queue_depth = int(queue_depth_raw or 0)
+    except (TypeError, ValueError):
+        return "malformed queue depth"
+    if queue_depth < 0:
+        return "malformed queue depth"
+    if queue_depth > 0:
+        return f"queue depth is {queue_depth}"
+    requests = ledger.get("requests", [])
+    if not isinstance(requests, list):
+        return "malformed request ledger"
+    for request in requests:
+        if not isinstance(request, dict):
+            return "malformed request ledger"
+        request_id = request.get("request_id")
+        state = request.get("state")
+        if not isinstance(request_id, str) or not request_id.strip():
+            return "malformed request ledger"
+        if not isinstance(state, str) or not state:
+            return f"request {request_id} has malformed state"
+        if state in _RESTART_ACTIVE_STATES:
+            return f"request {request_id} is {state}"
+        if state not in _RESTART_TERMINAL_STATES:
+            return f"request {request_id} has unknown state {state}"
+    return None
+
+
+def _restart_has_exclusive_admission(ledger: dict[str, object]) -> bool:
+    capabilities = ledger.get("capabilities")
+    return bool(
+        isinstance(capabilities, list)
+        and all(isinstance(item, str) for item in capabilities)
+        and "exclusive-admission-v1" in capabilities
+    )
+
+
+def _restart_dispatch_attributed(
+    ledger: dict[str, object],
+    request_id: str,
+    request_digest_sha256: str,
+    admitted_daemon_epoch: str,
+) -> bool:
+    requests = ledger.get("requests")
+    if not isinstance(requests, list):
+        return False
+    return any(
+        isinstance(entry, dict)
+        and entry.get("request_id") == request_id
+        and entry.get("request_digest_sha256") == request_digest_sha256
+        and entry.get("operation_class") == "mutating"
+        and entry.get("admitted_daemon_epoch") == admitted_daemon_epoch
+        and entry.get("exclusive") is True
+        for entry in requests
+    )
+
+
+def _restart_remaining(deadline: float, phase: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"Restart timeout exhausted during {phase}")
+    return remaining
+
+
+def _positive_finite_timeout(timeout: float) -> float:
+    value = float(timeout)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("timeout must be a finite positive number")
+    return value
+
+
+def _restart_timeout(timeout: float) -> float:
+    try:
+        return _positive_finite_timeout(timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Restart timeout must be a finite positive number") from exc
+
+
+def _restart_heartbeat_is_fresh(
+    ledger: dict[str, object],
+    *,
+    now: float | None = None,
+) -> bool:
+    try:
+        heartbeat = float(ledger.get("heartbeat_at_epoch"))
+    except (TypeError, ValueError):
+        return False
+    current = time.time() if now is None else now
+    return heartbeat <= current + 1.0 and current - heartbeat <= 5.0
+
+
+def _restart_staged_state_reason(
+    state: dict[str, object],
+    profile: str | None,
+) -> str | None:
+    try:
+        schema_version = int(state.get("state_schema_version"))
+    except (TypeError, ValueError):
+        return "staged state schema is missing or invalid"
+    if schema_version < 2:
+        return "staged state schema is too old for guarded restart"
+    if state.get("mode") not in {"local", "remote"}:
+        return "staged mode is invalid"
+    if state.get("profile") != profile:
+        return "staged profile identity does not match"
+
+    hash_fields = (
+        "deployed_daemon_sha256",
+        "deployed_il_sha256",
+        "deployed_setup_sha256",
+        "deployment_id",
+    )
+    hashes: dict[str, str] = {}
+    for field in hash_fields:
+        value = str(state.get(field) or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            return f"{field} is not a full SHA-256 digest"
+        hashes[field] = value
+    computed_deployment = hashlib.sha256(
+        (
+            hashes["deployed_daemon_sha256"]
+            + "\x00"
+            + hashes["deployed_il_sha256"]
+        ).encode("ascii")
+    ).hexdigest()
+    if hashes["deployment_id"] != computed_deployment:
+        return "deployment id does not match daemon/IL digests"
+
+    setup_path = str(state.get("setup_path") or "")
+    daemon_path = str(state.get("deployed_daemon_path") or "")
+    il_path = str(state.get("deployed_il_path") or "")
+    daemon_filename = str(state.get("daemon_filename") or "")
+    if not all((setup_path, daemon_path, il_path, daemon_filename)):
+        return "staged file paths are incomplete"
+    normalized = [value.replace("\\", "/") for value in (setup_path, daemon_path, il_path)]
+    directories = [value.rsplit("/", 1)[0] for value in normalized]
+    if not directories[0] or len(set(directories)) != 1:
+        return "staged files do not share one deployment directory"
+    daemon_stem, daemon_suffix = os.path.splitext(daemon_filename)
+    expected_names = (
+        f"virtuoso_setup.{hashes['deployment_id']}.il",
+        f"{daemon_stem}.{hashes['deployed_daemon_sha256']}{daemon_suffix}",
+        f"ramic_bridge.{hashes['deployed_il_sha256']}.il",
+    )
+    actual_names = tuple(value.rsplit("/", 1)[-1] for value in normalized)
+    if actual_names != expected_names:
+        return "staged file names do not match their recorded digests"
+    return None
+
+
+def _restart_daemon_one(
+    profile: str | None,
+    *,
+    timeout: float = 30.0,
+    _deadline: float | None = None,
+) -> bool:
+    """Guard, restart once, then prove the new daemon identity.
+
+    The restart request is never replayed.  A timeout or incomplete
+    post-restart proof returns failure even if the daemon may have restarted.
+    """
     from virtuoso_bridge.daemon_guard import check_daemon_user
-    from virtuoso_bridge.models import ExecutionStatus
+    from virtuoso_bridge.models import ExecutionStatus, OperationClass
     from virtuoso_bridge.transport.tunnel import SSHClient, resolve_auth_token
     from virtuoso_bridge.virtuoso.basic.bridge import VirtuosoClient
     from virtuoso_bridge.virtuoso.ops import escape_skill_string
 
+    try:
+        deadline = (
+            _deadline
+            if _deadline is not None
+            else time.monotonic() + _restart_timeout(timeout)
+        )
+        if not math.isfinite(deadline):
+            raise ValueError("Restart deadline must be finite")
+        _restart_remaining(deadline, "initialization")
+    except (TypeError, ValueError, TimeoutError) as exc:
+        print(f"[warning] Refusing daemon restart: {exc}.")
+        return False
     state = SSHClient.read_state(profile)
-    if not state or not state.get("port"):
-        return
+    if not isinstance(state, dict) or not state.get("port"):
+        print("[warning] Refusing daemon restart: staged bridge state is unavailable.")
+        return False
+
+    state_reason = _restart_staged_state_reason(state, profile)
+    if state_reason:
+        print(f"[warning] Refusing daemon restart: {state_reason}.")
+        return False
+    try:
+        staged_ok, staged_details = SSHClient.verify_staged_files(
+            profile,
+            state,
+            timeout=_restart_remaining(deadline, "staged file verification"),
+        )
+    except Exception as exc:
+        staged_ok, staged_details = False, str(exc)
+    if not staged_ok:
+        print(
+            "[warning] Refusing daemon restart: staged file verification failed: "
+            f"{staged_details}."
+        )
+        return False
 
     label = f" [{profile}]" if profile else ""
-    setup_path = str(state.get("setup_path") or "")
+    setup_path = str(
+        state.get("setup_path")
+        or state.get("compat_setup_path")
+        or state.get("bootstrap_path")
+        or ""
+    )
+    expected_build = str(state.get("deployed_daemon_sha256") or "")
+    if not setup_path or not expected_build:
+        print(
+            f"[warning] Refusing to restart daemon{label}: "
+            "staged setup/build identity is incomplete."
+        )
+        return False
+
+    # Require two consecutive idle snapshots before dispatch.  This does not
+    # replace daemon serialization, but it avoids acting on a single stale or
+    # partially updated ledger observation.
+    preflight: dict[str, object] | None = None
+    preflight_identity: tuple[str, str] | None = None
+    for observation in range(2):
+        try:
+            preflight = SSHClient.read_request_status(
+                profile,
+                timeout=min(5.0, _restart_remaining(deadline, "ledger preflight")),
+            )
+        except Exception as exc:
+            print(f"[warning] Refusing to restart daemon{label}: ledger read failed: {exc}")
+            return False
+        if not isinstance(preflight, dict):
+            print(
+                f"[warning] Refusing to restart daemon{label}: "
+                "the request ledger is unavailable."
+            )
+            return False
+        busy_reason = _restart_busy_reason(preflight)
+        if busy_reason:
+            print(f"[warning] Refusing to restart daemon{label}: {busy_reason}.")
+            return False
+        if not _restart_has_exclusive_admission(preflight):
+            print(
+                f"[warning] Refusing to restart daemon{label}: "
+                "the running daemon does not prove exclusive-admission-v1 support. "
+                "A one-time operator-controlled migration is required."
+            )
+            return False
+        identity = (
+            str(preflight.get("daemon_epoch") or ""),
+            str(preflight.get("daemon_build_sha256") or ""),
+        )
+        if not all(identity) or not _restart_heartbeat_is_fresh(preflight):
+            print(
+                f"[warning] Refusing to restart daemon{label}: "
+                "the running daemon identity or heartbeat is stale."
+            )
+            return False
+        if preflight_identity is not None and identity != preflight_identity:
+            print(
+                f"[warning] Refusing to restart daemon{label}: "
+                "the daemon identity changed during preflight."
+            )
+            return False
+        preflight_identity = identity
+        if observation == 0:
+            time.sleep(min(0.05, _restart_remaining(deadline, "stable idle check")))
+
+    old_epoch = str(preflight.get("daemon_epoch") or "")
+    running_build = str(preflight.get("daemon_build_sha256") or "")
+    if not old_epoch or not running_build:
+        print(
+            f"[warning] Refusing to restart daemon{label}: "
+            "the running daemon identity is incomplete."
+        )
+        return False
+
     if setup_path:
         skill = f'RBStop()\nload("{escape_skill_string(setup_path)}")'
-    else:
-        skill = "RBStop()\nRBStart()"
 
     print(f"Restarting daemon{label}...")
+    request_timeout = min(5.0, _restart_remaining(deadline, "restart dispatch"))
     client = VirtuosoClient(
         host="127.0.0.1",
         port=int(state["port"]),
-        timeout=5,
+        timeout=request_timeout,
         log_to_ciw=False,
         auth_token=resolve_auth_token(profile, create=False),
         profile=profile,
     )
     try:
-        user_check = check_daemon_user(client, profile=profile, timeout=5)
+        user_check = check_daemon_user(
+            client,
+            profile=profile,
+            timeout=min(5.0, _restart_remaining(deadline, "daemon identity check")),
+        )
     except Exception as exc:
         print(f"[warning] Could not check daemon before restart{label}: {exc}")
-        return
+        return False
     if not user_check.ok:
         print(f"[warning] Refusing to restart daemon{label}: {user_check.error}")
-        return
+        return False
 
-    result = client.execute_skill(skill, timeout=5)
-    if result.status == ExecutionStatus.SUCCESS:
-        print(f"Daemon restart requested{label}.")
-        return
-
-    details = "; ".join(result.errors) or result.output or "unknown error"
-    expected_disconnect = (
-        "Empty response from daemon",
-        "Connection reset",
-        "Broken pipe",
-    )
-    if any(fragment in details for fragment in expected_disconnect):
-        print(
-            f"Daemon restart requested{label} "
-            "(old daemon closed the connection while restarting)."
+    # Narrow the gap between the last idle observation and RBStop/load.  The
+    # profile wrapper lock serializes managed callers; this final read also
+    # fails closed if an out-of-band request appeared during the user check.
+    try:
+        final_preflight = SSHClient.read_request_status(
+            profile,
+            timeout=min(2.0, _restart_remaining(deadline, "final ledger guard")),
         )
-        return
+    except Exception as exc:
+        print(f"[warning] Refusing to restart daemon{label}: final ledger read failed: {exc}")
+        return False
+    if not isinstance(final_preflight, dict):
+        print(f"[warning] Refusing to restart daemon{label}: final ledger is unavailable.")
+        return False
+    final_identity = (
+        str(final_preflight.get("daemon_epoch") or ""),
+        str(final_preflight.get("daemon_build_sha256") or ""),
+    )
+    final_busy = _restart_busy_reason(final_preflight)
+    if (
+        final_identity != (old_epoch, running_build)
+        or not _restart_has_exclusive_admission(final_preflight)
+        or not _restart_heartbeat_is_fresh(final_preflight)
+        or final_busy is not None
+    ):
+        reason = final_busy or "daemon identity/heartbeat changed during the final guard"
+        print(f"[warning] Refusing to restart daemon{label}: {reason}.")
+        return False
 
-    print(f"[warning] Could not restart daemon{label}: {details}")
+    restart_wall_time = time.time()
+    try:
+        result = client.execute_skill(
+            skill,
+            timeout=min(5.0, _restart_remaining(deadline, "restart dispatch")),
+            operation_class=OperationClass.MUTATING,
+            exclusive=True,
+        )
+    except Exception as exc:
+        print(
+            f"[warning] Restart dispatch outcome is unverified{label}: {exc}. "
+            "The restart request was not replayed."
+        )
+        return False
+    accepted = result.status == ExecutionStatus.SUCCESS
+    details = "; ".join(result.errors) or result.output or "unknown error"
+    if not accepted:
+        expected_disconnect = (
+            "Empty response from daemon",
+            "Connection reset",
+            "Broken pipe",
+        )
+        accepted = any(fragment in details for fragment in expected_disconnect)
+    if not accepted:
+        print(f"[warning] Could not restart daemon{label}: {details}")
+        return False
+
+    dispatch_request_id = str(result.request_id or "")
+    dispatch_digest = str(
+        (result.metadata or {}).get("request_digest_sha256") or ""
+    ).lower()
+    if not dispatch_request_id or not re.fullmatch(r"[0-9a-f]{64}", dispatch_digest):
+        print(
+            f"[warning] Restart outcome is unverified{label}: "
+            "dispatch identity is incomplete. The restart request was not replayed."
+        )
+        return False
+
+    print(f"Restart request dispatched{label}; verifying the new daemon...")
+    last_reason = "no new ledger observed"
+    while True:
+        try:
+            remaining = _restart_remaining(deadline, "post-restart verification")
+        except TimeoutError:
+            break
+        try:
+            current = SSHClient.read_request_status(
+                profile,
+                timeout=min(2.0, remaining),
+            )
+        except Exception as exc:
+            current = None
+            last_reason = f"ledger read failed: {exc}"
+        if isinstance(current, dict):
+            epoch = str(current.get("daemon_epoch") or "")
+            build = str(current.get("daemon_build_sha256") or "")
+            heartbeat = current.get("heartbeat_at_epoch")
+            try:
+                heartbeat_value = float(heartbeat)
+                heartbeat_fresh = (
+                    heartbeat_value >= restart_wall_time - 1.0
+                    and time.time() - heartbeat_value <= 5.0
+                )
+            except (TypeError, ValueError):
+                heartbeat_fresh = False
+            dispatch_attributed = _restart_dispatch_attributed(
+                current,
+                dispatch_request_id,
+                dispatch_digest,
+                old_epoch,
+            )
+            if (
+                epoch
+                and epoch != old_epoch
+                and build == expected_build
+                and _restart_has_exclusive_admission(current)
+                and heartbeat_fresh
+                and _restart_busy_reason(current) is None
+                and dispatch_attributed
+            ):
+                print(
+                    f"Daemon restart verified{label}: epoch changed and "
+                    "staged build is active."
+                )
+                return True
+            if not epoch or epoch == old_epoch:
+                last_reason = "daemon epoch has not changed"
+            elif build != expected_build:
+                last_reason = "running build does not match the staged build"
+            elif not heartbeat_fresh:
+                last_reason = "new daemon heartbeat is not fresh"
+            elif not dispatch_attributed:
+                last_reason = "new daemon epoch is not attributable to this restart request"
+            else:
+                last_reason = _restart_busy_reason(current) or "daemon is not idle"
+        try:
+            time.sleep(min(0.25, _restart_remaining(deadline, "verification poll")))
+        except TimeoutError:
+            break
+
+    print(
+        f"[warning] Restart outcome is unverified{label}: {last_reason}. "
+        "The restart request was not replayed."
+    )
+    return False
 
 
-def _restart_one() -> int:
-    """Restart tunnel and request daemon restart for the current profile."""
+def _restart_one(*, timeout: float = 30.0) -> int:
+    """Stage/reuse the tunnel, then perform one guarded daemon restart."""
     profile = _get_cli_profile()
+    try:
+        deadline = time.monotonic() + _restart_timeout(timeout)
+    except (TypeError, ValueError) as exc:
+        print(f"[warning] Refusing daemon restart: {exc}.")
+        return 1
+
+    rc = _start_one_profile(profile, _deadline=deadline)
+    if rc != 0:
+        return rc
+    return 0 if _restart_daemon_one(profile, _deadline=deadline) else 1
+
+
+def cli_restart(*, timeout: float = 30.0) -> int:
+    _load_cli_env()
+    return _for_each_profile(lambda: _restart_one(timeout=timeout))
+
+
+# -- .cdsinit autoload -----------------------------------------------------
+
+def _autoload_expected_setup(profile: str | None) -> str | None:
     from virtuoso_bridge.transport.tunnel import SSHClient
 
-    if SSHClient.is_running(profile):
-        label = f" [{profile}]" if profile else ""
-        print(f"Stopping tunnel{label}...")
-        ssh = SSHClient.from_env(keep_remote_files=True, profile=profile)
-        ssh.stop()
-        time.sleep(0.5)
-
-    rc = _start_one()
-    if rc == 0:
-        _restart_daemon_one(profile)
-    return rc
+    state = SSHClient.read_state(profile)
+    if not state:
+        return None
+    return str(
+        state.get("compat_setup_path")
+        or state.get("bootstrap_path")
+        or state.get("setup_path")
+        or ""
+    ) or None
 
 
-def cli_restart() -> int:
+def _autoload_client(profile: str | None, *, create_auth_token: bool) -> object:
+    from virtuoso_bridge.transport.tunnel import SSHClient
+
+    return SSHClient.from_env(
+        keep_remote_files=True,
+        profile=profile,
+        create_auth_token=create_auth_token,
+        allow_remote_bind=_CLI_ALLOW_REMOTE_BIND[0],
+    )
+
+
+def _autoload_one(profile: str | None, action: str, timeout: float = 10.0) -> int:
+    from virtuoso_bridge.transport.tunnel import SSHClient
+
+    label = f" [{profile}]" if profile else ""
+    expected = _autoload_expected_setup(profile)
+    if action == "install":
+        # ``warm`` can stage immutable files and ensure/reuse the tunnel.  It
+        # never calls RBStop/load, so installing autoload cannot restart CIW.
+        try:
+            ssh = _autoload_client(profile, create_auth_token=True)
+        except Exception as exc:
+            print(f"autoload install failed{label}: {exc}")
+            return 1
+        try:
+            ssh.warm(timeout=max(15, int(timeout)))
+            expected = ssh.compat_setup_path or expected
+            result = ssh.autoload_install(
+                expected_setup_path=expected,
+                timeout=timeout,
+            )
+            result.pop("token", None)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return 0
+        except Exception as exc:
+            print(f"autoload install failed{label}: {exc}")
+            return 1
+        finally:
+            ssh.close()
+
+    # Read-only status and uninstall intentionally avoid token creation.  No
+    # warm/restart/CIW call is made for either operation.
+    try:
+        ssh = _autoload_client(profile, create_auth_token=False)
+    except Exception as exc:
+        print(f"autoload {action} failed{label}: {exc}")
+        return 1
+    try:
+        if action == "status":
+            result = ssh.autoload_status(
+                expected_setup_path=expected,
+                timeout=timeout,
+            )
+        else:
+            result = ssh.autoload_uninstall(timeout=timeout)
+        result.pop("token", None)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    except Exception as exc:
+        print(f"autoload {action} failed{label}: {exc}")
+        return 1
+    finally:
+        ssh.close()
+
+
+def cli_autoload(action: str, *, timeout: float = 10.0) -> int:
+    timeout = _positive_finite_timeout(timeout)
     _load_cli_env()
-    return _for_each_profile(_restart_one)
+    return _for_each_profile(
+        lambda: _autoload_one(_get_cli_profile(), action, timeout=timeout)
+    )
 
 
 # -- status -----------------------------------------------------------------
@@ -761,8 +1342,7 @@ def cli_request_status(
     *, request_id: str | None = None, timeout: float = 10.0
 ) -> int:
     """Read the daemon request ledger without using the CIW request channel."""
-    if timeout <= 0:
-        raise ValueError("request status timeout must be greater than zero")
+    timeout = _positive_finite_timeout(timeout)
     _load_cli_env()
     from virtuoso_bridge.transport.tunnel import SSHClient
 
@@ -780,8 +1360,7 @@ def cli_request_status(
 
 def cli_deployment_status(*, timeout: float = 10.0) -> int:
     """Compare packaged, staged, and running daemon identities."""
-    if timeout <= 0:
-        raise ValueError("deployment status timeout must be greater than zero")
+    timeout = _positive_finite_timeout(timeout)
     _load_cli_env()
     from virtuoso_bridge.transport.tunnel import SSHClient
 
@@ -796,7 +1375,12 @@ def cli_deployment_status(*, timeout: float = 10.0) -> int:
     ) else 2
 
 
-_REQUEST_PENDING_STATES = frozenset({"queued", "running", "timed_out_pending"})
+_REQUEST_PENDING_STATES = frozenset({
+    "queued",
+    "running",
+    "timed_out_pending",
+    "late_waiting_operator",
+})
 _REQUEST_KNOWN_TERMINAL_STATES = frozenset({
     "succeeded",
     "failed",
@@ -805,9 +1389,111 @@ _REQUEST_KNOWN_TERMINAL_STATES = frozenset({
 })
 
 
+def _is_sha256(value: object) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{64}", str(value or "")))
+
+
+def _terminal_proof_errors(
+    request: dict[str, object],
+    request_id: str,
+    expected: dict[str, object],
+) -> list[str]:
+    """Return fail-closed identity/integrity errors for one terminal proof."""
+    errors: list[str] = []
+    required_expected = {
+        "request_digest_sha256",
+        "operation_class",
+        "daemon_epoch",
+        "daemon_build_sha256",
+        "request_generation",
+        "protocol_version",
+    }
+    for key in sorted(required_expected):
+        if expected.get(key) in (None, ""):
+            errors.append(f"missing-expected-{key.replace('_', '-')}")
+    if errors:
+        return errors
+
+    proof = request.get("terminal_proof")
+    if not isinstance(proof, dict):
+        return ["terminal-proof-missing"]
+    if proof.get("schema_version") != 1:
+        errors.append("terminal-proof-schema-unsupported")
+    if proof.get("complete_frame") is not True:
+        errors.append("terminal-proof-frame-incomplete")
+
+    state = str(request.get("state") or "")
+    expected_marker = (
+        "STX" if state in {"succeeded", "succeeded_after_timeout"} else "NAK"
+    )
+    exact_fields = {
+        "request_id": request_id,
+        "request_digest_sha256": expected["request_digest_sha256"],
+        "operation_class": expected["operation_class"],
+        "daemon_epoch": expected["daemon_epoch"],
+        "daemon_build_sha256": expected["daemon_build_sha256"],
+        "request_generation": expected["request_generation"],
+        "protocol_version": expected["protocol_version"],
+        "state": state,
+        "response_marker": expected_marker,
+    }
+    for key, value in exact_fields.items():
+        if proof.get(key) != value:
+            errors.append(f"terminal-proof-{key.replace('_', '-')}-mismatch")
+
+    request_fields = {
+        "request_id": request_id,
+        "request_digest_sha256": expected["request_digest_sha256"],
+        "operation_class": expected["operation_class"],
+        "admitted_daemon_epoch": expected["daemon_epoch"],
+        "admitted_daemon_build_sha256": expected["daemon_build_sha256"],
+        "request_generation": expected["request_generation"],
+        "protocol_version": expected["protocol_version"],
+    }
+    for key, value in request_fields.items():
+        if request.get(key) != value:
+            errors.append(f"request-{key.replace('_', '-')}-mismatch")
+
+    for key in (
+        "response_marker",
+        "response_digest_sha256",
+        "payload_digest_sha256",
+        "response_size_bytes",
+        "finished_at_epoch",
+    ):
+        if request.get(key) != proof.get(key):
+            errors.append(f"request-terminal-proof-{key.replace('_', '-')}-mismatch")
+
+    for key in (
+        "request_digest_sha256",
+        "daemon_build_sha256",
+        "response_digest_sha256",
+        "payload_digest_sha256",
+    ):
+        if not _is_sha256(proof.get(key)):
+            errors.append(f"terminal-proof-{key.replace('_', '-')}-invalid")
+    response_size = proof.get("response_size_bytes")
+    if (
+        isinstance(response_size, bool)
+        or not isinstance(response_size, int)
+        or response_size < 0
+    ):
+        errors.append("terminal-proof-response-size-invalid")
+    try:
+        finished_at = float(proof.get("finished_at_epoch"))
+        if not math.isfinite(finished_at) or finished_at <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        errors.append("terminal-proof-finished-at-invalid")
+    return sorted(set(errors))
+
+
 def _classify_request_reconciliation(
     payload: dict[str, object] | None,
     request_id: str,
+    *,
+    expected_terminal_proof: dict[str, object] | None = None,
+    require_terminal_proof: bool = False,
 ) -> dict[str, object]:
     request = payload.get("request") if payload else None
     if not isinstance(request, dict):
@@ -820,15 +1506,34 @@ def _classify_request_reconciliation(
         }
 
     state = str(request.get("state") or "")
+    proof_errors: list[str] = []
     if state in _REQUEST_PENDING_STATES:
         outcome = "in_progress"
         terminal = False
         safe_to_clear = False
     else:
         terminal = True
-        safe_to_clear = state in _REQUEST_KNOWN_TERMINAL_STATES
-        outcome = "known_terminal" if safe_to_clear else "indeterminate_terminal"
-    return {
+        known_terminal = state in _REQUEST_KNOWN_TERMINAL_STATES
+        if known_terminal and require_terminal_proof:
+            proof_errors = _terminal_proof_errors(
+                request,
+                request_id,
+                expected_terminal_proof or {},
+            )
+            expected = expected_terminal_proof or {}
+            if payload.get("daemon_epoch") != expected.get("daemon_epoch"):
+                proof_errors.append("ledger-daemon-epoch-mismatch")
+            if (
+                payload.get("daemon_build_sha256")
+                != expected.get("daemon_build_sha256")
+            ):
+                proof_errors.append("ledger-daemon-build-sha256-mismatch")
+            safe_to_clear = not proof_errors
+            outcome = "known_terminal" if safe_to_clear else "terminal_proof_invalid"
+        else:
+            safe_to_clear = known_terminal and not require_terminal_proof
+            outcome = "known_terminal" if known_terminal else "indeterminate_terminal"
+    result = {
         "request_id": request_id,
         "state": state or None,
         "terminal": terminal,
@@ -840,6 +1545,10 @@ def _classify_request_reconciliation(
         "daemon_epoch": payload.get("daemon_epoch") if payload else None,
         "heartbeat_at_epoch": payload.get("heartbeat_at_epoch") if payload else None,
     }
+    if state not in _REQUEST_PENDING_STATES:
+        result["terminal_proof"] = request.get("terminal_proof")
+        result["proof_errors"] = proof_errors
+    return result
 
 
 def cli_request_await(
@@ -847,12 +1556,17 @@ def cli_request_await(
     request_id: str,
     timeout: float = 60.0,
     poll_interval: float = 1.0,
+    require_terminal_proof: bool = False,
+    expected_request_digest_sha256: str | None = None,
+    expected_operation_class: str | None = None,
+    expected_daemon_epoch: str | None = None,
+    expected_daemon_build_sha256: str | None = None,
+    expected_request_generation: str | None = None,
+    expected_protocol_version: int | None = None,
 ) -> int:
     """Wait for a ledger terminal state without replaying the request."""
-    if timeout <= 0:
-        raise ValueError("request wait timeout must be greater than zero")
-    if poll_interval <= 0:
-        raise ValueError("request poll interval must be greater than zero")
+    timeout = _positive_finite_timeout(timeout)
+    poll_interval = _positive_finite_timeout(poll_interval)
 
     _load_cli_env()
     from virtuoso_bridge.transport.tunnel import SSHClient
@@ -860,6 +1574,15 @@ def cli_request_await(
     deadline = time.monotonic() + timeout
     first_epoch: str | None = None
     latest: dict[str, object] | None = None
+    stable_terminal_signature: str | None = None
+    expected_terminal_proof: dict[str, object] = {
+        "request_digest_sha256": expected_request_digest_sha256,
+        "operation_class": expected_operation_class,
+        "daemon_epoch": expected_daemon_epoch,
+        "daemon_build_sha256": expected_daemon_build_sha256,
+        "request_generation": expected_request_generation,
+        "protocol_version": expected_protocol_version,
+    }
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -880,7 +1603,12 @@ def cli_request_await(
             latest["daemon_epoch_changed"] = bool(
                 first_epoch and epoch and first_epoch != epoch
             )
-            reconciliation = _classify_request_reconciliation(latest, request_id)
+            reconciliation = _classify_request_reconciliation(
+                latest,
+                request_id,
+                expected_terminal_proof=expected_terminal_proof,
+                require_terminal_proof=require_terminal_proof,
+            )
             if latest["daemon_epoch_changed"] and reconciliation["outcome"] == "not_found":
                 reconciliation = dict(reconciliation)
                 reconciliation.update({
@@ -888,10 +1616,42 @@ def cli_request_await(
                     "outcome": "indeterminate_terminal",
                     "state": "orphaned_unknown_after_daemon_restart",
                 })
+            if (
+                require_terminal_proof
+                and reconciliation["terminal"]
+                and reconciliation["safe_to_clear_quarantine"]
+            ):
+                signature = json.dumps(
+                    {
+                        "request": latest.get("request"),
+                        "daemon_epoch": latest.get("daemon_epoch"),
+                        "daemon_build_sha256": latest.get("daemon_build_sha256"),
+                        "expected": expected_terminal_proof,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if signature != stable_terminal_signature:
+                    stable_terminal_signature = signature
+                    reconciliation = dict(reconciliation)
+                    reconciliation.update({
+                        "terminal": False,
+                        "safe_to_clear_quarantine": False,
+                        "outcome": "terminal_proof_pending_stability",
+                        "stable_reads": 1,
+                    })
+                else:
+                    reconciliation = dict(reconciliation)
+                    reconciliation["stable_reads"] = 2
+            elif require_terminal_proof:
+                stable_terminal_signature = None
             latest["reconciliation"] = reconciliation
             if reconciliation["terminal"]:
                 print(json.dumps(latest, ensure_ascii=False, sort_keys=True))
                 return 0
+        elif require_terminal_proof:
+            stable_terminal_signature = None
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1664,7 +2424,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, hlp in [
         ("start", "Start SSH tunnel + deploy daemon"),
         ("stop", "Stop the SSH tunnel"),
-        ("restart", "Restart SSH tunnel + daemon"),
+        ("restart", "Stage/reuse the tunnel and perform one guarded daemon restart"),
         ("status", "Check tunnel + daemon status"),
         ("license", "Check Spectre license availability"),
     ]:
@@ -1683,6 +2443,28 @@ def build_parser() -> argparse.ArgumentParser:
                 default=None,
                 help="Explicitly expose the daemon beyond loopback (unsafe unless firewalled)",
             )
+        if name == "restart":
+            sp.add_argument(
+                "--timeout",
+                type=_restart_timeout,
+                default=30.0,
+                help="Absolute guard, dispatch, and convergence budget in seconds",
+            )
+
+    sp_autoload = subparsers.add_parser(
+        "autoload",
+        help="Install, inspect, or remove the profile-specific .cdsinit autoload block",
+    )
+    sp_autoload.add_argument(
+        "action", choices=("install", "status", "uninstall"),
+        help="Autoload operation; status/uninstall never create an auth token",
+    )
+    sp_autoload.add_argument("-p", "--profile", default=None,
+                             help="Connection profile")
+    sp_autoload.add_argument("--env", default=None,
+                             help="Explicit .env file path (highest priority)")
+    sp_autoload.add_argument("--timeout", type=_positive_finite_timeout, default=10.0,
+                             help="Remote file operation timeout in seconds")
 
     sp_request_status = subparsers.add_parser(
         "request-status",
@@ -1693,7 +2475,7 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="Connection profile")
     sp_request_status.add_argument("--env", default=None,
                                    help="Explicit .env file path (highest priority)")
-    sp_request_status.add_argument("--timeout", type=float, default=10.0,
+    sp_request_status.add_argument("--timeout", type=_positive_finite_timeout, default=10.0,
                                    help="Ledger read timeout in seconds")
 
     sp_deployment_status = subparsers.add_parser(
@@ -1704,7 +2486,7 @@ def build_parser() -> argparse.ArgumentParser:
                                       help="Connection profile")
     sp_deployment_status.add_argument("--env", default=None,
                                       help="Explicit .env file path (highest priority)")
-    sp_deployment_status.add_argument("--timeout", type=float, default=10.0,
+    sp_deployment_status.add_argument("--timeout", type=_positive_finite_timeout, default=10.0,
                                       help="Status read timeout in seconds")
 
     for name, help_text in [
@@ -1717,11 +2499,24 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Connection profile")
         sp_wait.add_argument("--env", default=None,
                              help="Explicit .env file path (highest priority)")
-        sp_wait.add_argument("--timeout", type=float, default=60.0,
+        sp_wait.add_argument("--timeout", type=_positive_finite_timeout, default=60.0,
                              help="Absolute ledger wait budget in seconds")
-        sp_wait.add_argument("--poll-interval", type=float, default=1.0,
+        sp_wait.add_argument("--poll-interval", type=_positive_finite_timeout, default=1.0,
                              help="Ledger poll interval in seconds")
 
+        if name == "request-reconcile":
+            sp_wait.add_argument("--expected-request-digest-sha256")
+            sp_wait.add_argument(
+                "--expected-operation-class",
+                choices=("unknown", "read_only", "mutating"),
+            )
+            sp_wait.add_argument("--expected-daemon-epoch")
+            sp_wait.add_argument("--expected-daemon-build-sha256")
+            sp_wait.add_argument("--expected-request-generation")
+            sp_wait.add_argument(
+                "--expected-protocol-version",
+                type=int,
+            )
     sp_profile = subparsers.add_parser("profile", help="Show or edit profile bindings")
     profile_sub = sp_profile.add_subparsers(dest="profile_action", required=True)
     sp_profile_show = profile_sub.add_parser("show", help="Show resolved profile")
@@ -2077,7 +2872,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
         "start": cli_start,
         "stop": cli_stop,
-        "restart": cli_restart,
+        "restart": lambda: cli_restart(timeout=getattr(args, "timeout", 30.0)),
+        "autoload": lambda: cli_autoload(
+            action=getattr(args, "action"),
+            timeout=getattr(args, "timeout", 10.0),
+        ),
         "status": cli_status,
         "request-status": lambda: cli_request_status(
             request_id=getattr(args, "request_id", None),
@@ -2095,6 +2894,13 @@ def main(argv: list[str] | None = None) -> int:
             request_id=getattr(args, "request_id"),
             timeout=getattr(args, "timeout", 60.0),
             poll_interval=getattr(args, "poll_interval", 1.0),
+            require_terminal_proof=True,
+            expected_request_digest_sha256=getattr(args, "expected_request_digest_sha256"),
+            expected_operation_class=getattr(args, "expected_operation_class"),
+            expected_daemon_epoch=getattr(args, "expected_daemon_epoch"),
+            expected_daemon_build_sha256=getattr(args, "expected_daemon_build_sha256"),
+            expected_request_generation=getattr(args, "expected_request_generation"),
+            expected_protocol_version=getattr(args, "expected_protocol_version"),
         ),
         "license": cli_license,
         "load": lambda: cli_load(

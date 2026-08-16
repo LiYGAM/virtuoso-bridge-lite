@@ -13,7 +13,7 @@ import struct
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from virtuoso_bridge.env import load_vb_env
 from virtuoso_bridge.profile import resolve_profile
@@ -442,9 +442,9 @@ class VirtuosoClient(VirtuosoInterface):
     def execute_skill(
         self,
         skill_code: str,
-        timeout: float | None = None,
+        timeout: Optional[float] = None,
         operation_class: OperationClass = OperationClass.UNKNOWN,
-        request_id: str | None = None,
+        request_id: Optional[str] = None,
         exclusive: bool = False,
     ) -> VirtuosoResult:
         """Execute SKILL code in Virtuoso via the RAMIC Bridge daemon.

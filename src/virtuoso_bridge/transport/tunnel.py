@@ -2508,6 +2508,7 @@ class SSHClient:
             source_variants[daemon_path.name] = _sha256_bytes(daemon_text.encode("utf-8"))
         il_text = _canonical_resource_text(_find_ramic_bridge_il())
         il_sha256 = _sha256_bytes(il_text.encode("utf-8"))
+        local_il_matches_deployed = state.get("deployed_il_sha256") == il_sha256
         selected_name = str(state.get("daemon_filename") or "")
         local_daemon_sha256 = source_variants.get(selected_name)
         running = cls.read_request_status(profile, timeout=timeout)
@@ -2576,6 +2577,7 @@ class SSHClient:
             "local_daemon_sha256": local_daemon_sha256,
             "local_daemon_variants": source_variants,
             "local_il_sha256": il_sha256,
+            "local_il_matches_deployed": local_il_matches_deployed,
             "deployed_daemon_sha256": deployed_sha256 or None,
             "deployed_daemon_path": deployed_path or None,
             "actual_deployed_daemon_sha256": actual_deployed_sha256 or None,
@@ -2591,6 +2593,7 @@ class SSHClient:
                 local_daemon_sha256
                 and deployed_sha256 == local_daemon_sha256
                 and actual_deployed_sha256 == deployed_sha256
+                and local_il_matches_deployed
             ),
             "deployed_matches_running": bool(
                 deployed_sha256 and running_sha256 == deployed_sha256
@@ -2602,7 +2605,8 @@ class SSHClient:
             "staged_update_pending": bool(
                 state.get("deployed_daemon_sha256")
                 and local_daemon_sha256
-                and state.get("deployed_daemon_sha256") != local_daemon_sha256
+                and (state.get("deployed_daemon_sha256") != local_daemon_sha256
+                     or not local_il_matches_deployed)
             ),
         }
 

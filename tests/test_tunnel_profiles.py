@@ -403,8 +403,9 @@ def test_verify_staged_files_checks_exact_local_bytes(tmp_path) -> None:
     assert "digest mismatch" in reason
 
 
+@pytest.mark.parametrize("il_state", ["matching", "outdated", "missing"])
 def test_deployment_status_verifies_actual_local_bytes_and_fresh_runtime(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, il_state
 ) -> None:
     daemon = tmp_path / "ramic_bridge_daemon_3.py"
     daemon.write_bytes(b"print('bridge')\n")
@@ -429,7 +430,7 @@ def test_deployment_status_verifies_actual_local_bytes_and_fresh_runtime(
             "daemon_filename": daemon.name,
             "deployed_daemon_sha256": daemon_sha,
             "deployed_daemon_path": str(daemon),
-            "deployed_il_sha256": il_sha,
+            "deployed_il_sha256": il_sha if il_state == "matching" else "0" * 64 if il_state == "outdated" else None,
         }),
     )
     monkeypatch.setattr(
@@ -447,7 +448,9 @@ def test_deployment_status_verifies_actual_local_bytes_and_fresh_runtime(
     status = SSHClient.deployment_status("v231")
 
     assert status["actual_deployed_daemon_sha256"] == daemon_sha
-    assert status["local_matches_deployed"] is True
+    assert status["local_matches_deployed"] is (il_state == "matching")
+    assert status["local_il_matches_deployed"] is (il_state == "matching")
+    assert status["staged_update_pending"] is (il_state != "matching")
     assert status["deployed_matches_running"] is True
     assert status["running_heartbeat_fresh"] is True
 

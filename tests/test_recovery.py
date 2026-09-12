@@ -281,6 +281,17 @@ def test_absolute_backend_budget_expires_between_suboperations(monkeypatch):
     with pytest.raises(RecoveryRefused, match="budget-exhausted"): backend.budget()
 
 
+@pytest.mark.parametrize("ledger", [None, {}, {"requests": []}, {"request": None},
+                                     {"request": {"request_id": "unrelated", "state": "completed"}}])
+def test_monitor_fingerprint_without_target_request(ledger):
+    from virtuoso_bridge.recovery_cli import _recovery_fingerprint
+    snapshot = {"fault_class": "daemon-exited", "identity": {"epoch": "same"}, "ledger": ledger}
+    fingerprint = json.loads(_recovery_fingerprint(snapshot))
+    assert fingerprint["request_id"] is None
+    assert all(value is None for value in fingerprint["request"].values())
+    assert _recovery_fingerprint(snapshot) == _recovery_fingerprint(dict(snapshot, heartbeat_at=123))
+
+
 def test_monitor_waits_for_changes_after_refusal(subject, monkeypatch):
     from virtuoso_bridge.recovery_cli import _watch_worker
     engine, store, backend = subject

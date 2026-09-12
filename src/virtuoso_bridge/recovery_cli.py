@@ -79,9 +79,12 @@ def _recovery_fingerprint(snapshot):
                   or snapshot.get("pending_request_id"))
     ledger = snapshot.get("ledger") or {}
     requests = ledger.get("requests") or []
-    request = next((r for r in requests if r.get("request_id") == request_id), {})
-    if not request and (ledger.get("request") or {}).get("request_id") == request_id:
-        request = ledger["request"]
+    request = {}
+    if request_id:
+        request = next((r for r in requests if r.get("request_id") == request_id), {})
+        single_request = ledger.get("request") or {}
+        if not request and single_request.get("request_id") == request_id:
+            request = single_request
     return json.dumps({
         "fault": snapshot["fault_class"], "identity": snapshot.get("identity"),
         "policy": {k: (snapshot.get("policy") or {}).get(k) for k in ("policy_id", "active")},

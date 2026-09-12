@@ -167,6 +167,8 @@ def test_unattributed_load_invalidates_older_current_version(tmp_path):
 
 
 def test_recovery_timeout_and_deadline_do_not_leak(tmp_path, monkeypatch):
+    # Filesystem scheduling must not consume this test's synthetic deadline.
+    monkeypatch.setattr("virtuoso_bridge.recovery.time.monotonic", lambda: 100.0)
     backend = SimpleNamespace(timeout=15, deadline=None, snapshot=lambda: (_ for _ in ()).throw(RecoveryRefused("unavailable")))
     engine = RecoveryEngine(RecoveryStore(tmp_path, "owned"), backend)
     engine.run(timeout=.01)

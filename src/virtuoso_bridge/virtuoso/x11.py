@@ -97,6 +97,83 @@ def _ensure_helper(
     return remote_path
 
 
+def capture_screen(runner, user, output, *, profile=None, display=None, window_id=None):
+    """Capture the X11 desktop over SSH, without creating a SKILL client."""
+    import shutil
+    import tempfile
+    import uuid
+
+    output = Path(output).resolve()
+    if output.exists():
+        raise ValueError(f"Output already exists: {output}")
+    script = _ensure_helper(runner, user, profile)
+    py = _detect_remote_python(runner)
+    capture_id = None
+    if window_id:
+        matches = [w for w in list_windows(runner, user, display, profile)
+                   if w.get("window_id") == window_id and w.get("mapped")]
+        if len(matches) != 1:
+            raise ValueError("Target window is not uniquely mapped")
+        capture_id = int(matches[0].get("frame_id") or window_id, 16)
+        # System PyGTK captures a drawable without activating or moving it.
+        py = "env -u LD_LIBRARY_PATH -u LD_PRELOAD /usr/bin/python"
+    remote = "/tmp/vb-screen-" + uuid.uuid4().hex + ".png"
+    # Reuse process-based DISPLAY/XAUTHORITY detection, including on blocked CIWs.
+    code = (
+        "import os,subprocess; m={'__name__':'vb_screen_x11'}; "
+        f"exec(compile(open({script!r}).read(),{script!r},'exec'),m); e=m['find_x11_env']({user!r}); "
+        "os.environ.update(dict((k,v) for k,v in e.items() if v)); "
+        + (f"os.environ['DISPLAY']={display!r}; " if display else "")
+        + "assert os.environ.get('DISPLAY'), 'Cannot detect DISPLAY'; "
+        + "os.umask(0o077); "
+        + "os.environ.pop('LD_LIBRARY_PATH',None); os.environ.pop('LD_PRELOAD',None); "
+        + f"subprocess.check_call(['timeout','15','gnome-screenshot','-f',{remote!r}])"
+    )
+    if capture_id is not None:
+        code = code[:code.index("subprocess.check_call(")] + (
+            "import gtk; "
+            f"w=gtk.gdk.window_foreign_new({capture_id}); "
+            "assert w is not None, 'Window disappeared'; "
+            "width,height=w.get_size(); "
+            "p=gtk.gdk.Pixbuf(gtk.gdk.COLORSPACE_RGB,False,8,width,height); "
+            "assert p.get_from_drawable(w,w.get_colormap(),0,0,0,0,width,height), 'Cannot capture window'; "
+            f"p.save({remote!r},'png')"
+        )
+    try:
+        with tempfile.TemporaryDirectory(prefix="vb-capture-") as folder:
+            launcher = Path(folder) / "capture.py"
+            launcher.write_text(code, encoding="utf-8")
+            if runner:
+                uploaded = runner.upload(launcher, remote + ".py")
+                if uploaded.returncode:
+                    raise RuntimeError(uploaded.stderr or "Capture helper upload failed")
+                launch_path = remote + ".py"
+            else:
+                launch_path = str(launcher)
+            result = _run(runner, f"{py} {shlex.quote(launch_path)}", timeout=20)
+        if result.returncode:
+            raise RuntimeError(result.stderr or result.stdout or "Desktop capture failed")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="vb-screen-") as folder:
+            local = Path(folder) / "screen.png"
+            if runner:
+                result = runner.download(remote, local, timeout=20)
+                if result.returncode:
+                    raise RuntimeError(result.stderr or "Screenshot download failed")
+            else:
+                shutil.copyfile(remote, local)
+            with local.open("rb") as source:
+                if source.read(8) != b"\x89PNG\r\n\x1a\n":
+                    raise RuntimeError("Screenshot is not a PNG")
+                source.seek(0)
+                with output.open("xb") as destination:
+                    shutil.copyfileobj(source, destination)
+        return {"status": "success", "output": str(output), "transport": "x11-ssh",
+                "skill_executed": False, "window_id": window_id}
+    finally:
+        _run(runner, f"rm -f -- {shlex.quote(remote)} {shlex.quote(remote + '.py')}", timeout=10)
+
+
 def find_dialogs(
     runner: SSHRunner | None,
     user: str,

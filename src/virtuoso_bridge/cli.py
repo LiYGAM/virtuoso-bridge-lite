@@ -2374,6 +2374,23 @@ def cli_export_visio() -> int:
     return 0
 
 
+def cli_screen(output=None, display=None, window_id=None) -> int:
+    """Capture desktop independently of the daemon and SKILL channel."""
+    _load_cli_env()
+    from virtuoso_bridge.virtuoso.x11 import capture_screen
+    from virtuoso_bridge.runtime_paths import artifact_dir
+    from uuid import uuid4
+    runner, user = _make_ssh_runner()
+    output = output or artifact_dir("screenshots") / ("desktop-" + uuid4().hex + ".png")
+    try:
+        result = capture_screen(runner, user, output, profile=_get_cli_profile(), display=display, window_id=window_id)
+        print(json.dumps(result))
+        return 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(json.dumps({"status": "error", "error": str(exc), "skill_executed": False}))
+        return 1
+
+
 def cli_screenshot() -> int:
     """Take a screenshot of a Virtuoso window."""
     _load_cli_env()
@@ -2606,6 +2623,13 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Connection profile")
     sp_dismiss.add_argument("--env", default=None,
                             help="Explicit .env file path (highest priority)")
+
+    sp_screen = subparsers.add_parser("screen", help="Capture X11 desktop without SKILL")
+    sp_screen.add_argument("-o", "--output", default=None)
+    sp_screen.add_argument("--display", default=None)
+    sp_screen.add_argument("--window-id", default=None)
+    sp_screen.add_argument("-p", "--profile", default=None)
+    sp_screen.add_argument("--env", default=None)
 
     sp_list_windows = subparsers.add_parser(
         "list-windows", help="List Virtuoso-related X11 windows")
@@ -2915,6 +2939,7 @@ def main(argv: list[str] | None = None) -> int:
             quiet=getattr(args, "quiet", False),
             operation_class=getattr(args, "operation_class", OperationClass.UNKNOWN),
         ),
+        "screen": lambda: cli_screen(getattr(args, "output", None), getattr(args, "display", None), getattr(args, "window_id", None)),
         "dismiss-dialog": cli_dismiss_dialog,
         "list-windows": lambda: cli_list_windows(
             json_output=getattr(args, "json", False),

@@ -202,6 +202,7 @@ def test_read_request_status_filters_local_ledger(monkeypatch, tmp_path) -> None
 
     assert status == {
         "schema_version": 1,
+        "ledger_source_path": str(ledger),
         "daemon_epoch": "epoch-1",
         "exclusive_request_id": "req-2",
         "exclusive_request_generation": "generation-2",

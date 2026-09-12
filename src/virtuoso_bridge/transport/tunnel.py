@@ -1996,6 +1996,18 @@ class SSHClient:
                     f"cat -- {shlex.quote(path)}",
                     timeout=timeout,
                 )
+                # A different local account may have staged a new setup while
+                # the existing daemon still writes beside the previous setup.
+                # Only try the recorded predecessor, never scan other clients.
+                previous = str(state.get("previous_setup_path") or "")
+                if result.returncode != 0 and previous:
+                    previous_path = previous.rsplit("/", 1)[0] + "/request-status.json"
+                    if previous_path != path:
+                        result = client._require_runner().run_command(
+                            f"cat -- {shlex.quote(previous_path)}", timeout=timeout,
+                        )
+                        if result.returncode == 0:
+                            path = previous_path
                 if result.returncode != 0:
                     return None
                 payload = _strict_json_loads(result.stdout)
@@ -2005,6 +2017,7 @@ class SSHClient:
                 client.close()
         if not isinstance(payload, dict):
             return None
+        payload["ledger_source_path"] = path
         requests = payload.get("requests", [])
         if not isinstance(requests, list) or any(
             not isinstance(entry, dict) for entry in requests
@@ -2016,6 +2029,7 @@ class SSHClient:
             if entry.get("request_id") == request_id:
                 filtered = {
                     "schema_version": payload.get("schema_version"),
+                    "ledger_source_path": path,
                     "daemon_epoch": payload.get("daemon_epoch"),
                     "request": entry,
                 }

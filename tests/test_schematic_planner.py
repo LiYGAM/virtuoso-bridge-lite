@@ -287,7 +287,7 @@ def test_schematic_ops_create_from_plan_executes_schcheck_and_save() -> None:
 
         def execute_operations(self, operations: list[str], timeout: int = 60):
             self.operations = operations
-            return {"ok": True, "result": {"status": "success", "errors": []}}
+            return {"ok": True, "result": {"status": "success", "output": "t", "errors": []}}
 
     client = Client()
     plan = SchematicPlanner().plan(

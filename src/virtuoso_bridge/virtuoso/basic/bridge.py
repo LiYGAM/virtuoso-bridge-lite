@@ -107,6 +107,7 @@ def _parse_v3_frame(raw: bytes, expected_request_id: str) -> tuple[dict[str, Any
         "transport_unknown",
         "busy",
         "rejected",
+        "expired_before_dispatch",
     }
     if status not in allowed_statuses:
         raise _V3FrameError("invalid VBR3 response status")
@@ -197,7 +198,6 @@ class VirtuosoClient(VirtuosoInterface):
         from virtuoso_bridge.virtuoso.maestro.ops import MaestroOps
 
         self.maestro = MaestroOps(self)
-        self._il_upload_cache: dict[str, tuple[str, str]] = {}
         # For connect retry when jump host adds latency
         self._has_jump_host = (
             bool(os.getenv("VB_JUMP_HOST", "").strip())
@@ -701,9 +701,9 @@ class VirtuosoClient(VirtuosoInterface):
         return self.execute_skill(skill, timeout=effective_timeout)
 
     def open_window(self, lib: str, cell: str, *, view: str = "schematic",
-                    view_type: str | None = None, timeout: int | None = None) -> VirtuosoResult:
+                    view_type: str | None = None, mode: str = "a", timeout: int | None = None) -> VirtuosoResult:
         effective_timeout = timeout if timeout is not None else self._timeout
-        skill = op_open_window(lib, cell, view=view, view_type=view_type)
+        skill = op_open_window(lib, cell, view=view, view_type=view_type, mode=mode)
         return self.execute_skill(skill, timeout=effective_timeout)
 
     def save_current_cellview(self, timeout: int | None = None) -> VirtuosoResult:
@@ -1568,15 +1568,28 @@ let((result winName ciwNum)
 
     # -- IL loading ---------------------------------------------------------
 
-    def load_il(self, path: str | Path, timeout: int | None = None) -> VirtuosoResult:
-        """Load an IL file in Virtuoso."""
+    def load_il(self, path: str | Path, timeout: int | None = None, *,
+                expected_sha256: str | None = None, expected_context: dict | None = None,
+                target: dict | None = None, mode: str = "a", view_type: str | None = None,
+                require_window: bool = False, save: bool = False) -> VirtuosoResult:
+        """Load a fixed entrypoint snapshot, optionally guarded in the same request."""
+        from virtuoso_bridge.script_loading import prepare_script, write_receipt, finish_receipt, managed_load_command
+        from virtuoso_bridge.virtuoso.development import guard_context, targeted_load
         effective_timeout = timeout if timeout is not None else self._timeout
         deadline = time.monotonic() + effective_timeout
         try:
-            prepared, uploaded = self._prepare_il_path(
-                path,
-                timeout=self._remaining_timeout(deadline),
-            )
+            if save and target is None:
+                raise ValueError("Saving a development load requires an explicit target")
+            prepared = prepare_script(self, path, timeout=self._remaining_timeout(deadline), expected_sha256=expected_sha256)
+            skill_command = f'load("{_escape_for_skill_evalstring_source(prepared["artifact_path"])}")'
+            skill_command = managed_load_command(skill_command, prepared)
+            if target is not None:
+                skill_command = targeted_load(skill_command, target, mode=mode, view_type=view_type,
+                                               require_window=require_window, save=save)
+            if expected_context is not None:
+                skill_command = guard_context(skill_command, expected_context)
+            prepared.update(started_at=time.time(), status="dispatch-pending-or-unknown", target=target)
+            write_receipt(self, prepared)
         except Exception as e:
             return VirtuosoResult(
                 status=ExecutionStatus.ERROR,
@@ -1585,7 +1598,6 @@ let((result winName ciwNum)
                 completion=CompletionStatus.NOT_DISPATCHED,
             )
 
-        skill_command = f'load("{_escape_for_skill_evalstring_source(prepared)}")'
         result = self.execute_skill(
             skill_command,
             timeout=self._remaining_timeout(deadline),
@@ -1596,50 +1608,48 @@ let((result winName ciwNum)
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 self.ciw_log(
-                    f'printf("[RAMIC] loaded {_escape_skill_string(prepared)}\\n")',
+                    f'printf("[RAMIC] loaded {_escape_skill_string(prepared["artifact_path"])}\\n")',
                     timeout=min(5, remaining),
                 )
 
-        result.metadata["uploaded"] = uploaded
+        result.metadata["uploaded"] = prepared["uploaded"]
         result.metadata["skill_command"] = skill_command
-        return result
+        return finish_receipt(self, prepared, result)
 
     def run_il_file(self, path: str | Path, lib: str, cell: str, *,
                     view: str = "layout", view_type: str | None = None,
                     mode: str = "a", open_window: bool = True,
                     save: bool = False, timeout: int | None = None) -> VirtuosoResult:
+        if mode not in {"r", "a"} or (mode == "r" and save):
+            return VirtuosoResult(status=ExecutionStatus.ERROR, errors=["Invalid load mode or save requested for read-only target"],
+                                  completion=CompletionStatus.NOT_DISPATCHED, operation_class=OperationClass.MUTATING)
         effective_timeout = timeout if timeout is not None else self._timeout
         deadline = time.monotonic() + effective_timeout
-        opened = self.open_cell_view(
-            lib, cell, view=view, view_type=view_type, mode=mode,
-            timeout=self._remaining_timeout(deadline),
-        )
-        if opened.status != ExecutionStatus.SUCCESS:
-            return opened
         if open_window:
             window_result = self.open_window(
-                lib, cell, view=view, view_type=view_type,
+                lib, cell, view=view, view_type=view_type, mode=mode,
                 timeout=self._remaining_timeout(deadline),
             )
             if window_result.status != ExecutionStatus.SUCCESS:
                 return window_result
-        sync_result = self.execute_skill(
-            "cv = geGetEditCellView()",
+        return self.load_il(
+            path, target={"lib": lib, "cell": cell, "view": view}, mode=mode, view_type=view_type,
+            require_window=open_window, save=save,
             timeout=self._remaining_timeout(deadline),
         )
-        if sync_result.status != ExecutionStatus.SUCCESS:
-            return sync_result
-        load_result = self.load_il(
-            path,
-            timeout=self._remaining_timeout(deadline),
-        )
-        if load_result.status != ExecutionStatus.SUCCESS or not save:
-            return load_result
-        save_result = self.save_current_cellview(
-            timeout=self._remaining_timeout(deadline)
-        )
-        save_result.metadata["load_result"] = load_result.model_dump(mode="json")
-        return save_result
+
+    def editor_context(self, *, limit: int = 50, timeout: int = 15) -> dict:
+        from virtuoso_bridge.virtuoso.development import editor_context
+        return editor_context(self, limit=limit, timeout=timeout)
+
+    def loaded_scripts(self, *, timeout: int = 15) -> dict:
+        from virtuoso_bridge.script_loading import loaded_scripts
+        return loaded_scripts(self, timeout=timeout)
+
+    def execute_guarded(self, code: str, expected_context: dict, *, timeout: int | None = None,
+                        operation_class=OperationClass.MUTATING) -> VirtuosoResult:
+        from virtuoso_bridge.virtuoso.development import guard_context
+        return self.execute_skill(guard_context(code, expected_context), timeout=timeout, operation_class=operation_class)
 
     def execute_operations(self, commands: list[str], *, timeout: int | None = None,
                            wrap_in_progn: bool = True) -> VirtuosoResult:
@@ -1660,45 +1670,10 @@ let((result winName ciwNum)
         *,
         timeout: float | None = None,
     ) -> tuple[str, bool]:
-        """Return (remote_path, uploaded) where uploaded=False means cache hit."""
-        p = Path(path)
-        if self._tunnel is not None and p.is_file():
-            from virtuoso_bridge.transport.remote_paths import (
-                default_virtuoso_bridge_dir,
-                resolve_client_id,
-                resolve_remote_username,
-            )
-            from virtuoso_bridge.transport.tunnel import _profiled_bridge_leaf
-            work_dir = self._tunnel.remote_work_dir
-            if not work_dir:
-                remote_username = resolve_remote_username(
-                    configured_user=getattr(self._tunnel, '_remote_user', None),
-                    runner=self._tunnel.ssh_runner,
-                )
-                work_dir = default_virtuoso_bridge_dir(
-                    remote_username,
-                    _profiled_bridge_leaf(getattr(self._tunnel, '_profile', None)),
-                    resolve_client_id(getattr(self._tunnel, '_profile', None)),
-                )
-            remote_dir = work_dir.rstrip("/")
-            remote_path = f"{remote_dir}/{p.name}"
-            content = p.read_bytes()
-            md5 = hashlib.md5(content).hexdigest()
-            cached = self._il_upload_cache.get(str(p))
-            if cached and cached[0] == md5:
-                return cached[1], False
-            up = self._tunnel.upload_text(
-                content.decode("utf-8"),
-                remote_path,
-                timeout=timeout,
-                retry_transport_errors=False,
-            )
-            if up.returncode != 0:
-                raise RuntimeError(f"Failed to upload IL file {p.name}: {up.stderr.strip()}")
-            remote_posix = _path_to_posix(remote_path)
-            self._il_upload_cache[str(p)] = (md5, remote_posix)
-            return remote_posix, True
-        return _path_to_posix(p), False
+        """Return a uniquely owned content snapshot; paths are never reused."""
+        from virtuoso_bridge.script_loading import prepare_script
+        prepared = prepare_script(self, path, timeout=timeout)
+        return prepared["artifact_path"], prepared["uploaded"]
 
     def _execute_skill_once(
         self,
@@ -1895,7 +1870,7 @@ let((result winName ciwNum)
                     request_id=request_id,
                     protocol_version=3,
                 )
-            if response_status in {"busy", "rejected"}:
+            if response_status in {"busy", "rejected", "expired_before_dispatch"}:
                 return VirtuosoResult(
                     status=ExecutionStatus.ERROR,
                     errors=[payload or response_status],
@@ -1969,6 +1944,7 @@ let((result winName ciwNum)
                 "REQUEST_ID_CONFLICT",
                 "REQUEST_TOO_LARGE",
                 "REQUEST_READ_TIMEOUT",
+                "REQUEST_EXPIRED_BEFORE_DISPATCH",
             }:
                 completion = CompletionStatus.NOT_DISPATCHED
             else:

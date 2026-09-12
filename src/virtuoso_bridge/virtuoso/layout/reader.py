@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import math
 from typing import Any
 
 
@@ -14,18 +15,27 @@ def _decode_skill_output(raw: str) -> str:
 
 
 def _parse_skill_numbers(value: str) -> list[float]:
-    return [float(token) for token in re.findall(r"-?\d+(?:\.\d+)?", value or "")]
+    number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    text = value or ""
+    if not re.fullmatch(r"[\s():]*(?:" + number + r"(?:[\s():]+" + number + r")*)?[\s():]*", text):
+        raise ValueError(f"Invalid SKILL numeric geometry: {value!r}")
+    numbers = [float(token) for token in re.findall(number, text)]
+    if not all(math.isfinite(n) for n in numbers):
+        raise ValueError("Non-finite SKILL geometry")
+    return numbers
 
 
 def _parse_skill_point(value: str) -> tuple[float, float] | None:
     numbers = _parse_skill_numbers(value)
-    return (numbers[0], numbers[1]) if len(numbers) >= 2 else None
+    if len(numbers) != 2:
+        raise ValueError(f"Expected exactly two coordinates: {value!r}")
+    return (numbers[0], numbers[1])
 
 
 def _parse_skill_point_list(value: str) -> list[tuple[float, float]] | None:
     numbers = _parse_skill_numbers(value)
     if len(numbers) < 2 or len(numbers) % 2 != 0:
-        return None
+        raise ValueError(f"Expected coordinate pairs: {value!r}")
     return [(numbers[i], numbers[i + 1]) for i in range(0, len(numbers), 2)]
 
 
@@ -44,7 +54,9 @@ def parse_layout_geometry_output(raw: str) -> list[dict[str, Any]]:
             obj[key] = None if value == "nil" else value
         if "bbox" in obj and isinstance(obj["bbox"], str):
             points = _parse_skill_point_list(obj["bbox"])
-            obj["bbox"] = points if points and len(points) == 2 else obj["bbox"]
+            if len(points) != 2:
+                raise ValueError(f"Expected two bbox corners: {obj['bbox']!r}")
+            obj["bbox"] = points
         if "points" in obj and isinstance(obj["points"], str):
             obj["points"] = _parse_skill_point_list(obj["points"])
         if "xy" in obj and isinstance(obj["xy"], str):

@@ -1,0 +1,10 @@
+{
+  "template_only": true,
+  "description": "审查示例；通过 recovery policy grant 创建绑定实际会话的授权，不直接复制为 policy.json。",
+  "actions": ["connect", "proven_read_only", "proven_not_dispatched", "daemon_relaunch"],
+  "hours": 8,
+  "incident_seconds": 60,
+  "monitor_interval_seconds": 10,
+  "monitor_enabled": false,
+  "reason": "允许本会话恢复确认已退出的 daemon"
+}

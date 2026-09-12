@@ -90,6 +90,7 @@ class _Connection:
 
 
 def _load_functions(filename: str, names: set[str], namespace: dict[str, object]) -> dict[str, object]:
+    namespace.setdefault("_monotonic", lambda: 0.0)
     source_path = RESOURCE_DIR / filename
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     functions = [

@@ -788,3 +788,49 @@ def test_assembler_1749_uses_the_ok_mnemonic() -> None:
     helper = _load_helper_module()
 
     assert helper._known_action("ADE Assembler Message 1749") == "alt-o"
+
+
+@pytest.mark.parametrize("operation", ["dismiss", "input"])
+@pytest.mark.parametrize("matching_displays", [[], [":7"], [":7", ":8"]])
+def test_explicit_window_actions_require_one_display_and_restore_auth(
+    monkeypatch, capsys, operation, matching_displays
+):
+    helper = _load_helper_module()
+    calls = []
+    monkeypatch.setenv("XAUTHORITY", "/tmp/original")
+    monkeypatch.setattr(helper, "find_x11_envs", lambda: [
+        {"DISPLAY": ":7", "XAUTHORITY": "/tmp/auth-a"},
+        {"DISPLAY": ":8", "XAUTHORITY": "/tmp/auth-b"},
+    ])
+    monkeypatch.setattr(helper, "discover_windows", lambda display, **kw: [
+        {"window_id": "0xabc", "dismiss_id": "0xabc", "frame_id": "0xframe"}
+    ] if display in matching_displays else [])
+    monkeypatch.setattr(helper, "_verify_dismissal", lambda result: result)
+
+    def capture(display, target, *args, **kwargs):
+        calls.append((display, target, helper.os.environ.get("XAUTHORITY")))
+        return {"dismissed": target} if operation == "dismiss" else {"sent": False}
+
+    monkeypatch.setattr(helper, "dismiss_window", capture)
+    monkeypatch.setattr(helper, "window_input", capture)
+    args = ["helper", "--dismiss-window", "0xabc"] if operation == "dismiss" else [
+        "helper", "--window-input", "0xabc", "--expect-title", "review",
+        "--action", "move", "--x", "1", "--y", "1", "--dry-run",
+    ]
+    monkeypatch.setattr(helper.sys, "argv", args)
+    with pytest.raises(SystemExit) as exited:
+        helper.main()
+    if len(matching_displays) == 1:
+        assert exited.value.code == 0
+        assert calls == [(":7", "0xabc", "/tmp/auth-a")]
+    else:
+        assert exited.value.code != 0
+        assert calls == []
+        assert "error" in capsys.readouterr().out
+
+
+def test_apply_x11_env_clears_previous_displays_authority(monkeypatch):
+    helper = _load_helper_module()
+    monkeypatch.setenv("XAUTHORITY", "/tmp/previous")
+    assert helper._apply_x11_env({"DISPLAY": ":7", "XAUTHORITY": None}) == ":7"
+    assert "XAUTHORITY" not in helper.os.environ

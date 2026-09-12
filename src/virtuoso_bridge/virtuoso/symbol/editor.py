@@ -53,6 +53,6 @@ class SymbolEditor:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if exc_type is None:
             self.commands.append(symbol_check())
-            self.commands.append(save_current_cellview())
+            self.commands.append(save_current_cellview(target={"lib": self.lib, "cell": self.cell, "view": self.view}))
             response = self.client.execute_operations(self.commands, timeout=self.timeout)
             ensure_operation_response(response, context="symbol edit")

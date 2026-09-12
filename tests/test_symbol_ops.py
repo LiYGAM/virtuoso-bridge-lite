@@ -193,7 +193,7 @@ def test_symbol_editor_opens_symbol_view_and_saves() -> None:
         def execute_operations(self, commands: list[str], *, timeout: int):
             self.commands = commands
             self.timeout = timeout
-            return {"ok": True, "result": {"status": "success"}}
+            return {"ok": True, "result": {"status": "success", "output": "t"}}
 
     client = Client()
     with SymbolEditor(client, "demoLib", "nand2", timeout=7) as symbol:
@@ -213,7 +213,7 @@ def test_symbol_editor_forwards_custom_view_type() -> None:
 
         def execute_operations(self, commands: list[str], *, timeout: int):
             self.commands = commands
-            return {"ok": True, "result": {"status": "success"}}
+            return {"ok": True, "result": {"status": "success", "output": "t"}}
 
     client = Client()
     with SymbolEditor(client, "demoLib", "nand2", view_type="symbol") as symbol:

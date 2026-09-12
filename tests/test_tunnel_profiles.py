@@ -153,6 +153,8 @@ def test_remote_setup_path_and_port_are_profile_scoped(monkeypatch) -> None:
     )
     assert '/tmp/virtuoso_bridge_designer/90590/virtuoso_bridge_t28_digital/ramic_bridge.' in setup
     assert len(client._deployment_id or "") == 64
+    assert f'setShellEnvVar("RB_DEPLOYMENT_ID" "{client._deployment_id}")' in setup
+    assert f'setShellEnvVar("RB_IL_SHA256" "{client._deployed_il_sha256}")' in setup
     assert all(call.get("retry_transport_errors") is False for call in fake.upload_options)
 
 
@@ -347,6 +349,7 @@ def test_saved_auto_switched_local_port_remains_part_of_profile_identity(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr("virtuoso_bridge.transport.tunnel.load_vb_env", lambda: None)
+    monkeypatch.setattr("virtuoso_bridge.transport.ssh.load_vb_env", lambda: None)
     monkeypatch.setenv("VB_REMOTE_HOST_v231", "eda-host")
     monkeypatch.setenv("VB_REMOTE_USER_v231", "designer")
     monkeypatch.setenv("VB_REMOTE_PORT_v231", "65271")
@@ -415,6 +418,13 @@ def test_deployment_status_verifies_actual_local_bytes_and_fresh_runtime(
     il.write_bytes(b"t\n")
     daemon_sha = hashlib.sha256(daemon.read_bytes()).hexdigest()
     il_sha = hashlib.sha256(il.read_bytes()).hexdigest()
+    staged_il_sha = il_sha if il_state == "matching" else "0" * 64 if il_state == "outdated" else None
+    deployment_id = hashlib.sha256((daemon_sha + "\0" + (staged_il_sha or "")).encode()).hexdigest()
+    identity = tmp_path / "daemon_identity.txt"
+    identity.write_text(
+        f"pid=123\nepoch=epoch-current\nprofile=v231\ndeployment_id={deployment_id}\n"
+        f"il_sha256={staged_il_sha or ''}\nidentity_complete=1\n"
+    )
     monkeypatch.setattr(
         "virtuoso_bridge.transport.tunnel._find_ramic_bridge_daemon",
         lambda major: daemon if major == 3 else legacy_daemon,
@@ -430,7 +440,9 @@ def test_deployment_status_verifies_actual_local_bytes_and_fresh_runtime(
             "daemon_filename": daemon.name,
             "deployed_daemon_sha256": daemon_sha,
             "deployed_daemon_path": str(daemon),
-            "deployed_il_sha256": il_sha if il_state == "matching" else "0" * 64 if il_state == "outdated" else None,
+            "deployed_il_sha256": staged_il_sha,
+            "deployment_id": deployment_id,
+            "identity_path": str(identity),
         }),
     )
     monkeypatch.setattr(
@@ -438,6 +450,7 @@ def test_deployment_status_verifies_actual_local_bytes_and_fresh_runtime(
         "read_request_status",
         classmethod(lambda cls, profile=None, request_id=None, timeout=10.0: {
             "daemon_epoch": "epoch-current",
+            "daemon_pid": 123,
             "daemon_build_sha256": daemon_sha,
             "heartbeat_at_epoch": time.time(),
             "protocol_versions": [2, 3],
@@ -451,7 +464,8 @@ def test_deployment_status_verifies_actual_local_bytes_and_fresh_runtime(
     assert status["local_matches_deployed"] is (il_state == "matching")
     assert status["local_il_matches_deployed"] is (il_state == "matching")
     assert status["staged_update_pending"] is (il_state != "matching")
-    assert status["deployed_matches_running"] is True
+    assert status["deployed_matches_running"] is (il_state != "missing")
+    assert status["deployed_daemon_matches_running"] is True
     assert status["running_heartbeat_fresh"] is True
 
 

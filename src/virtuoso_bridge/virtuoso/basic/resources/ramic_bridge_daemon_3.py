@@ -91,6 +91,7 @@ PROTOCOL_VERSIONS = (2, 3)
 DAEMON_CAPABILITIES = (
     "auth-token-v1",
     "bounded-queue-v1",
+    "queue-deadline-v1",
     "daemon-heartbeat-v1",
     "exclusive-admission-v1",
     "late-completion-witness-v1",
@@ -221,6 +222,7 @@ _RECOVER_AS_ORPHANED_STATES = (
     "queued", "running", "timed_out_pending", "late_waiting_operator"
 )
 _TERMINAL_STATES = (
+    "expired_before_dispatch",
     "succeeded",
     "failed",
     "succeeded_after_timeout",
@@ -232,6 +234,7 @@ _TERMINAL_STATES = (
     "orphaned_unknown_response_stream_closed",
 )
 _EXCLUSIVE_RELEASE_STATES = (
+    "expired_before_dispatch",
     "succeeded", "failed", "succeeded_after_timeout", "failed_after_timeout"
 )
 
@@ -511,7 +514,8 @@ def _finalize_request(request_id, request_generation, state, response_bytes=None
         if (
             not entry
             or entry.get("request_generation") != request_generation
-            or entry.get("state") not in _ACTIVE_STATES
+            or (entry.get("state") not in _ACTIVE_STATES
+                and not (state == "expired_before_dispatch" and entry.get("state") == "queued"))
         ):
             return False
         entry = dict(entry)
@@ -648,7 +652,7 @@ def _validate_request(request_data):
         timeout_seconds = float(request_data.get("timeout"))
     except (TypeError, ValueError):
         raise RequestProtocolError("INVALID_TIMEOUT")
-    if timeout_seconds <= 0 or timeout_seconds > _MAX_EXECUTION_TIMEOUT_SECONDS:
+    if not 0 < timeout_seconds <= _MAX_EXECUTION_TIMEOUT_SECONDS:
         raise RequestProtocolError("INVALID_TIMEOUT")
     request_id = str(request_data.get("request_id") or "")
     if not request_id or len(request_id) > 256:
@@ -833,6 +837,7 @@ def _admit_external_connection(conn, addr):
             request_digest,
             request_generation,
             exclusive,
+            _monotonic() + timeout_seconds,
         )
         response = None
         with _STATE_LOCK:
@@ -986,6 +991,28 @@ def _admit_external_connection(conn, addr):
     return False
 
 
+def _expire_queued_request(request_id, generation, operation_class, protocol, digest, conn):
+    """Persist admission-side evidence without claiming a CIW response."""
+    finished = time.time()
+    proof = {
+        "schema_version": 1, "state": "expired_before_dispatch",
+        "execution_dispatched": False, "request_id": request_id,
+        "request_generation": generation, "request_digest_sha256": digest,
+        "operation_class": operation_class, "protocol_version": protocol,
+        "daemon_epoch": DAEMON_EPOCH, "daemon_build_sha256": DAEMON_BUILD_SHA256,
+        "finished_at_epoch": finished,
+    }
+    response = _format_client_response(
+        protocol, request_id, "expired_before_dispatch", "NAK",
+        "REQUEST_EXPIRED_BEFORE_DISPATCH", request_digest_sha256=digest,
+    )
+    finalized = _finalize_request(request_id, generation, "expired_before_dispatch",
+                      response_bytes=response, finished_at_epoch=finished,
+                      execution_dispatched=False, pre_dispatch_proof=proof)
+    if finalized:
+        _safe_sendall(conn, response)
+
+
 def handle_external_connection(admitted):
     (
         conn,
@@ -998,6 +1025,7 @@ def handle_external_connection(admitted):
         request_digest,
         request_generation,
         exclusive,
+        deadline,
     ) = admitted
     watchdog_timer = None
     timed_out_event = threading.Event()
@@ -1005,6 +1033,10 @@ def handle_external_connection(admitted):
     tmp_il_path = None
 
     try:
+        if _monotonic() >= deadline:
+            _expire_queued_request(request_id, request_generation, operation_class,
+                                   protocol_version, request_digest, conn)
+            return
         if not _mark_request_running(request_id, request_generation):
             _safe_sendall(conn, _format_client_response(
                 protocol_version, request_id, "transport_unknown", "NAK",
@@ -1035,19 +1067,24 @@ def handle_external_connection(admitted):
         else:
             send_code = f'let(((__vb_r {skill_code})) hiFlush() __vb_r)\n'
 
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            _expire_queued_request(request_id, request_generation, operation_class,
+                                   protocol_version, request_digest, conn)
+            return
         sys.stdout.buffer.write(send_code.encode("utf-8"))
         sys.stdout.buffer.flush()
 
         # Start watchdog timer
         watchdog_timer = threading.Timer(
-            timeout_seconds,
+            remaining,
             watchdog_callback,
             args=(request_id, request_generation, timed_out_event),
         )
         watchdog_timer.daemon = True
         watchdog_timer.start()
 
-        drain_deadline = _monotonic() + timeout_seconds + _RESPONSE_DRAIN_WARNING_SECONDS
+        drain_deadline = deadline + _RESPONSE_DRAIN_WARNING_SECONDS
         returnData, response_too_large, response_bytes_seen = read_until_delimiter(
             drain_deadline,
             late_wait_callback=lambda: late_wait_warning_callback(
@@ -1304,10 +1341,11 @@ def start_server():
             except Exception:
                 _ip = ""
         sys.stderr.write(
-            "[RB-banner] pid={pid} bind={host}:{port} host={hn} ip={ip} build={build} protocols={protocols}\n".format(
+            "[RB-banner] pid={pid} bind={host}:{port} host={hn} ip={ip} build={build} protocols={protocols} epoch={epoch}\n".format(
                 pid=os.getpid(), host=HOST, port=PORT, hn=_hn, ip=(_ip or "unknown"),
                 build=(DAEMON_BUILD_SHA256[:12] or "unknown"),
                 protocols=",".join(str(value) for value in PROTOCOL_VERSIONS),
+                epoch=DAEMON_EPOCH,
             )
         )
         sys.stderr.flush()

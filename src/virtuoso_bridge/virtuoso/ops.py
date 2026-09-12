@@ -70,6 +70,8 @@ def open_window(
     Reuses an existing window if one is already open for the same
     lib/cell/view combination, focusing it instead of opening a duplicate.
     """
+    if mode not in {"r", "a"}:
+        raise ValueError("Window opens support r/a mode")
     elib = escape_skill_string(lib)
     ecell = escape_skill_string(cell)
     eview = escape_skill_string(view)
@@ -86,18 +88,27 @@ def open_window(
         f'         && cv~>viewName == "{eview}" '
         f'      existing = w))) '
         f'if(existing '
-        f'  then hiRaiseWindow(existing) window = existing '
+        f'  then unless(equal(existing~>cellView~>mode "{mode}") error("window-mode-mismatch\\n")) '
+        f'    hiRaiseWindow(existing) window = existing '
         f'  else window = geOpen(?lib "{elib}" ?cell "{ecell}" '
         f'    ?view "{eview}" ?viewType "{evtype}" ?mode "{mode}")) '
-        f'window)'
+        f'unless(window && window~>cellView && equal(window~>cellView~>mode "{mode}") '
+        f'  error("window-mode-unavailable\\n")) window)'
     )
 
-def save_current_cellview() -> str:
-    """Build SKILL to save the current edit cellview or bound ``cv``."""
+def save_current_cellview(*, target: dict | None = None) -> str:
+    """Save successfully or raise; explicit edit targets never fall back to focus."""
+    binding = "if(boundp('cv) && cv then cv else geGetEditCellView())"
+    check = ""
+    if target is not None:
+        from virtuoso_bridge.virtuoso.development import target_matches
+        binding = "if(boundp('cv) then cv else nil)"
+        check = f'unless({target_matches("rbCv", target)} error("save-target-mismatch\\n")) '
     return (
         "let((rbCv) "
-        "rbCv = if(boundp('cv) && cv then cv else geGetEditCellView()) "
-        "if(rbCv then dbSave(rbCv) else nil))"
+        f"rbCv = {binding} "
+        + check + 'unless(rbCv error("save-target-unavailable\\n")) '
+        'unless(dbSave(rbCv) error("cellview-not-saved\\n")) t)'
     )
 
 def close_current_cellview() -> str:

@@ -216,6 +216,32 @@ virtuoso-bridge load my_script.il
 | `skill-info <fn>`                                                 | 获取 SKILL 函数的详细 `More Info` 文档                                                |
 | `doc-search <query>`                                              | 通过活动桥接器搜索已安装的 Cadence 文档，或使用 `--doc-root` 进行本地/离线搜索                          |
 
+### 部署和窗口操作的状态判断
+
+`deployment-status` 分别报告本地资源、已部署文件和运行中版本。
+`deployed_matches_running=true` 要求 daemon SHA 一致，并且成功加载的 SKILL
+身份包含匹配的 deployment ID、IL SHA、profile、daemon PID 和 epoch。
+`running_identity_verified=false` 表示加载身份缺失、不完整或不属于当前进程；
+旧版身份文件不会被视为激活成功。已经部署但尚未确认激活时，
+`staged_update_pending=true`。状态查询只读取文件，不向 CIW 发送探测代码。
+
+`connect -p <profile>` 只恢复已准备配置的 SSH 隧道，不部署资源或激活更新。
+首次准备资源使用 `start`，激活新版本使用 `restart`。daemon 的 `queue-deadline-v1`
+将排队和发送前准备计入 timeout；到期请求以 `expired_before_dispatch` 结束，
+客户端报告 `not_dispatched`。已发送到 CIW 的请求仍保留原完成见证流程。
+
+机器调用使用 `--json-envelope`，`data` 为结构化对象或数组，日志写入 stderr。
+健康的待更新状态返回 `ok=true/status=pending`；完成未知为 `status=unknown` 且非零退出。
+`session-status --expected-epoch <epoch>` 只检查指定会话是否空闲且加载身份已验证；
+它本身不解除外部工作流的隔离状态。
+
+`autoload status/install/uninstall` 在 `VB_GUI_HOST` 对应用户的 home 中操作
+`.cdsinit`；部署文件仍由 `VB_DEPLOY_HOST` 接收。各主机需要能访问生成的 setup 路径。
+
+`dismiss-window` 和 `window-input` 会先定位唯一的 DISPLAY，再使用该 DISPLAY
+对应的 XAUTHORITY。没有匹配窗口或同一 XID 出现在多个 DISPLAY 时会拒绝操作；
+可通过 `VB_DISPLAY` 明确选择。`window-input --dry-run` 同样执行这些检查，但不发送输入。
+
 ## 导出 Maestro 运行快照
 
 将当前聚焦的 Maestro 会话的设置和最近一次运行的产物拉取到本地文件夹：

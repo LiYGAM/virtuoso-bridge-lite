@@ -4,15 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from virtuoso_bridge.models import ExecutionStatus, VirtuosoResult
+from virtuoso_bridge.models import CompletionStatus, ExecutionStatus, VirtuosoResult
 
 
 def ensure_operation_response(response: Any, *, context: str) -> None:
     """Raise a consistent error when an edit batch fails."""
     if isinstance(response, VirtuosoResult):
-        if response.status != ExecutionStatus.SUCCESS:
+        if response.status != ExecutionStatus.SUCCESS or response.completion != CompletionStatus.CONFIRMED:
             errors = response.errors or ["unknown failure"]
             raise RuntimeError(f"{context} failed: {errors[0]}")
+        if response.output.strip() != "t":
+            raise RuntimeError(f"{context} failed: cellview save was not confirmed")
         return
 
     if not response.get("ok", False):
@@ -22,3 +24,5 @@ def ensure_operation_response(response: Any, *, context: str) -> None:
     if result.get("status") != "success":
         errors = result.get("errors") or [result.get("status", "unknown failure")]
         raise RuntimeError(f"{context} failed: {errors[0]}")
+    if str(result.get("output", "")).strip() != "t":
+        raise RuntimeError(f"{context} failed: cellview save was not confirmed")

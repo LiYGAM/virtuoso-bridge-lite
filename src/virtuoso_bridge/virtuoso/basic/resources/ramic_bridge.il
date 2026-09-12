@@ -52,6 +52,14 @@ unless(boundp('RBLastPid) RBLastPid = nil)
 unless(boundp('RBLastBind) RBLastBind = "")
 unless(boundp('RBLastHost) RBLastHost = "")
 unless(boundp('RBLastIP) RBLastIP = "")
+unless(boundp('RBLastEpoch) RBLastEpoch = "")
+unless(boundp('RBLoadedDeploymentId) RBLoadedDeploymentId = "")
+unless(boundp('RBLoadedIlSha256) RBLoadedIlSha256 = "")
+unless(boundp('RBLoadedProfile) RBLoadedProfile = "")
+unless(boundp('RBRecoverySession)
+    RBRecoverySession = sprintf(nil "%d_%d" ipcGetPid() stringToTime(getCurrentTime())))
+unless(boundp('RBLastRecoveryId) RBLastRecoveryId = "")
+unless(boundp('RBRecoveryTimerGeneration) RBRecoveryTimerGeneration = 0)
 
 ; Daemon-reported runtime stats (counter / errors / uptime in seconds).
 ; Updated by RBIpcErrHandler when the daemon emits a [RB-stat] line.
@@ -68,8 +76,14 @@ procedure(RBWriteIdentity()
             let((port)
                 port = outfile(RBIdentityPath)
                 when(port
+                    fprintf(port "ciw_pid=%d\nciw_session=%s\nrecovery_id=%s\nrecovery_mailbox_version=1\n"
+                        ipcGetPid() RBRecoverySession RBLastRecoveryId)
                     fprintf(port "host=%s\nip=%s\npid=%L\nbind=%s\n"
                         RBLastHost RBLastIP RBLastPid RBLastBind)
+                    ; The final marker lets readers reject an interrupted write.
+                    when(RBLastPid && strlen(RBLastEpoch) > 0
+                        fprintf(port "epoch=%s\nprofile=%s\ndeployment_id=%s\nil_sha256=%s\nidentity_complete=1\n"
+                            RBLastEpoch RBLoadedProfile RBLoadedDeploymentId RBLoadedIlSha256))
                     close(port)))))
 )
 
@@ -145,7 +159,9 @@ procedure(RBIpcErrHandler(ipcId data)
                 when(strlen(tok) > 5 && equal(substring(tok 1 5) "host=")
                     RBLastHost = substring(tok 6))
                 when(strlen(tok) > 3 && equal(substring(tok 1 3) "ip=")
-                    RBLastIP = substring(tok 4)))
+                    RBLastIP = substring(tok 4))
+                when(strlen(tok) > 6 && equal(substring(tok 1 6) "epoch=")
+                    RBLastEpoch = substring(tok 7)))
             RBWriteIdentity()
             ; First banner of this daemon's lifetime --> announce
             ; "ready" with the populated identity.  RBStart printed
@@ -179,6 +195,64 @@ procedure(RBIpcFinishHandler(ipcId data)
   )
 )
 
+procedure(RBRecoveryReadData(path)
+    let((port data)
+        when(isFile(path)
+            port = infile(path)
+            when(port
+                errset(data = lineread(port))
+                close(port)))
+        data))
+
+procedure(RBRecoveryPoll(generation)
+    ; Mailbox values are literals, never SKILL source. An expired action cannot
+    ; execute later when a blocked CIW finally returns to its event loop.
+    when(generation == RBRecoveryTimerGeneration
+        errset(
+            let((auth intent now rid receipt port)
+                when(strlen(RBIdentityPath) > 0
+                    auth = RBRecoveryReadData(strcat(RBIdentityPath ".recovery-auth"))
+                    intent = RBRecoveryReadData(strcat(RBIdentityPath ".recovery-intent"))
+                    now = stringToTime(getCurrentTime())
+                    when(listp(auth) && listp(intent) && length(auth) == 8 && length(intent) == 6
+                        when(stringp(nth(0 intent)) && stringp(nth(1 intent)) &&
+                             stringp(nth(2 intent)) && stringp(nth(3 intent)) &&
+                             stringp(nth(4 intent)) && fixp(nth(5 intent)) && fixp(nth(4 auth)) &&
+                             nth(5 intent) > now && nth(4 auth) > now &&
+                             stringp(nth(5 auth)) && member("daemon_relaunch" parseString(nth(5 auth) ",")) &&
+                             equal(nth(6 auth) RBDPath) && stringp(nth(7 auth)) &&
+                             !isFile(strcat(RBIdentityPath ".recovery-revoked-" nth(1 intent))) &&
+                             equal(nth(1 intent) nth(0 auth)) &&
+                             equal(nth(2 intent) nth(1 auth)) && equal(nth(2 intent) RBLastEpoch) &&
+                             equal(nth(3 intent) nth(2 auth)) && equal(nth(3 intent) RBLoadedDeploymentId) &&
+                             equal(nth(4 intent) nth(3 auth)) && equal(nth(4 intent) RBRecoverySession) &&
+                             !equal(nth(0 intent) RBLastRecoveryId) &&
+                             !(boundp('RBIpc) && ipcIsAliveProcess(RBIpc))
+                            rid = nth(0 intent)
+                            ; Persist acceptance before spawning, so missing replies
+                            ; cannot cause a second lifecycle action in this CIW.
+                            receipt = strcat(RBIdentityPath ".recovery-receipt")
+                            port = outfile(receipt)
+                            when(port
+                                fprintf(port "recovery_id=%s\nold_epoch=%s\nciw_session=%s\naccepted=1\n"
+                                    rid RBLastEpoch RBRecoverySession)
+                                close(port)
+                                RBLastRecoveryId = rid
+                                ; Reload the pinned setup to restore all launch settings.
+                                load(nth(7 auth))))))))
+        hiRegTimer(sprintf(nil "RBRecoveryPoll(%d)" generation) 10)))
+
+procedure(RBRecoveryRestartAllowed(policyId epoch deployment expires)
+    let((auth now)
+        auth = RBRecoveryReadData(strcat(RBIdentityPath ".recovery-auth"))
+        now = stringToTime(getCurrentTime())
+        listp(auth) && length(auth) == 8 && fixp(nth(4 auth)) && stringp(nth(5 auth)) &&
+        equal(nth(0 auth) policyId) && equal(nth(1 auth) epoch) && equal(epoch RBLastEpoch) &&
+        equal(nth(2 auth) deployment) && equal(deployment RBLoadedDeploymentId) &&
+        equal(nth(3 auth) RBRecoverySession) && equal(nth(6 auth) RBDPath) &&
+        expires > now && nth(4 auth) > now && member("daemon_restart" parseString(nth(5 auth) ",")) &&
+        !isFile(strcat(RBIdentityPath ".recovery-revoked-" policyId))))
+
 procedure(RBStart()
     ; Start the RAMIC Bridge daemon process.  Launches the Python daemon
     ; as a child process of Virtuoso; the actual "ready" ack is printed
@@ -201,6 +275,7 @@ procedure(RBStart()
         RBLastBind = ""
         RBLastHost = ""
         RBLastIP = ""
+        RBLastEpoch = ""
         RBStatCount = 0
         RBStatErrors = 0
         RBStatUptime = 0)
@@ -218,6 +293,7 @@ procedure(RBStart()
         RBLastBind = ""
         RBLastHost = ""
         RBLastIP = ""
+        RBLastEpoch = ""
         RBStatCount = 0
         RBStatErrors = 0
         RBStatUptime = 0
@@ -280,6 +356,7 @@ procedure(RBStopAll()
     RBLastPid = nil
     RBLastHost = ""
     RBLastIP = ""
+    RBLastEpoch = ""
     RBStatCount = 0
     RBStatErrors = 0
     RBStatUptime = 0
@@ -641,5 +718,13 @@ procedure(RBPrintEmptyLines(@optional (n 10))
     for(i 1 n printf("\n"))
 )
 
-; Auto-start the bridge when this file is loaded (no second daemon if already up)
+; Publish the managed load identity only after every definition has loaded.
+RBLoadedDeploymentId = if(getShellEnvVar("RB_DEPLOYMENT_ID") getShellEnvVar("RB_DEPLOYMENT_ID") "")
+RBLoadedIlSha256 = if(getShellEnvVar("RB_IL_SHA256") getShellEnvVar("RB_IL_SHA256") "")
+RBLoadedProfile = RBProfile
+; Auto-start the bridge when this file is loaded (no second daemon if already up).
 RBStart()
+RBRecoveryTimerGeneration = RBRecoveryTimerGeneration + 1
+hiRegTimer(sprintf(nil "RBRecoveryPoll(%d)" RBRecoveryTimerGeneration) 10)
+; A reload also updates the identity when the daemon was already running.
+RBWriteIdentity()

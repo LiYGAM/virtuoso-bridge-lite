@@ -13,6 +13,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -73,6 +74,37 @@ def _mark_interpreter_shutdown() -> None:
     _INTERPRETER_SHUTTING_DOWN = True
 
 atexit.register(_mark_interpreter_shutdown)
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Query process state without sending a signal on Windows."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # Windows signal 0 is CTRL_C_EVENT, not a POSIX existence query.
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _windows_no_window_kwargs(
@@ -491,7 +523,7 @@ class SSHRunner:
 
         logger.info("Starting SSH tunnel: %s", " ".join(cmd))
         if self._verbose:
-            print(f"[cmd] {' '.join(cmd)}", flush=True)
+            print(f"[cmd] {' '.join(cmd)}", file=sys.stderr, flush=True)
 
         if os.name == "nt":
             # Capture stderr so we can surface "banner exchange timeout"
@@ -618,11 +650,7 @@ class SSHRunner:
         if self._tunnel_proc is not None and self._tunnel_proc.poll() is None:
             return True
         if self._tunnel_using_external and self._tunnel_pid:
-            try:
-                os.kill(self._tunnel_pid, 0)
-                return True
-            except (OSError, PermissionError):
-                pass
+            return _process_is_alive(self._tunnel_pid)
         return False
 
     @property
@@ -733,7 +761,7 @@ class SSHRunner:
     def _print_cmd(self, cmd: list[str]) -> None:
         logger.info("[local] %s", " ".join(cmd))
         if self._verbose:
-            print(f"[cmd] {' '.join(cmd)}", flush=True)
+            print(f"[cmd] {' '.join(cmd)}", file=sys.stderr, flush=True)
 
     # Transport-level SSH error patterns that indicate a flaky cold
     # handshake rather than a server-side problem.  Seeing any of these
@@ -1003,7 +1031,7 @@ class SSHRunner:
             # picks up the no-mux config on the next try.
             cmd = self._build_ssh_base() + [plan.remote_command]
             if self._verbose:
-                print(f"[cmd] {' '.join(cmd)}  # upload -> {remote_path}", flush=True)
+                print(f"[cmd] {' '.join(cmd)}  # upload -> {remote_path}", file=sys.stderr, flush=True)
             r = subprocess.run(
                 cmd,
                 input=text_bytes,
@@ -1153,7 +1181,7 @@ class SSHRunner:
             ssh_command = self._build_ssh_base() + [plan.remote_command]
             if self._verbose:
                 print(
-                    f"[cmd] {' '.join(local_command)} | {' '.join(ssh_command)}",
+                    f"[cmd] {' '.join(local_command)} | {' '.join(ssh_command)}", file=sys.stderr,
                     flush=True,
                 )
             tar_process: subprocess.Popen[Any] | None = None
@@ -1244,7 +1272,7 @@ class SSHRunner:
             print(
                 f"[cmd] {' '.join(ssh_command)} | {' '.join(local_command)}"
                 f"  # download {plan.remote_path} -> {plan.local_path}",
-                flush=True,
+                file=sys.stderr, flush=True,
             )
         logger.debug(
             "Downloading via tar pipe %s:%s -> %s",
@@ -1587,7 +1615,7 @@ class SSHRunner:
                 # Trim heredoc payload: cat > path <<'TOKEN' → cat > path
                 if "<<'" in summary:
                     summary = summary.split("<<'")[0].rstrip()
-                print(f"[cmd] {self._host}: {summary}", flush=True)
+                print(f"[cmd] {self._host}: {summary}", file=sys.stderr, flush=True)
         token = uuid.uuid4().hex
         begin_marker = f"__vb_STDOUT_B64_BEGIN_{token}__"
         stderr_marker = f"__vb_STDERR_B64_BEGIN_{token}__"

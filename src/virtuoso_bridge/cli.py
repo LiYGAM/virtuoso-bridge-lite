@@ -12,6 +12,7 @@ import math
 import os
 import re
 import shlex
+import sys
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -87,7 +88,7 @@ def _load_cli_env() -> Path | None:
     global _PRINTED_ENV_PATH
     env_path = load_vb_env()
     if env_path is not None and env_path != _PRINTED_ENV_PATH:
-        print(f"using .env: {env_path}")
+        print(f"using .env: {env_path}", file=sys.stderr)
         _PRINTED_ENV_PATH = env_path
     return env_path
 
@@ -367,6 +368,18 @@ def cli_start() -> int:
 
 # -- stop -------------------------------------------------------------------
 
+def cli_connect(*, timeout: float = 15.0) -> int:
+    """Connect to an already prepared profile; never deploy or activate it."""
+    _load_cli_env()
+    from virtuoso_bridge.transport.tunnel import SSHClient
+    client = SSHClient.from_env(keep_remote_files=True, profile=_get_cli_profile(), create_auth_token=False)
+    try:
+        print(json.dumps(client.connect(timeout=_positive_finite_timeout(timeout))))
+        return 0
+    finally:
+        client.close()
+
+
 def _stop_one() -> int:
     """Stop tunnel for the current profile."""
     profile = _get_cli_profile()
@@ -395,6 +408,7 @@ _RESTART_ACTIVE_STATES = frozenset(
 )
 _RESTART_TERMINAL_STATES = frozenset(
     {
+        "expired_before_dispatch",
         "succeeded",
         "failed",
         "succeeded_after_timeout",
@@ -583,6 +597,10 @@ def _restart_daemon_one(
     *,
     timeout: float = 30.0,
     _deadline: float | None = None,
+    _state_snapshot: dict | None = None,
+    _recovery_id: str | None = None,
+    _recovery_policy: dict | None = None,
+    _recovery_expires: float | None = None,
 ) -> bool:
     """Guard, restart once, then prove the new daemon identity.
 
@@ -594,6 +612,9 @@ def _restart_daemon_one(
     from virtuoso_bridge.transport.tunnel import SSHClient, resolve_auth_token
     from virtuoso_bridge.virtuoso.basic.bridge import VirtuosoClient
     from virtuoso_bridge.virtuoso.ops import escape_skill_string
+
+    if _recovery_id:
+        from virtuoso_bridge.recovery_backend import RecoverySSHClient as SSHClient
 
     try:
         deadline = (
@@ -607,7 +628,7 @@ def _restart_daemon_one(
     except (TypeError, ValueError, TimeoutError) as exc:
         print(f"[warning] Refusing daemon restart: {exc}.")
         return False
-    state = SSHClient.read_state(profile)
+    state = _state_snapshot if _state_snapshot is not None else SSHClient.read_state(profile)
     if not isinstance(state, dict) or not state.get("port"):
         print("[warning] Refusing daemon restart: staged bridge state is unavailable.")
         return False
@@ -708,6 +729,14 @@ def _restart_daemon_one(
 
     if setup_path:
         skill = f'RBStop()\nload("{escape_skill_string(setup_path)}")'
+        if _recovery_id:
+            if not re.fullmatch(r"[0-9a-f]{32}", _recovery_id) or not _recovery_policy or not _recovery_expires:
+                raise ValueError("Invalid lifecycle recovery id")
+            values = [_recovery_policy["policy_id"], _recovery_policy["identity"]["epoch"], state["deployment_id"]]
+            guard = " ".join('"' + escape_skill_string(value) + '"' for value in values)
+            skill = (f'if(RBRecoveryRestartAllowed({guard} {int(_recovery_expires)}) then\n'
+                     f'RBLastRecoveryId = "{_recovery_id}"\n' + skill +
+                     '\nelse error("Recovery authorization inactive")\n)')
 
     print(f"Restarting daemon{label}...")
     request_timeout = min(5.0, _restart_remaining(deadline, "restart dispatch"))
@@ -768,6 +797,7 @@ def _restart_daemon_one(
             timeout=min(5.0, _restart_remaining(deadline, "restart dispatch")),
             operation_class=OperationClass.MUTATING,
             exclusive=True,
+            **({"request_id": _recovery_id} if _recovery_id else {}),
         )
     except Exception as exc:
         print(
@@ -845,6 +875,17 @@ def _restart_daemon_one(
                     f"Daemon restart verified{label}: epoch changed and "
                     "staged build is active."
                 )
+                if not _recovery_id:
+                    from virtuoso_bridge.runtime_paths import state_dir
+                    from virtuoso_bridge.transport.tunnel import _atomic_write_json
+                    receipt = {"profile": profile, "request_id": dispatch_request_id, "request_digest_sha256": dispatch_digest,
+                               "old_epoch": old_epoch, "new_epoch": epoch, "daemon_build_sha256": build,
+                               "deployment_id": state["deployment_id"], "verified_at": time.time()}
+                    try:
+                        _atomic_write_json(state_dir() / "verified-restarts" / str(profile or "default") /
+                                           (dispatch_request_id + ".json"), receipt)
+                    except OSError as exc:
+                        print(f"[warning] Could not preserve the verified restart receipt: {exc}")
                 return True
             if not epoch or epoch == old_epoch:
                 last_reason = "daemon epoch has not changed"
@@ -1416,6 +1457,12 @@ def _for_each_profile(fn: Callable[[], int]) -> int:
 
 def cli_status() -> int:
     _load_cli_env()
+    if _CLI_JSON_ENVELOPE[0]:
+        from virtuoso_bridge.transport.tunnel import SSHClient
+        profile = _get_cli_profile()
+        print(json.dumps({"tunnel_running": SSHClient.is_running(profile),
+                          "deployment": SSHClient.deployment_status(profile)}))
+        return 0
     return _for_each_profile(_print_status)
 
 
@@ -1456,6 +1503,33 @@ def cli_deployment_status(*, timeout: float = 10.0) -> int:
     ) else 2
 
 
+def cli_session_status(*, expected_epoch: str, timeout: float = 15.0) -> int:
+    """Inspect a pinned, idle session without making CIW calls or staging files."""
+    _load_cli_env()
+    from virtuoso_bridge.transport.tunnel import SSHClient
+    profile = _get_cli_profile()
+    deadline = time.monotonic() + _positive_finite_timeout(timeout)
+    ledger = SSHClient.read_request_status(profile, timeout=_restart_remaining(deadline, "session ledger"))
+    if not ledger or any(k not in ledger for k in ("requests", "queue_depth", "active_request_id")):
+        raise RuntimeError("Session ledger is unavailable or incomplete")
+    reason = _restart_busy_reason(ledger)
+    if (reason or type(ledger.get("queue_depth")) is not int or ledger["queue_depth"] != 0
+            or type(ledger.get("daemon_pid")) is not int or ledger["daemon_pid"] <= 0
+            or not _restart_heartbeat_is_fresh(ledger)):
+        raise RuntimeError(reason or "Session heartbeat is stale")
+    deployment = SSHClient.deployment_status(profile, timeout=_restart_remaining(deadline, "loaded identity"))
+    if (not expected_epoch or ledger.get("daemon_epoch") != expected_epoch
+            or deployment.get("running_daemon_epoch") != expected_epoch
+            or not deployment.get("running_identity_verified")
+            or not deployment.get("running_heartbeat_fresh")
+            or ledger.get("daemon_build_sha256") != deployment.get("running_daemon_sha256")):
+        raise RuntimeError("Pinned session identity is not verified")
+    print(json.dumps({"idle": True, "identity_verified": True, "daemon_epoch": expected_epoch,
+                      "daemon_build_sha256": ledger.get("daemon_build_sha256"),
+                      "daemon_pid": ledger.get("daemon_pid"), "profile": profile}))
+    return 0
+
+
 _REQUEST_PENDING_STATES = frozenset({
     "queued",
     "running",
@@ -1463,6 +1537,7 @@ _REQUEST_PENDING_STATES = frozenset({
     "late_waiting_operator",
 })
 _REQUEST_KNOWN_TERMINAL_STATES = frozenset({
+    "expired_before_dispatch",
     "succeeded",
     "failed",
     "succeeded_after_timeout",
@@ -1493,6 +1568,31 @@ def _terminal_proof_errors(
         if expected.get(key) in (None, ""):
             errors.append(f"missing-expected-{key.replace('_', '-')}")
     if errors:
+        return errors
+
+    if request.get("state") == "expired_before_dispatch":
+        proof = request.get("pre_dispatch_proof")
+        if not isinstance(proof, dict):
+            return ["pre-dispatch-proof-missing"]
+        exact = dict(expected, request_id=request_id, state="expired_before_dispatch",
+                     schema_version=1, execution_dispatched=False)
+        for key, value in exact.items():
+            if proof.get(key) != value or (key == "execution_dispatched" and proof.get(key) is not False):
+                errors.append(f"pre-dispatch-proof-{key}-mismatch")
+        for key in ("request_id", "request_digest_sha256", "operation_class", "request_generation", "protocol_version"):
+            if request.get(key) != exact[key]:
+                errors.append(f"pre-dispatch-request-{key}-mismatch")
+        for key in ("daemon_epoch", "daemon_build_sha256"):
+            if request.get("admitted_" + key) != expected[key]:
+                errors.append(f"pre-dispatch-admitted-{key}-mismatch")
+        if request.get("execution_dispatched") is not False:
+            errors.append("pre-dispatch-request-not-proven")
+        try:
+            finished = float(proof.get("finished_at_epoch"))
+            if not math.isfinite(finished) or finished <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            errors.append("pre-dispatch-proof-finish-invalid")
         return errors
 
     proof = request.get("terminal_proof")
@@ -1628,6 +1728,8 @@ def _classify_request_reconciliation(
     }
     if state not in _REQUEST_PENDING_STATES:
         result["terminal_proof"] = request.get("terminal_proof")
+        if state == "expired_before_dispatch":
+            result["pre_dispatch_proof"] = request.get("pre_dispatch_proof")
         result["proof_errors"] = proof_errors
     return result
 
@@ -1847,14 +1949,16 @@ def _make_ssh_runner() -> tuple["SSHRunner | None", str]:
     ), remote_user
 
 
-def cli_load(*, file: str, timeout: float = 60, quiet: bool = False) -> int:
+def cli_load(*, file: str, timeout: float = 60, quiet: bool = False,
+             expected_sha256: str | None = None, expected_context: str | None = None,
+             lib: str | None = None, cell: str | None = None, view: str = "layout",
+             save: bool = False, require_window: bool = False) -> int:
     """Execute a SKILL .il file in the running Virtuoso session.
 
-    Equivalent to ``load("<file>")`` typed in the CIW: SKILL reads the
-    original file directly, so error messages keep the **original file
-    path + line numbers** (no temp-wrapper pollution).  In SSH mode
-    the file is uploaded first; in local mode the path is forwarded
-    as-is.  Both paths land in :meth:`VirtuosoClient.load_il`.
+    SKILL loads an immutable copy with the original filename and unchanged
+    line numbers. ``metadata.script_load.source_map`` maps that artifact
+    back to the development file. Nested loads keep normal CIW resolution;
+    their observed dependency hashes are not execution attestations.
 
     Output: the full ``VirtuosoResult`` serialised as JSON on stdout
     (status, output, errors, warnings, execution_time, metadata).
@@ -1882,7 +1986,18 @@ def cli_load(*, file: str, timeout: float = 60, quiet: bool = False) -> int:
 
     _load_cli_env()
     client = _vb_pkg.VirtuosoClient.from_env(profile=_get_cli_profile())
-    result = client.load_il(p, timeout=timeout)
+    options = {}
+    if expected_sha256 is not None:
+        options["expected_sha256"] = expected_sha256
+    if expected_context is not None:
+        options["expected_context"] = json.loads(Path(expected_context).read_text(encoding="utf-8-sig"))
+    if lib is not None or cell is not None:
+        if not lib or not cell:
+            raise ValueError("Both --lib and --cell are required")
+        options.update(target={"lib": lib, "cell": cell, "view": view}, save=save, require_window=require_window)
+    elif save or require_window:
+        raise ValueError("--save and --require-window require --lib and --cell")
+    result = client.load_il(p, timeout=timeout, **options)
 
     if not quiet:
         # Stable contract: dump the VirtuosoResult exactly as the model
@@ -1898,7 +2013,8 @@ def cli_load(*, file: str, timeout: float = 60, quiet: bool = False) -> int:
 
 def cli_eval(*, skill: str | None, stdin: bool, timeout: float = 60,
              quiet: bool = False,
-             operation_class: OperationClass = OperationClass.UNKNOWN) -> int:
+             operation_class: OperationClass = OperationClass.UNKNOWN,
+             expected_context: str | None = None) -> int:
     """Execute a SKILL expression in the running Virtuoso session.
 
     Companion to :func:`cli_load` for one-liners and round-trip checks
@@ -1941,6 +2057,10 @@ def cli_eval(*, skill: str | None, stdin: bool, timeout: float = 60,
     # The newlines also force the daemon onto its multi-line code path
     # (temp-file + load), which handles `progn` reliably.
     wrapped = f"progn(\n{skill}\n)"
+    if expected_context is not None:
+        from pathlib import Path
+        from virtuoso_bridge.virtuoso.development import guard_context
+        wrapped = guard_context(wrapped, json.loads(Path(expected_context).read_text(encoding="utf-8-sig")))
 
     _load_cli_env()
     client = _vb_pkg.VirtuosoClient.from_env(profile=_get_cli_profile())
@@ -1959,6 +2079,20 @@ def cli_eval(*, skill: str | None, stdin: bool, timeout: float = 60,
     return 0 if result.status == ExecutionStatus.SUCCESS else 1
 
 
+def cli_development(action, *, timeout=15, limit=50, output=None):
+    _load_cli_env()
+    from virtuoso_bridge import VirtuosoClient
+    client = VirtuosoClient.from_env(profile=_get_cli_profile())
+    result = client.editor_context(limit=limit, timeout=timeout) if action == "context" else client.loaded_scripts(timeout=timeout)
+    if output:
+        from pathlib import Path
+        destination = Path(output)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cli_dismiss_dialog() -> int:
     """Find and dismiss blocking Virtuoso GUI dialogs via X11."""
     _load_cli_env()
@@ -1966,6 +2100,9 @@ def cli_dismiss_dialog() -> int:
     runner, user = _make_ssh_runner()
 
     dialogs = x11.dismiss_dialogs(runner, user, profile=_get_cli_profile())
+    if _CLI_JSON_ENVELOPE[0]:
+        print(json.dumps(dialogs, ensure_ascii=False))
+        return 1 if any("error" in d or d.get("still_mapped") for d in dialogs) else 0
     if not dialogs:
         print("No dialog windows found.")
         return 0
@@ -2028,6 +2165,9 @@ def cli_dismiss_window(*, window_id: str, action: str = "enter") -> int:
         action=action,
         profile=_get_cli_profile(),
     )
+    if _CLI_JSON_ENVELOPE[0]:
+        print(json.dumps(results, ensure_ascii=False))
+        return 0 if results and not any("error" in r or r.get("still_mapped") for r in results) else 1
     if not results:
         print("No result returned.")
         return 1
@@ -2366,8 +2506,11 @@ def cli_windows() -> int:
         _parse_skill_str_list,
     )
 
-    client = VirtuosoClient.from_env()
+    client = VirtuosoClient.from_env(profile=_get_cli_profile())
     windows = client.list_windows()
+    if _CLI_JSON_ENVELOPE[0]:
+        print(json.dumps(windows, ensure_ascii=False, default=str))
+        return 0
     if not windows:
         print("No windows found.")
         return 1
@@ -2441,7 +2584,7 @@ def cli_snapshot() -> int:
     from virtuoso_bridge.virtuoso import snapshot as poly_snapshot
     from virtuoso_bridge.virtuoso.snapshot import classify_window
 
-    client = VirtuosoClient.from_env()
+    client = VirtuosoClient.from_env(profile=_get_cli_profile())
     opts = _SNAPSHOT_OPTS
 
     # Focused window title — decode SKILL octal escapes (e.g. \256 -> ®).
@@ -2597,6 +2740,12 @@ def cli_screenshot() -> int:
     return 0
 
 
+def cli_recovery(args) -> int:
+    _load_cli_env()
+    from virtuoso_bridge.recovery_cli import command
+    return command(args, _get_cli_profile())
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="virtuoso-bridge")
     parser.add_argument(
@@ -2605,6 +2754,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit one stable machine-readable command envelope",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    recovery = subparsers.add_parser("recovery", help="Inspect and execute authorized bounded recovery")
+    recovery.add_argument("recovery_action", choices=["policy", "inspect", "run", "watch", "stop", "worker", "resolve"])
+    recovery.add_argument("policy_action", nargs="?", choices=["status", "grant", "revoke"])
+    recovery.add_argument("--workspace", required=True)
+    recovery.add_argument("-p", "--profile", required=True)
+    recovery.add_argument("--env")
+    recovery.add_argument("--actions", default="")
+    recovery.add_argument("--reason", default="")
+    recovery.add_argument("--hours", type=float, default=8)
+    recovery.add_argument("--timeout", type=_positive_finite_timeout, default=60)
+    recovery.add_argument("--interval", type=_positive_finite_timeout, default=10)
+    recovery.add_argument("--action", choices=["auto", "connect", "daemon_restart", "daemon_relaunch"], default="auto")
+    recovery.add_argument("--automatic", action="store_true")
+    recovery.add_argument("--watch-token", default="")
+    recovery.add_argument("--recovery-id", default="")
+    recovery.add_argument("--expected-epoch", default="")
+    recovery.add_argument("--acknowledge-unknown", action="store_true")
     sp_init = subparsers.add_parser("init", help="Create a starter .env")
     sp_init.add_argument(
         "remote", nargs="?", default=None,
@@ -2621,6 +2787,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     for name, hlp in [
         ("start", "Start SSH tunnel + deploy daemon"),
+        ("connect", "Restore transport without deploying or activating resources"),
+        ("session-status", "Inspect an explicitly pinned idle session"),
         ("stop", "Stop the SSH tunnel"),
         ("restart", "Stage/reuse the tunnel and perform one guarded daemon restart"),
         ("status", "Check tunnel + daemon status"),
@@ -2634,6 +2802,11 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "start":
             sp.add_argument("--bind-venv", action="store_true",
                             help="Bind the active virtualenv to this -p profile before starting")
+        if name == "connect":
+            sp.add_argument("--timeout", type=_positive_finite_timeout, default=15.0)
+        if name == "session-status":
+            sp.add_argument("--timeout", type=_positive_finite_timeout, default=15.0)
+            sp.add_argument("--expected-epoch", required=True)
         if name in {"start", "restart"}:
             sp.add_argument(
                 "--allow-remote-bind",
@@ -2736,10 +2909,9 @@ def build_parser() -> argparse.ArgumentParser:
         "load",
         help="Execute a SKILL .il file in the running Virtuoso session",
         description=(
-            "Equivalent to typing `load(\"<file>\")` in the CIW.  SKILL\n"
-            "reads the original file, so any error keeps the original\n"
-            "file path + line number (no temp-wrapper pollution).  In\n"
-            "SSH mode the file is uploaded automatically.\n\n"
+            "Loads a fixed content snapshot with unchanged source line numbers.\n"
+            "metadata.script_load contains its SHA256, source mapping and receipt.\n"
+            "Nested loads and external redefinitions are not attested.\n\n"
             "Output: full VirtuosoResult as JSON on stdout (status,\n"
             "output, errors, warnings, execution_time, metadata).\n\n"
             "VSCode .vscode/tasks.json snippet:\n"
@@ -2749,6 +2921,13 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sp_load.add_argument("file", help="Path to the .il file to execute")
+    sp_load.add_argument("--expected-sha256", default=None, help="Refuse if the captured source differs from this SHA256")
+    sp_load.add_argument("--expected-context", default=None, help="JSON context file checked in the load request")
+    sp_load.add_argument("--lib", default=None, help="Explicit database target library")
+    sp_load.add_argument("--cell", default=None, help="Explicit database target cell")
+    sp_load.add_argument("--view", default="layout")
+    sp_load.add_argument("--save", action="store_true", help="Save only the verified bound target")
+    sp_load.add_argument("--require-window", action="store_true", help="Require the edit window to match the target")
     sp_load.add_argument("-p", "--profile", default=None,
                          help="Connection profile (reads VB_*_<profile> env vars)")
     sp_load.add_argument("--env", default=None,
@@ -2797,6 +2976,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_eval.add_argument("--quiet", action="store_true",
                          help="Suppress JSON output; only the exit code is reported")
+    sp_eval.add_argument("--expected-context", default=None, help="JSON context file checked before execution")
+
+    for name in ("context", "loaded-scripts"):
+        sp = subparsers.add_parser(name, help="Read editor context or managed script load receipts as JSON")
+        sp.add_argument("-p", "--profile", default=None)
+        sp.add_argument("--env", default=None)
+        sp.add_argument("--timeout", type=_positive_finite_timeout, default=15)
+        sp.add_argument("--output", default=None, help="Also write UTF-8 JSON to this file")
+        if name == "context":
+            sp.add_argument("--limit", type=int, default=50, help="Maximum selection summaries (0-500)")
 
     sp_dismiss = subparsers.add_parser(
         "dismiss-dialog", help="Find and dismiss blocking Virtuoso GUI dialogs")
@@ -3073,6 +3262,11 @@ def main(argv: list[str] | None = None) -> int:
     _make_stdio_safe()
     parser = build_parser()
     args = parser.parse_args(argv)
+    _CLI_JSON_ENVELOPE[0] = bool(getattr(args, "json_envelope", False))
+    if _CLI_JSON_ENVELOPE[0] and hasattr(args, "json"):
+        args.json = True
+    if _CLI_JSON_ENVELOPE[0] and hasattr(args, "quiet"):
+        args.quiet = False
     _CLI_PROFILE[0] = None
     set_runtime_env_file(getattr(args, "env", None))
     if getattr(args, "bind_venv", False):
@@ -3090,6 +3284,7 @@ def main(argv: list[str] | None = None) -> int:
         _CLI_PROFILE[0] = profile
     _CLI_ALLOW_REMOTE_BIND[0] = getattr(args, "allow_remote_bind", None)
     dispatch = {
+        "recovery": lambda: cli_recovery(args),
         "init": lambda: cli_init(
             remote=getattr(args, "remote", None),
             jump=getattr(args, "jump", None),
@@ -3100,6 +3295,8 @@ def main(argv: list[str] | None = None) -> int:
             profile=getattr(args, "profile", None),
         ),
         "start": cli_start,
+        "connect": lambda: cli_connect(timeout=getattr(args, "timeout", 15.0)),
+        "session-status": lambda: cli_session_status(expected_epoch=args.expected_epoch, timeout=args.timeout),
         "stop": cli_stop,
         "restart": lambda: cli_restart(timeout=getattr(args, "timeout", 30.0)),
         "autoload": lambda: cli_autoload(
@@ -3136,6 +3333,10 @@ def main(argv: list[str] | None = None) -> int:
             file=getattr(args, "file"),
             timeout=getattr(args, "timeout", 60),
             quiet=getattr(args, "quiet", False),
+            expected_sha256=getattr(args, "expected_sha256", None),
+            expected_context=getattr(args, "expected_context", None),
+            lib=getattr(args, "lib", None), cell=getattr(args, "cell", None), view=getattr(args, "view", "layout"),
+            save=getattr(args, "save", False), require_window=getattr(args, "require_window", False),
         ),
         "eval": lambda: cli_eval(
             skill=getattr(args, "skill", None),
@@ -3143,7 +3344,10 @@ def main(argv: list[str] | None = None) -> int:
             timeout=getattr(args, "timeout", 60),
             quiet=getattr(args, "quiet", False),
             operation_class=getattr(args, "operation_class", OperationClass.UNKNOWN),
+            expected_context=getattr(args, "expected_context", None),
         ),
+        "context": lambda: cli_development("context", timeout=args.timeout, limit=args.limit, output=args.output),
+        "loaded-scripts": lambda: cli_development("loaded-scripts", timeout=args.timeout, output=args.output),
         "screen": lambda: cli_screen(getattr(args, "output", None), getattr(args, "display", None), getattr(args, "window_id", None)),
         "dismiss-dialog": cli_dismiss_dialog,
         "list-windows": lambda: cli_list_windows(
@@ -3242,15 +3446,38 @@ def main(argv: list[str] | None = None) -> int:
     error_items: list[str] = []
     if caught is not None:
         error_items.append(str(caught))
-    if exit_code and stderr_text:
-        error_items.append(stderr_text)
-    data: object = parsed if parsed is not None else {"stdout": stdout_text}
+    structured_commands = {
+        "connect", "status", "deployment-status", "session-status", "list-windows", "windows",
+        "window-input", "dismiss-dialog", "dismiss-window", "request-status", "request-await",
+        "request-reconcile", "eval", "load", "autoload", "recovery",
+    }
+    if parsed is None and not exit_code and args.command in structured_commands:
+        exit_code = 1
+        error_items.append("Command did not produce the required structured result")
+    data: object = parsed if parsed is not None else {"action": args.command, "completed": exit_code == 0}
+    if parsed is None and stdout_text:
+        print(stdout_text, file=sys.stderr)
+    if stderr_text:
+        print(stderr_text, file=sys.stderr)
     request_id = None
     if isinstance(parsed, dict):
         request_id = parsed.get("request_id")
         if request_id is None and isinstance(parsed.get("request"), dict):
             request_id = parsed["request"].get("request_id")
     status = "success" if exit_code == 0 else "error"
+    if isinstance(parsed, dict):
+        if parsed.get("recovery_state") == "unknown":
+            status = "unknown"
+        if parsed.get("completion") == "timed_out_unknown":
+            status = "unknown"
+        elif (args.command == "deployment-status" and parsed.get("staged_update_pending")
+              and parsed.get("running_available") and parsed.get("running_heartbeat_fresh")
+              and not parsed.get("actual_digest_error")):
+            status, exit_code = "pending", 0
+        if exit_code and not error_items:
+            error_items.extend(str(item) for item in parsed.get("errors", []))
+    if exit_code and not error_items:
+        error_items.append(stderr_text or stdout_text or f"{args.command} failed")
     envelope = {
         "schema_version": 1,
         "command": args.command,
@@ -3263,15 +3490,17 @@ def main(argv: list[str] | None = None) -> int:
         "ended_utc": ended.isoformat(),
         "data": data,
         "errors": error_items,
-        "warnings": [stderr_text] if stderr_text and not exit_code else [],
+        "warnings": parsed.get("warnings", []) if isinstance(parsed, dict) else [],
         "evidence": [],
     }
     print(json.dumps(envelope, ensure_ascii=False, default=str))
+    _CLI_JSON_ENVELOPE[0] = False
     return exit_code
 
 
 # Global profile for CLI commands (avoids changing all function signatures)
 _CLI_PROFILE: list[str | None] = [None]
+_CLI_JSON_ENVELOPE = [False]
 _CLI_ALLOW_REMOTE_BIND: list[bool | None] = [None]
 _SCREENSHOT_OUTPUT: list[str | None] = [None]
 

@@ -47,6 +47,7 @@ class LayoutEditor:
         self.mode = mode
         self.timeout = timeout
         self.commands: list[str] = []
+        self._close_requested = False
 
     def __enter__(self) -> LayoutEditor:
         if self.mode == "w":
@@ -65,11 +66,13 @@ class LayoutEditor:
         self.commands.append(skill_cmd)
 
     def close(self) -> None:
-        """Append a close-cellview operation."""
-        self.commands.append(close_current_cellview())
+        """Close the owned target after its final save succeeds."""
+        self._close_requested = True
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if exc_type is None:
-            self.commands.append(save_current_cellview())
+            self.commands.append(save_current_cellview(target={"lib": self.lib, "cell": self.cell, "view": self.view}))
+            if self._close_requested:
+                self.commands.extend([close_current_cellview(), "t"])
             response = self.client.execute_operations(self.commands, timeout=self.timeout)
             ensure_operation_response(response, context="layout edit")

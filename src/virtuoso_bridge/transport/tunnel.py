@@ -41,6 +41,7 @@ from virtuoso_bridge.transport.ssh import (
     CommandResult,
     SSHRunner,
     _TimeoutBudget,
+    _process_is_alive,
     ssh_backend_env_from_os,
     ssh_proxy_url_from_os,
 )
@@ -650,6 +651,22 @@ def _find_ramic_bridge_daemon(python_major: int) -> Path:
 
 
 
+def _parse_daemon_identity(text: str) -> dict[str, str]:
+    identity: dict[str, str] = {}
+    allowed = {"host", "ip", "pid", "bind", "epoch", "profile",
+               "deployment_id", "il_sha256", "identity_complete"}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in allowed:
+            if key in identity:
+                return {}
+            identity[key] = value.strip()
+    # Keep legacy host diagnostics, but incomplete files cannot prove a load.
+    if not text.endswith("identity_complete=1\n"):
+        identity.pop("identity_complete", None)
+    return identity
+
+
 def _generate_virtuoso_setup_il(
     daemon_path: str,
     il_path: str,
@@ -661,6 +678,8 @@ def _generate_virtuoso_setup_il(
     request_state_path: str = "",
     allow_remote_bind: bool = False,
     profile: str | None = None,
+    deployment_id: str = "",
+    il_sha256: str = "",
 ) -> str:
     identity_line = (
         f'setShellEnvVar("RB_IDENTITY_PATH" "{identity_path}")\n'
@@ -679,6 +698,8 @@ def _generate_virtuoso_setup_il(
         f'setShellEnvVar("RB_AUTH_TOKEN_FILE" "{auth_token_path}")\n'
         f'setShellEnvVar("RB_REQUEST_STATE_FILE" "{request_state_path}")\n'
         f'setShellEnvVar("RB_PROFILE" "{profile or ""}")\n'
+        f'setShellEnvVar("RB_DEPLOYMENT_ID" "{deployment_id}")\n'
+        f'setShellEnvVar("RB_IL_SHA256" "{il_sha256}")\n'
         f'setShellEnvVar("RB_LOCAL_ONLY" "{"nil" if allow_remote_bind else "t"}")\n'
         f'setShellEnvVar("RB_BIND_HOST" "{"0.0.0.0" if allow_remote_bind else "127.0.0.1"}")\n'
         f"{identity_line}"
@@ -1054,6 +1075,12 @@ class SSHClient:
             raise RuntimeError("Deployment SSH runner is unavailable in local mode")
         return runner
 
+    def _require_gui_runner(self) -> SSHRunner:
+        runner = self.gui_runner
+        if runner is None:
+            raise RuntimeError("GUI SSH runner is unavailable in local mode")
+        return runner
+
     @property
     def remote_work_dir(self) -> str | None:
         return self._remote_work_dir
@@ -1257,6 +1284,8 @@ class SSHClient:
             python_cmd,
             port=self._port,
             identity_path=remote_identity,
+            deployment_id=deployment_id,
+            il_sha256=il_sha256,
             auth_token_path=remote_token,
             request_state_path=remote_request_state,
             allow_remote_bind=self._allow_remote_bind,
@@ -1416,6 +1445,8 @@ class SSHClient:
             python_cmd,
             port=self._port,
             identity_path=str(local_identity),
+            deployment_id=deployment_id,
+            il_sha256=il_sha256,
             auth_token_path=str(local_token),
             request_state_path=str(local_request_state),
             allow_remote_bind=self._allow_remote_bind,
@@ -1463,7 +1494,7 @@ class SSHClient:
         ``retry_transport_errors=False`` for the same fail-closed semantics as
         file uploads and atomic replacement.
         """
-        runner = self._require_runner()
+        runner = self._require_gui_runner()
         setup_literal = shlex.quote(str(expected_setup_path or ""))
         command = (
             'p="$HOME/.cdsinit"; '
@@ -1636,7 +1667,7 @@ class SSHClient:
             rendered, _ = _autoload_render_install(text, self._profile, str(expected))
         else:
             rendered, _ = _autoload_render_uninstall(text, self._profile)
-        runner = self._require_runner()
+        runner = self._require_gui_runner()
         profile_key = _autoload_profile_key(self._profile)
         nonce = f"{os.getpid()}.{time.time_ns()}"
         target_path = str(snapshot.get("path") or "")
@@ -1810,7 +1841,7 @@ class SSHClient:
     ) -> dict[str, Any]:
         """Return .cdsinit autoload state without staging or token creation."""
         expected = expected_setup_path or self._compat_setup_path
-        if _is_localhost(self._remote_host):
+        if _is_localhost(self._gui_host):
             snapshot = _local_autoload_snapshot(self._profile, expected)
         else:
             snapshot = self._remote_cdsinit_snapshot(expected, timeout=timeout)
@@ -1828,7 +1859,7 @@ class SSHClient:
         expected = expected_setup_path or self._compat_setup_path
         if not expected:
             raise RuntimeError("No compatible bridge setup path is staged")
-        if _is_localhost(self._remote_host):
+        if _is_localhost(self._gui_host):
             path = _local_cdsinit_path(self._profile)
             with _local_autoload_lock(path):
                 snapshot = _local_autoload_snapshot(self._profile, expected)
@@ -1877,7 +1908,7 @@ class SSHClient:
     ) -> dict[str, Any]:
         """Remove only this profile's managed block, never touching CIW."""
         expected = self._compat_setup_path
-        if _is_localhost(self._remote_host):
+        if _is_localhost(self._gui_host):
             path = _local_cdsinit_path(self._profile)
             with _local_autoload_lock(path):
                 snapshot = _local_autoload_snapshot(self._profile, expected)
@@ -2001,7 +2032,7 @@ class SSHClient:
                 # Tunnel running
                 if local_port != self._local_port:
                     logger.info("Local port %d was busy, using port %d", self._local_port, local_port)
-                    print(f"[port] {self._local_port} busy, auto-switched to {local_port}", flush=True)
+                    print(f"[port] {self._local_port} busy, auto-switched to {local_port}", file=sys.stderr, flush=True)
                     self._local_port = local_port
                     _update_env_file(_profiled_env_key("VB_LOCAL_PORT", self._profile), str(local_port))
                 logger.info(
@@ -2021,6 +2052,24 @@ class SSHClient:
         raise RuntimeError(f"No free local port found after {max_attempts} attempts ({self._local_port}-{local_port - 1})")
 
     # -- high-level lifecycle -----------------------------------------------
+
+    def connect(self, timeout: float = 15.0) -> dict[str, Any]:
+        """Restore transport from saved deployment state without staging files."""
+        state = self.read_state(self._profile)
+        if not state or not self.staged_profile_config_matches_current(self._profile):
+            raise RuntimeError("No matching prepared Bridge state; run explicit start first")
+        if not self._auth_token:
+            raise RuntimeError("Prepared Bridge authentication is unavailable; run explicit start")
+        if not _is_localhost(self._daemon_host):
+            self.ensure_tunnel(_budget=_TimeoutBudget.start(timeout, self._timeout))
+            # Preserve the staged resource identity when only transport changes.
+            if self.read_state(self._profile) != state:
+                raise RuntimeError("Bridge state changed during connect; state was not overwritten")
+            state["port"] = self._local_port
+            state["tunnel_pid"] = self._require_runner().tunnel_pid
+            state["profile_config"] = dict(state.get("profile_config") or {}, local_port=self._local_port)
+            _atomic_write_json(_state_file(self._profile), state)
+        return {"connected": True, "port": state.get("port"), "deployment_changed": False}
 
     def warm(self, timeout: int = 15) -> None:
         """Full startup: remote setup + persistent shell + tunnel."""
@@ -2102,7 +2151,7 @@ class SSHClient:
         )
         return next((line.strip() for line in result.stdout.splitlines() if line.strip()), "")
 
-    def read_daemon_identity(self) -> dict[str, str]:
+    def read_daemon_identity(self, *, timeout: float | None = None) -> dict[str, str]:
         """Read the banner identity written by the CIW-side loader.
 
         This path remains usable when the TCP tunnel targets the wrong host,
@@ -2122,17 +2171,12 @@ class SSHClient:
         else:
             result = self._require_deployment_runner().run_command(
                 f"test -r {shlex.quote(identity_path)} && cat {shlex.quote(identity_path)}",
-                timeout=min(self._timeout, 10),
+                timeout=min(self._timeout, 10) if timeout is None else timeout,
             )
             if result.returncode != 0:
                 return {}
             text = result.stdout
-        identity: dict[str, str] = {}
-        for line in text.splitlines():
-            key, separator, value = line.partition("=")
-            if separator and key in {"host", "ip", "pid", "bind"}:
-                identity[key] = value.strip()
-        return identity
+        return _parse_daemon_identity(text)
 
     # -- state file ---------------------------------------------------------
 
@@ -2517,6 +2561,42 @@ class SSHClient:
         )
         deployed_sha256 = str(state.get("deployed_daemon_sha256") or "")
         deployed_path = str(state.get("deployed_daemon_path") or "")
+        identity: dict[str, str] = {}
+        identity_error: str | None = None
+        identity_path = str(state.get("identity_path") or "")
+        saved_roles = state.get("profile_config") or {}
+        deploy_host = saved_roles.get("deploy_host") if isinstance(saved_roles, dict) else None
+        identity_is_local = _is_localhost(deploy_host) if deploy_host else state.get("mode") == "local"
+        try:
+            if identity_path and identity_is_local:
+                identity = _parse_daemon_identity(Path(identity_path).read_text(encoding="utf-8"))
+            elif identity_path:
+                identity_client = cls.from_env(
+                    keep_remote_files=True, profile=profile, create_auth_token=False,
+                )
+                try:
+                    identity = identity_client.read_daemon_identity(timeout=timeout)
+                finally:
+                    identity_client.close()
+        except Exception as exc:  # noqa: BLE001
+            identity_error = str(exc)
+        running_identity_verified = bool(
+            running
+            and identity.get("identity_complete") == "1"
+            and identity.get("epoch")
+            and identity.get("epoch") == running.get("daemon_epoch")
+            and identity.get("pid", "").isdigit()
+            and identity.get("pid") == str(running.get("daemon_pid"))
+            and identity.get("profile") == (profile or "")
+            and re.fullmatch(r"[0-9a-f]{64}", identity.get("deployment_id", ""))
+            and re.fullmatch(r"[0-9a-f]{64}", identity.get("il_sha256", ""))
+        )
+        daemon_matches_running = bool(deployed_sha256 and running_sha256 == deployed_sha256)
+        deployed_matches_running = bool(
+            daemon_matches_running and running_identity_verified
+            and identity.get("deployment_id") == state.get("deployment_id")
+            and identity.get("il_sha256") == state.get("deployed_il_sha256")
+        )
         actual_deployed_sha256 = ""
         actual_digest_error: str | None = None
         if deployed_path:
@@ -2585,6 +2665,13 @@ class SSHClient:
             "deployed_il_sha256": state.get("deployed_il_sha256"),
             "deployed_setup_sha256": state.get("deployed_setup_sha256"),
             "running_daemon_sha256": running_sha256 or None,
+            "running_identity_verified": running_identity_verified,
+            "running_identity_error": identity_error or (
+                None if running_identity_verified else "loaded identity missing, incomplete, or mismatched"
+            ),
+            "running_deployment_id": identity.get("deployment_id") if running_identity_verified else None,
+            "running_il_sha256": identity.get("il_sha256") if running_identity_verified else None,
+            "deployed_daemon_matches_running": daemon_matches_running,
             "running_daemon_epoch": running.get("daemon_epoch") if running else None,
             "running_heartbeat_age_seconds": heartbeat_age_seconds,
             "running_protocol_versions": running.get("protocol_versions") if running else None,
@@ -2595,17 +2682,15 @@ class SSHClient:
                 and actual_deployed_sha256 == deployed_sha256
                 and local_il_matches_deployed
             ),
-            "deployed_matches_running": bool(
-                deployed_sha256 and running_sha256 == deployed_sha256
-            ),
+            "deployed_matches_running": deployed_matches_running,
             "running_available": running is not None,
             "running_heartbeat_fresh": bool(
                 heartbeat_age_seconds is not None and heartbeat_age_seconds <= 5.0
             ),
             "staged_update_pending": bool(
                 state.get("deployed_daemon_sha256")
-                and local_daemon_sha256
-                and (state.get("deployed_daemon_sha256") != local_daemon_sha256
+                and (not deployed_matches_running
+                     or deployed_sha256 != local_daemon_sha256
                      or not local_il_matches_deployed)
             ),
         }
@@ -2645,13 +2730,9 @@ class SSHClient:
                 return True
             except (ConnectionRefusedError, OSError):
                 pass
-        # Fallback: is the process alive? (os.kill(pid, 0) on Unix)
+        # Query the saved process without sending Windows console events.
         if pid:
-            try:
-                os.kill(pid, 0)
-                return True
-            except (OSError, PermissionError):
-                pass
+            return _process_is_alive(pid)
         return False
 
     # -- file transfer (delegated to SSHRunner) -----------------------------

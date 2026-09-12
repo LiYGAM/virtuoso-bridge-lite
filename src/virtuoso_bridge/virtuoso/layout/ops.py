@@ -450,21 +450,62 @@ def layout_delete_shapes_on_layer(
 
 def layout_clear_routing(
     *,
+    lib: str,
+    cell: str,
+    lpps: Iterable[tuple[str, str]],
     view: str = "layout",
-    view_type: str | None = None,
-    mode: str = "a",
+    types: Iterable[str] = ("path", "pathSeg"),
+    nets: Iterable[str] = (),
+    selected_only: bool = True,
+    apply: bool = False,
+    save: bool = False,
+    expected_context: dict | None = None,
 ) -> str:
-    """Build SKILL to delete all shapes from the open layout and save it."""
-    cv_expr = _layout_get_edit_cv_expr(view=view, view_type=view_type, mode=mode)
-    return (
-        "prog((cv count) "
-        f"cv = {cv_expr} "
-        'unless(cv return("ERROR: no layout window open")) '
-        "count = length(cv~>shapes) "
-        "foreach(shape cv~>shapes dbDeleteObject(shape)) "
-        "dbSave(cv) "
-        'return(sprintf(nil "deleted %d shape(s) from %s/%s (instances preserved)" count cv~>libName cv~>cellName)))'
-    )
+    """Preview/delete explicitly filtered, non-pin routing; never infer a window."""
+    from virtuoso_bridge.virtuoso.development import skill_string
+    pairs = list(lpps)
+    kinds = list(types)
+    if not pairs or any(len(pair) != 2 or not all(isinstance(s, str) and s for s in pair) for pair in pairs):
+        raise ValueError("Routing cleanup requires explicit layer-purpose pairs")
+    if not kinds or not set(kinds) <= {"path", "pathSeg", "rect", "polygon"}:
+        raise ValueError("Routing types must be path, pathSeg, rect or polygon")
+    pair_expr = "list(" + " ".join("list(" + " ".join(map(skill_string, pair)) + ")" for pair in pairs) + ")"
+    kind_expr = "list(" + " ".join(map(skill_string, kinds)) + ")"
+    net_names = list(nets)
+    net_expr = "list(" + " ".join(map(skill_string, net_names)) + ")"
+    predicate = f"member(shape~>objType {kind_expr}) && member(shape~>lpp {pair_expr}) && !shape~>pin"
+    if net_names:
+        predicate += f" && shape~>net && member(shape~>net~>name {net_expr})"
+    return _clear_shapes(lib, cell, view, predicate, selected_only, apply, save, expected_context,
+                         f'foreach(pair {pair_expr} unless(techGetLP(techGetTechFile(cv) pair) error("invalid-routing-lpp\\n")))')
+
+
+def layout_clear_all_shapes(*, lib: str, cell: str, view: str = "layout", apply: bool = False,
+                            save: bool = False, confirm_all: bool = False, expected_context: dict | None = None) -> str:
+    """Preview all shapes; deletion requires explicit scope acknowledgement."""
+    if apply and not confirm_all:
+        raise ValueError("All-shape deletion requires confirm_all=True")
+    return _clear_shapes(lib, cell, view, "t", False, apply, save, expected_context)
+
+
+def _clear_shapes(lib, cell, view, predicate, selected_only, apply, save, expected_context, validate=""):
+    from virtuoso_bridge.virtuoso.development import target_matches, guard_context
+    if save and not apply:
+        raise ValueError("A preview cannot save")
+    if apply and expected_context is None:
+        raise ValueError("Apply requires a complete expected_context snapshot")
+    match = target_matches("cv", {"lib": lib, "cell": cell, "view": view})
+    source = "geGetSelSet()" if selected_only else "cv~>shapes"
+    action = "foreach(shape candidates dbDeleteObject(shape))" if apply else ""
+    saved = 'unless(dbSave(cv) error("cleanup-save-failed\\n"))' if save else ""
+    writable = 'when(cv~>mode == "r" error("cleanup-target-read-only\\n"))' if apply else ""
+    command = f'''let((cv candidates count)
+      cv=geGetEditCellView() unless({match} error("cleanup-target-mismatch\\n"))
+      {writable} {validate}
+      candidates=setof(shape {source} equal(shape~>cellView cv) && ({predicate}))
+      count=length(candidates) {action} {saved}
+      list("{'deleted' if apply else 'preview'}" count cv~>libName cv~>cellName cv~>viewName))'''
+    return guard_context(command, expected_context) if expected_context is not None else command
 
 def layout_delete_cell(lib: str, cell: str) -> str:
     """Build SKILL to close layout windows and delete the target cell."""

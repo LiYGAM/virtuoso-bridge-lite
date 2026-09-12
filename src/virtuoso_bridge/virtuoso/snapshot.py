@@ -6,10 +6,8 @@ reader.  Each backend returns a JSON-serializable dict; this wrapper
 adds an outer envelope with the kind tag and window title so consumers
 can branch on ``result["kind"]``.
 
-Currently only the ``maestro`` backend is wired through to a real
-aggregator (:func:`virtuoso_bridge.virtuoso.maestro.snapshot`).  The
-others classify correctly but return ``supported=False`` until their
-own aggregators land — extending the dispatch is one elif away.
+Maestro uses its domain aggregator. Layout and schematic use the bounded
+editor context reader; unsupported window kinds return supported=False.
 """
 
 from __future__ import annotations
@@ -68,8 +66,10 @@ def classify_window(title: str) -> str:
 def _focused_window_title(client: VirtuosoClient) -> str:
     """One SKILL call → focused window title (or ``""`` if no focus)."""
     r = client.execute_skill(
-        'let((cw) cw = hiGetCurrentWindow() if(cw hiGetWindowName(cw) ""))'
+        'let((cw) cw = hiGetCurrentWindow() if(cw hiGetWindowName(cw) ""))', operation_class="read_only"
     )
+    if r.status.value != "success" or r.completion.value != "confirmed":
+        raise RuntimeError("Focused window query was not confirmed")
     raw = (r.output or "").strip()
     return raw.strip('"') if raw and raw != "nil" else ""
 
@@ -115,8 +115,8 @@ def snapshot(client: VirtuosoClient, *,
         out["data"] = _maestro_snapshot(client, **kwargs)
         out["supported"] = True
 
-    # Other kinds: stub for now.  Schematic / layout aggregators are next
-    # on the roadmap — drop in a `from .schematic import snapshot` etc.
-    # here when they exist.
+    elif detected_kind in {"layout", "schematic"}:
+        out["data"] = client.editor_context(**kwargs)
+        out["supported"] = True
 
     return out

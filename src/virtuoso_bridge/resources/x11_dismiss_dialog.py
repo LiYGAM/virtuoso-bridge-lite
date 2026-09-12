@@ -738,7 +738,24 @@ def _apply_x11_env(x11_env):
     xauth = x11_env.get("XAUTHORITY")
     if isinstance(xauth, string_types) and xauth:
         os.environ["XAUTHORITY"] = xauth
+    else:
+        os.environ.pop("XAUTHORITY", None)
     return display
+
+
+def _unique_window_env(x11_envs, requested_id):
+    """Resolve an XID before any input; XIDs are only unique within a display."""
+    matches = []
+    for x11_env in x11_envs:
+        active_display = _apply_x11_env(x11_env)
+        if any(requested_id in (w.get("frame_id"), w.get("window_id"), w.get("dismiss_id"))
+               for w in discover_windows(active_display)):
+            matches.append(x11_env)
+    if not matches:
+        raise ValueError("window id not found on any Virtuoso display")
+    if len(matches) != 1:
+        raise ValueError("window id found on more than one display; select an explicit DISPLAY")
+    return _apply_x11_env(matches[0])
 
 
 def _verify_dismissal(result):
@@ -1255,39 +1272,31 @@ def main():
                 raise ValueError("--allow-live is required")
             if input_x is None or input_y is None:
                 raise ValueError("--window-input requires --x and --y")
+            active_display = _unique_window_env(x11_envs, input_target)
             result = window_input(
-                display, input_target, expect_title, action, input_x, input_y,
+                active_display, input_target, expect_title, action, input_x, input_y,
                 input_button, input_to_x, input_to_y, dry_run, settle_ms,
                 hold_ms, drag_duration_ms, drag_steps, postcondition,
                 post_expect_title,
             )
+            result["display"] = active_display
         except ValueError as exc:
             result = {"error": str(exc), "window_id": input_target}
         print(json.dumps(result))
         sys.exit(1 if "error" in result else 0)
 
     if dismiss_target:
-        matches = []
-        for x11_env in x11_envs:
-            active_display = _apply_x11_env(x11_env)
+        try:
+            active_display = _unique_window_env(x11_envs, dismiss_target)
             resolved_target = _resolve_dismiss_target(active_display, dismiss_target)
-            if resolved_target != dismiss_target or any(
-                dismiss_target in (w.get("frame_id"), w.get("window_id"), w.get("dismiss_id"))
-                for w in discover_windows(active_display)
-            ):
-                matches.append((active_display, resolved_target))
-        if not matches:
-            print(json.dumps({"error": "window id not found on any Virtuoso display", "window_id": dismiss_target}))
-            sys.exit(1)
-        failed = False
-        for active_display, resolved_target in matches:
             result = dismiss_window(active_display, resolved_target, action=action)
             result["display"] = active_display
             result["requested_window_id"] = dismiss_target
-            verified = _verify_dismissal(result)
-            print(json.dumps(verified))
-            failed = failed or "error" in verified or verified.get("still_mapped", False)
-        sys.exit(1 if failed else 0)
+            result = _verify_dismissal(result)
+        except ValueError as exc:
+            result = {"error": str(exc), "window_id": dismiss_target}
+        print(json.dumps(result))
+        sys.exit(1 if "error" in result or result.get("still_mapped", False) else 0)
 
     if bootstrap_target:
         if not setup_path:

@@ -275,7 +275,7 @@ All commands take `-p PROFILE` / `--env PATH` to pick a non-default config; run 
 | `dismiss-window WINDOW_ID [--action enter\|escape\|alt-y\|alt-n]` | X11 path: send an explicit action to one window ID returned by `list-windows` |
 | `window-input WINDOW_ID --expect-title TEXT --action move\|click\|drag --x X --y Y --allow-live` | X11 path: send one bounds-checked pointer action to an explicitly confirmed current child window |
 | `request-status [REQUEST_ID]` | Read the daemon's request ledger over SSH/local filesystem without using the CIW request channel |
-| `deployment-status` | Compare packaged, staged, and running daemon SHA/protocol/capability identity |
+| `deployment-status` | Compare packaged, staged, and running daemon/SKILL identity; see [activation status](READMEs/README.zh-CN.md#部署和窗口操作的状态判断) |
 | `snapshot [-o DIR] [--history H]` | Dump the focused Virtuoso window (maestro/schematic/...) — brief by default, full disk dump with `-o` |
 | **Export** | |
 | `export-visio LIB CELL -o OUT.vsdx` | Render a Virtuoso schematic to Microsoft Visio (Windows + pywin32) |
@@ -498,3 +498,8 @@ If you use virtuoso-bridge in academic work, please cite:
 - **Xintian Li** — Tsinghua University
 - **Nan Sun** — Tsinghua University
 - **Lu Jie** — Tsinghua University
+# 授权自动恢复
+
+新增 `recovery policy/inspect/run/watch/stop/resolve`，按动作和会话授权恢复。
+默认仅连接和精确证明恢复；daemon 重建及后台监控需要显式启用。
+参阅[中文操作说明](docs/recovery.md)。

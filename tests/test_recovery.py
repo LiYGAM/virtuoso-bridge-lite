@@ -53,6 +53,16 @@ def subject(tmp_path):
     return RecoveryEngine(store, backend), store, backend
 
 
+@pytest.fixture
+def recovery_clock(monkeypatch):
+    # Advance only on recovery waits, so filesystem latency cannot preempt dispatch.
+    now = [1000.0]
+    def sleep(seconds):
+        now[0] += seconds
+    monkeypatch.setattr("virtuoso_bridge.recovery.time", SimpleNamespace(
+        time=lambda: now[0], monotonic=lambda: now[0], sleep=sleep))
+
+
 def quarantine(store, *, operation="read_only", expired=False):
     q = {"schemaVersion": 3, "proofAnchor": {"complete": True, "requestId": "original",
          "requestDigestSha256": "a" * 64, "operationClass": operation, "daemonEpoch": "epoch-proof",
@@ -173,7 +183,7 @@ def test_lifecycle_intent_is_observed_once_and_authority_follows_proven_epoch(su
     assert engine.policy()["identity"]["epoch"] == "new"
 
 
-def test_lost_lifecycle_reply_is_not_replayed(subject):
+def test_lost_lifecycle_reply_is_not_replayed(subject, recovery_clock):
     engine, store, backend = subject
     engine.grant(["daemon_restart"], "one bounded restart")
     backend.complete = False
@@ -186,11 +196,13 @@ def test_lost_lifecycle_reply_is_not_replayed(subject):
     assert len(store.read("failures.json")) == 1
 
 
-def test_stale_intent_can_be_verified_without_replay(subject):
+def test_stale_intent_can_be_verified_without_replay(subject, recovery_clock):
     engine, store, backend = subject
     engine.grant(["daemon_restart"], "fixture")
     backend.complete = False
     first = engine.run(timeout=0.02, action="daemon_restart")
+    assert first["recovery_state"] == "unknown"
+    assert backend.calls.count("daemon_restart") == 1
     backend.complete = True
     result = engine.run(timeout=1)
     assert result["recovery_state"] == "recovered"
@@ -235,7 +247,7 @@ def test_revocation_tombstone_survives_stale_policy_writer(subject):
     assert "daemon_restart" not in backend.calls
 
 
-def test_null_filtered_request_is_pending_not_crash(subject):
+def test_null_filtered_request_is_pending_not_crash(subject, recovery_clock):
     engine, store, backend = subject
     quarantine(store)
     backend.ledger_result = {"request": None}
@@ -334,7 +346,7 @@ def test_manual_resolution_requires_explicit_review(subject, missing):
     assert not backend.calls
 
 
-def test_manual_resolution_archives_unknown_without_replay(subject):
+def test_manual_resolution_archives_unknown_without_replay(subject, recovery_clock):
     engine, store, backend = subject
     engine.grant(["daemon_restart"], "fixture")
     backend.complete = False

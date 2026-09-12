@@ -29,15 +29,12 @@ except NameError:
 VIRTUOSO_WM_CLASSES = ["virtuoso", "libManager"]
 KNOWN_MODAL_ACTIONS = {
     "ade explorer update and run": "enter",
+    "ade assembler message 1749": "alt-o",
 }
 
 
-def find_x11_env(user=None):
-    """Auto-detect DISPLAY and XAUTHORITY from running virtuoso process.
-
-    Skips batch virtuoso processes (those with -nograph in cmdline).
-    If multiple candidates, prefers the interactive one.
-    """
+def find_x11_envs(user=None):
+    """Return X11 environments for all interactive Virtuoso processes."""
     candidates = []
     try:
         pids = subprocess.check_output(
@@ -73,12 +70,22 @@ def find_x11_env(user=None):
     except (subprocess.CalledProcessError, OSError):
         pass
 
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        key = (candidate.get("DISPLAY"), candidate.get("XAUTHORITY"))
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def find_x11_env(user=None):
+    """Return the first interactive Virtuoso X11 environment for compatibility."""
+    candidates = find_x11_envs(user)
     if not candidates:
         return {"DISPLAY": None, "XAUTHORITY": None}
 
-    # Prefer interactive display (not Xvfb-style small displays)
-    # Heuristic: Xvfb displays often use high display numbers (:99, :1024)
-    # Real user sessions use lower numbers or localhost:NN
     return candidates[0]
 
 
@@ -558,10 +565,11 @@ def _root_frames():
     return frames
 
 
-def _frame_children(frame_id):
+def _frame_children(frame_id, recursive=True):
     try:
+        option = "-tree" if recursive else "-children"
         subtree = subprocess.check_output(
-            ["xwininfo", "-id", frame_id, "-tree"],
+            ["xwininfo", "-id", frame_id, option],
             stderr=subprocess.PIPE
         ).decode("utf-8", "replace")
     except (subprocess.CalledProcessError, OSError):
@@ -616,12 +624,20 @@ def _representative_app_window(frame, app_children):
     return None
 
 
+def _looks_like_ciw(title):
+    title_l = (title or "").lower()
+    return "command interpreter" in title_l or bool(re.search(r"\bciw\b", title_l))
+
+
 def classify_windows(windows):
     classified = []
     for win in windows:
         item = dict(win)
         action = _known_action(item.get("title") or "")
-        if action:
+        if _looks_like_ciw(item.get("title") or ""):
+            item["kind"] = "ciw"
+            item["suggested_action"] = None
+        elif action:
             item["kind"] = "known_modal"
             item["suggested_action"] = action
         elif _geometry_is_dialog_sized(item.get("geometry") or {}):
@@ -634,8 +650,8 @@ def classify_windows(windows):
     return classified
 
 
-def discover_windows(display):
-    """Enumerate Virtuoso-related X11 windows with frame and child details."""
+def discover_windows(display, top_level=False):
+    """Enumerate Virtuoso windows, optionally returning one item per WM frame."""
     os.environ["DISPLAY"] = display
     windows = []
     seen = set()
@@ -644,30 +660,37 @@ def discover_windows(display):
             continue
         frame_id = frame["id"]
         geometry = frame.get("geometry") or {}
-        children = _frame_children(frame_id)
+        children = _frame_children(frame_id, recursive=not top_level)
         app_children = [c for c in children if _is_virtuoso_class(c.get("class"))]
-        child = _representative_app_window(frame, app_children)
-        if not child:
-            continue
-        dismiss_id = child["id"]
-        key = (frame_id, dismiss_id)
-        if key in seen:
-            continue
-        seen.add(key)
-        windows.append({
-            "frame_id": frame_id,
-            "window_id": dismiss_id,
-            "dismiss_id": dismiss_id,
-            "title": child.get("title") or frame.get("title") or "",
-            "class": child.get("class") or frame.get("class") or [],
-            "geometry": {
-                "w": int(geometry.get("w") or 0),
-                "h": int(geometry.get("h") or 0),
-                "x": int(geometry.get("x") or 0),
-                "y": int(geometry.get("y") or 0),
-            },
-            "mapped": True,
-        })
+        if _is_virtuoso_class(frame.get("class")):
+            app_children.append(frame)
+        if top_level and app_children:
+            ciw = [c for c in app_children if _looks_like_ciw(c.get("title") or frame.get("title") or "")]
+            titled = [c for c in app_children if c.get("title")]
+            app_children = [(ciw or titled or app_children)[0]]
+        if not top_level:
+            representative = _representative_app_window(frame, app_children)
+            app_children = [representative] if representative else []
+        for child in app_children:
+            dismiss_id = child["id"]
+            key = frame_id if top_level else (frame_id, dismiss_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            windows.append({
+                "frame_id": frame_id,
+                "window_id": dismiss_id,
+                "dismiss_id": dismiss_id,
+                "title": child.get("title") or frame.get("title") or "",
+                "class": child.get("class") or frame.get("class") or [],
+                "geometry": {
+                    "w": int(geometry.get("w") or 0),
+                    "h": int(geometry.get("h") or 0),
+                    "x": int(geometry.get("x") or 0),
+                    "y": int(geometry.get("y") or 0),
+                },
+                "mapped": True,
+            })
     return classify_windows(windows)
 
 
@@ -694,6 +717,38 @@ def find_dialogs(display):
             "suggested_action": win.get("suggested_action"),
         })
     return dialogs
+
+
+def _resolve_dismiss_target(display, requested_id):
+    """Accept either a WM frame id or an application's dismissable child id."""
+    for window in discover_windows(display):
+        if requested_id in (
+            window.get("frame_id"),
+            window.get("window_id"),
+            window.get("dismiss_id"),
+        ):
+            return window.get("dismiss_id") or requested_id
+    return requested_id
+
+
+def _apply_x11_env(x11_env):
+    """Make one discovered X11 environment active for ctypes and xwininfo."""
+    display = x11_env.get("DISPLAY")
+    os.environ["DISPLAY"] = display
+    xauth = x11_env.get("XAUTHORITY")
+    if isinstance(xauth, string_types) and xauth:
+        os.environ["XAUTHORITY"] = xauth
+    return display
+
+
+def _verify_dismissal(result):
+    """Report whether the target is still mapped after an injected action."""
+    if "dismissed" not in result:
+        return result
+    time.sleep(0.3)
+    target = result.get("child") or result.get("dismissed")
+    result["still_mapped"] = bool(_read_window_info(target).get("mapped"))
+    return result
 
 
 def _find_app_child(display, frame_id_str):
@@ -742,6 +797,21 @@ def _send_alt_y(dpy, xlib, xtst):
     return kc_alt, kc_y
 
 
+def _send_alt_o(dpy, xlib, xtst):
+    """Send Alt+O to activate the standard OK button mnemonic."""
+    keysym_alt_l = 0xffe9  # XK_Alt_L
+    keysym_o = 0x006f      # XK_o
+    kc_alt = xlib.XKeysymToKeycode(dpy, keysym_alt_l)
+    kc_o = xlib.XKeysymToKeycode(dpy, keysym_o)
+
+    xtst.XTestFakeKeyEvent(dpy, kc_alt, True, 0)
+    xtst.XTestFakeKeyEvent(dpy, kc_o, True, 0)
+    xtst.XTestFakeKeyEvent(dpy, kc_o, False, 0)
+    xtst.XTestFakeKeyEvent(dpy, kc_alt, False, 0)
+    xlib.XFlush(dpy)
+    return kc_alt, kc_o
+
+
 def _send_escape(dpy, xlib, xtst):
     """Send Escape key (maps to Cancel on most dialogs)."""
     keysym_esc = 0xff1b  # XK_Escape
@@ -771,10 +841,122 @@ def _send_explicit_action(dpy, xlib, xtst, action):
     if normalized in ("alt-y", "yes"):
         kc_alt, kc_y = _send_alt_y(dpy, xlib, xtst)
         return "alt-y", {"keycode_alt": int(kc_alt), "keycode_y": int(kc_y)}
+    if normalized in ("alt-o", "ok"):
+        kc_alt, kc_o = _send_alt_o(dpy, xlib, xtst)
+        return "alt-o", {"keycode_alt": int(kc_alt), "keycode_o": int(kc_o)}
     if normalized in ("alt-n", "no"):
         kc_alt, kc_n = _send_alt_n(dpy, xlib, xtst)
         return "alt-n", {"keycode_alt": int(kc_alt), "keycode_n": int(kc_n)}
     raise ValueError("unsupported action: %s" % action)
+
+
+_SHIFTED_ASCII = set('~!@#$%^&*()_+{}|:\"<>?')
+
+
+def _skill_load_expression(setup_path):
+    if not setup_path or not setup_path.startswith("/"):
+        raise ValueError("setup path must be absolute")
+    if os.path.basename(setup_path) != "virtuoso_setup.il":
+        raise ValueError("setup path must name generated virtuoso_setup.il")
+    if "\n" in setup_path or "\r" in setup_path or "\x00" in setup_path:
+        raise ValueError("setup path contains unsupported control characters")
+    escaped = setup_path.replace("\\", "\\\\").replace('"', '\\"')
+    return 'load("%s")' % escaped
+
+
+def _type_ascii_into_window(display, window_id, text):
+    """Focus one explicit X11 window, type ASCII with XTest, then Return."""
+    try:
+        text.encode("ascii")
+    except UnicodeError:
+        return {"error": "bootstrap path must contain ASCII characters"}
+    os.environ["DISPLAY"] = display
+    xlib_path = ctypes.util.find_library("X11")
+    xtst_path = ctypes.util.find_library("Xtst")
+    if not xlib_path or not xtst_path:
+        return {"error": "libX11 or libXtst not found"}
+
+    xlib = ctypes.cdll.LoadLibrary(xlib_path)
+    xtst = ctypes.cdll.LoadLibrary(xtst_path)
+    xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    xlib.XOpenDisplay.restype = ctypes.c_void_p
+    xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    xlib.XFlush.argtypes = [ctypes.c_void_p]
+    xlib.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    xlib.XSetInputFocus.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    xlib.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    xlib.XKeysymToKeycode.restype = ctypes.c_uint
+    xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+    xtst.XTestFakeKeyEvent.restype = ctypes.c_int
+
+    dpy = xlib.XOpenDisplay(None)
+    if not dpy:
+        return {"error": "cannot open display %s" % display}
+    target = int(window_id, 16) if window_id.startswith("0x") else int(window_id)
+    shift_keycode = xlib.XKeysymToKeycode(dpy, 0xffe1)  # XK_Shift_L
+    return_keycode = xlib.XKeysymToKeycode(dpy, 0xff0d)  # XK_Return
+    strokes = []
+    for char in text:
+        keycode = xlib.XKeysymToKeycode(dpy, ord(char))
+        if not keycode:
+            xlib.XCloseDisplay(dpy)
+            return {"error": "cannot map bootstrap character %r" % char}
+        strokes.append((keycode, char.isupper() or char in _SHIFTED_ASCII))
+    if not shift_keycode or not return_keycode:
+        xlib.XCloseDisplay(dpy)
+        return {"error": "cannot map required Shift/Return key"}
+
+    xlib.XRaiseWindow(dpy, target)
+    xlib.XSetInputFocus(dpy, target, 1, 0)
+    xlib.XFlush(dpy)
+    time.sleep(0.15)
+    try:
+        for keycode, shifted in strokes:
+            if shifted:
+                xtst.XTestFakeKeyEvent(dpy, shift_keycode, True, 0)
+            xtst.XTestFakeKeyEvent(dpy, keycode, True, 0)
+            xtst.XTestFakeKeyEvent(dpy, keycode, False, 0)
+            if shifted:
+                xtst.XTestFakeKeyEvent(dpy, shift_keycode, False, 0)
+        xtst.XTestFakeKeyEvent(dpy, return_keycode, True, 0)
+        xtst.XTestFakeKeyEvent(dpy, return_keycode, False, 0)
+        xlib.XFlush(dpy)
+    except Exception as exc:
+        xlib.XCloseDisplay(dpy)
+        return {"error": "XTest bootstrap failed: %s" % str(exc)}
+    xlib.XCloseDisplay(dpy)
+    return {"bootstrapped": window_id, "command": text}
+
+
+def bootstrap_ciw(display, requested_id, setup_path):
+    """Inject only the generated load expression into one verified CIW."""
+    matches = []
+    for window in discover_windows(display, top_level=True):
+        if requested_id in (
+            window.get("frame_id"),
+            window.get("window_id"),
+            window.get("dismiss_id"),
+        ):
+            matches.append(window)
+    if not matches:
+        return {"error": "window id is not a top-level Virtuoso window", "window_id": requested_id}
+    window = matches[0]
+    if window.get("kind") != "ciw":
+        return {
+            "error": "refusing bootstrap: selected window is not identified as a CIW",
+            "window_id": requested_id,
+            "title": window.get("title") or "",
+        }
+    try:
+        expression = _skill_load_expression(setup_path)
+    except ValueError as exc:
+        return {"error": str(exc), "window_id": requested_id}
+    target = window.get("dismiss_id") or window.get("window_id") or requested_id
+    result = _type_ascii_into_window(display, target, expression)
+    result["requested_window_id"] = requested_id
+    result["display"] = display
+    result["title"] = window.get("title") or ""
+    return result
 
 
 def dismiss_window(display, win_id_str, title="", x=0, y=0, w=0, h=0, action=None):
@@ -942,7 +1124,10 @@ def main():
     display = None
     do_dismiss = False
     list_windows = False
+    top_level = False
     dismiss_target = None
+    bootstrap_target = None
+    setup_path = None
     action = "enter"
     input_target = None
     expect_title = None
@@ -966,11 +1151,25 @@ def main():
             do_dismiss = True
         elif args[i] == "--list-windows":
             list_windows = True
+        elif args[i] == "--top-level":
+            top_level = True
         elif args[i] == "--dismiss-window":
             if i + 1 >= len(args):
                 print(json.dumps({"error": "--dismiss-window requires a window id"}))
                 sys.exit(2)
             dismiss_target = args[i + 1]
+            i += 1
+        elif args[i] == "--bootstrap-window":
+            if i + 1 >= len(args):
+                print(json.dumps({"error": "--bootstrap-window requires a window id"}))
+                sys.exit(2)
+            bootstrap_target = args[i + 1]
+            i += 1
+        elif args[i] == "--setup-path":
+            if i + 1 >= len(args):
+                print(json.dumps({"error": "--setup-path requires a path"}))
+                sys.exit(2)
+            setup_path = args[i + 1]
             i += 1
         elif args[i] == "--action":
             if i + 1 >= len(args):
@@ -1042,21 +1241,13 @@ def main():
             display = args[i]
         i += 1
 
-    if not display:
-        x11_env = find_x11_env()
-        display = x11_env.get("DISPLAY")
-        if not display:
+    if display:
+        x11_envs = [{"DISPLAY": display, "XAUTHORITY": os.environ.get("XAUTHORITY")}]
+    else:
+        x11_envs = find_x11_envs()
+        if not x11_envs:
             print(json.dumps({"error": "cannot detect DISPLAY"}))
             sys.exit(2)
-        xauth = x11_env.get("XAUTHORITY")
-        if isinstance(xauth, string_types) and xauth:
-            os.environ["XAUTHORITY"] = xauth
-
-    # Export DISPLAY so ctypes XOpenDisplay(None) and xwininfo subprocesses
-    # (which read it from the environment) connect to the right X server.
-    # Without this, auto-detected DISPLAY stays a Python variable and
-    # XOpenDisplay(None) returns NULL -> segfault.
-    os.environ["DISPLAY"] = display
 
     if input_target:
         try:
@@ -1076,31 +1267,95 @@ def main():
         sys.exit(1 if "error" in result else 0)
 
     if dismiss_target:
-        result = dismiss_window(display, dismiss_target, action=action)
+        matches = []
+        for x11_env in x11_envs:
+            active_display = _apply_x11_env(x11_env)
+            resolved_target = _resolve_dismiss_target(active_display, dismiss_target)
+            if resolved_target != dismiss_target or any(
+                dismiss_target in (w.get("frame_id"), w.get("window_id"), w.get("dismiss_id"))
+                for w in discover_windows(active_display)
+            ):
+                matches.append((active_display, resolved_target))
+        if not matches:
+            print(json.dumps({"error": "window id not found on any Virtuoso display", "window_id": dismiss_target}))
+            sys.exit(1)
+        failed = False
+        for active_display, resolved_target in matches:
+            result = dismiss_window(active_display, resolved_target, action=action)
+            result["display"] = active_display
+            result["requested_window_id"] = dismiss_target
+            verified = _verify_dismissal(result)
+            print(json.dumps(verified))
+            failed = failed or "error" in verified or verified.get("still_mapped", False)
+        sys.exit(1 if failed else 0)
+
+    if bootstrap_target:
+        if not setup_path:
+            print(json.dumps({"error": "bootstrap requires --setup-path"}))
+            sys.exit(2)
+        matches = []
+        refusal = None
+        for x11_env in x11_envs:
+            active_display = _apply_x11_env(x11_env)
+            for window in discover_windows(active_display, top_level=True):
+                if bootstrap_target not in (
+                    window.get("frame_id"),
+                    window.get("window_id"),
+                    window.get("dismiss_id"),
+                ):
+                    continue
+                if window.get("kind") != "ciw":
+                    refusal = {
+                        "error": "refusing bootstrap: selected window is not identified as a CIW",
+                        "window_id": bootstrap_target,
+                        "title": window.get("title") or "",
+                    }
+                else:
+                    matches.append(x11_env)
+        if len(matches) != 1:
+            if len(matches) > 1:
+                result = {"error": "window id matched more than one display; set VB_DISPLAY explicitly"}
+            else:
+                result = refusal or {
+                    "error": "window id not found on any Virtuoso display",
+                    "window_id": bootstrap_target,
+                }
+            print(json.dumps(result))
+            sys.exit(1)
+        selected_display = _apply_x11_env(matches[0])
+        result = bootstrap_ciw(selected_display, bootstrap_target, setup_path)
         print(json.dumps(result))
-        sys.exit(1 if "error" in result else 0)
+        if "error" in result:
+            sys.exit(1)
+        sys.exit(0)
 
     if list_windows:
-        windows = discover_windows(display)
-        for w in windows:
-            print(json.dumps(w))
+        windows = []
+        for x11_env in x11_envs:
+            active_display = _apply_x11_env(x11_env)
+            for window in discover_windows(active_display, top_level=top_level):
+                window["display"] = active_display
+                windows.append(window)
+                print(json.dumps(window))
         sys.exit(0 if windows else 1)
 
-    dialogs = find_dialogs(display)
-    for d in dialogs:
-        print(json.dumps(d))
-
+    dialogs = []
+    for x11_env in x11_envs:
+        active_display = _apply_x11_env(x11_env)
+        for dialog in find_dialogs(active_display):
+            dialog["display"] = active_display
+            dialogs.append(dialog)
+            print(json.dumps(dialog))
     if not dialogs:
         sys.exit(1)
 
     if do_dismiss:
+        failed = False
         for d in dialogs:
             if "window_id" in d:
-                explicit_action = None
-                if "ade explorer update and run" in (d.get("title", "") or "").lower():
-                    explicit_action = d.get("suggested_action") or "enter"
+                explicit_action = d.get("suggested_action")
                 result = dismiss_window(
-                    display,
+                    d["display"],
                     d["window_id"],
                     d.get("title", ""),
                     d.get("x", 0),
@@ -1109,7 +1364,11 @@ def main():
                     d.get("h", 0),
                     explicit_action,
                 )
-                print(json.dumps(result))
+                verified = _verify_dismissal(result)
+                print(json.dumps(verified))
+                failed = failed or "error" in verified or verified.get("still_mapped", False)
+        if failed:
+            sys.exit(1)
 
     sys.exit(0)
 

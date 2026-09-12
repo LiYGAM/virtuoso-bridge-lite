@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.resources
 import logging
 import os
 import re
@@ -11,6 +10,7 @@ import shutil
 import subprocess
 import time
 import uuid
+import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -29,9 +29,18 @@ from virtuoso_bridge.transport.remote_paths import (
     resolve_client_id,
     resolve_remote_username,
 )
-from virtuoso_bridge.transport.ssh import SSHRunner, RemoteTaskResult, run_remote_task, remote_ssh_env_from_os
+from virtuoso_bridge.transport.remote_roles import remote_host_roles_from_os
+from virtuoso_bridge.transport.ssh import (
+    SSHRunner,
+    run_remote_task,
+    ssh_backend_env_from_os,
+    ssh_proxy_url_from_os,
+)
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_PARALLEL_WORKERS = 4
 
 
 SPECTRE_MODE_ARGS: dict[str, list[str]] = {
@@ -491,6 +500,86 @@ def _has_fatal_spectre_error(output: str) -> bool:
 # SpectreSimulator
 # ---------------------------------------------------------------------------
 
+def _validate_max_workers(max_workers: int) -> int:
+    """Validate a user-supplied Spectre job concurrency limit."""
+    if (
+        not isinstance(max_workers, int)
+        or isinstance(max_workers, bool)
+        or max_workers < 1
+    ):
+        raise ValueError("max_workers must be at least 1")
+    return max_workers
+
+
+class SpectrePool:
+    """Explicitly owned pool for incremental asynchronous simulations.
+
+    Prefer :meth:`SpectreSimulator.run_parallel` for a fixed batch. Use this
+    class when simulations need to be submitted over time while earlier jobs
+    are still running. The context manager makes the executor lifetime and
+    concurrency limit explicit.
+    """
+
+    def __init__(
+        self,
+        simulator: "SpectreSimulator",
+        max_workers: int = DEFAULT_PARALLEL_WORKERS,
+    ) -> None:
+        self._simulator = simulator
+        self._max_workers = _validate_max_workers(max_workers)
+        self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
+        self._closed = False
+
+    @property
+    def max_workers(self) -> int:
+        """Maximum number of Spectre jobs that may run concurrently."""
+        return self._max_workers
+
+    def submit(
+        self,
+        netlist: Path,
+        params: dict | None = None,
+    ) -> Future[SimulationResult]:
+        """Submit one simulation and return its future immediately."""
+        if self._closed:
+            raise RuntimeError("SpectrePool has been shut down")
+        netlist = Path(netlist).resolve()
+        work_dir = self._simulator._new_parallel_work_dir(netlist)
+        return self._executor.submit(
+            self._simulator._run_in_work_dir,
+            netlist,
+            params or {},
+            work_dir,
+        )
+
+    def wait_all(
+        self,
+        futures: list[Future[SimulationResult]],
+    ) -> list[SimulationResult]:
+        """Wait for futures and return results in submission order."""
+        return self._simulator.wait_all(futures)
+
+    def shutdown(
+        self,
+        wait: bool = True,
+        *,
+        cancel_futures: bool = False,
+    ) -> None:
+        """Shut down this pool; subsequent submissions are rejected."""
+        if self._closed:
+            return
+        self._closed = True
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    def __enter__(self) -> "SpectrePool":
+        if self._closed:
+            raise RuntimeError("SpectrePool has been shut down")
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.shutdown()
+
+
 class SpectreSimulator:
     """Cadence Spectre simulator adapter."""
 
@@ -530,23 +619,32 @@ class SpectreSimulator:
         self._output_format = output_format
         self._ssh_key_path = ssh_key_path
         self._ssh_config_path = ssh_config_path
-        self._max_workers = 64
-        self._pool: ThreadPoolExecutor | None = None
         self._keep_remote_files = keep_remote_files
+        # Compatibility only. New code should use run_parallel() for a batch
+        # or parallel_pool() for incremental submission.
+        self._legacy_max_workers = DEFAULT_PARALLEL_WORKERS
+        self._legacy_pool: SpectrePool | None = None
         self._ssh_runner: SSHRunner | None = ssh_runner
         self._profile = profile
+        self._ssh_backend: str | None = None
+        self._ssh_max_sessions: int | None = None
+        self._ssh_proxy_url: str | None = None
 
         rh, ru, jh, ju = remote_host, remote_user, jump_host, jump_user
         if remote:
-            env = remote_ssh_env_from_os(profile)
+            roles = remote_host_roles_from_os(profile, load=False)
+            backend_env = ssh_backend_env_from_os(profile)
+            self._ssh_backend = backend_env.backend
+            self._ssh_max_sessions = backend_env.max_sessions
+            self._ssh_proxy_url = ssh_proxy_url_from_os(profile)
             if rh is None:
-                rh = env.remote_host
+                rh = roles.spectre_host
             if ru is None:
-                ru = env.remote_user
+                ru = roles.remote_user
             if jh is None:
-                jh = env.jump_host
+                jh = roles.jump_for(rh)
             if ju is None:
-                ju = env.jump_user
+                ju = roles.jump_user
 
         self._remote_host = rh
         self._remote_user = ru
@@ -572,16 +670,15 @@ class SpectreSimulator:
         """Create a SpectreSimulator from environment variables.
 
         If the configured remote host is localhost (or unset with a localhost
-        env var), returns a local simulator.  Otherwise automatically reuses
-        the SSH connection managed by ``virtuoso-bridge start`` (via
-        ControlMaster).  Raises RuntimeError if no remote connection is
-        available.
+        env var), returns a local simulator. Otherwise it uses the selected
+        OpenSSH or Paramiko backend. Raises RuntimeError if the bridge tunnel
+        lifecycle state is unavailable.
         """
         profile = resolve_profile(profile)
         load_vb_env()
         # Check if we should run locally
-        suffix = f"_{profile}" if profile else ""
-        remote_host = os.environ.get(f"VB_REMOTE_HOST{suffix}", "") or os.environ.get("VB_REMOTE_HOST", "")
+        roles = remote_host_roles_from_os(profile, load=False)
+        remote_host = roles.spectre_host or ""
         if remote_host and _is_localhost(remote_host):
             return cls(
                 spectre_cmd=spectre_cmd,
@@ -595,10 +692,16 @@ class SpectreSimulator:
 
         if ssh_runner is None:
             from virtuoso_bridge.transport.tunnel import SSHClient
-            if not SSHClient.is_running(profile):
-                hint = f"Run `virtuoso-bridge start -p {profile}` first." if profile else "Run `virtuoso-bridge start` first."
-                raise RuntimeError(f"No virtuoso-bridge connection found. {hint}")
-            ssh_runner = SSHClient.from_env(keep_remote_files=keep_remote_files, profile=profile).ssh_runner
+            if SSHClient.is_running(profile):
+                ssh_client = SSHClient.from_env(
+                    keep_remote_files=keep_remote_files,
+                    profile=profile,
+                )
+                ssh_runner = getattr(
+                    ssh_client,
+                    "spectre_runner",
+                    getattr(ssh_client, "ssh_runner", None),
+                )
 
         return cls(
             spectre_cmd=spectre_cmd,
@@ -636,84 +739,117 @@ class SpectreSimulator:
         """Run a Spectre simulation on *netlist* synchronously."""
         netlist = Path(netlist).resolve()
         params = params or {}
+        return self._run_in_work_dir(netlist, params, self._work_dir)
+
+    def _run_in_work_dir(
+        self,
+        netlist: Path,
+        params: dict,
+        work_dir: Path | None,
+    ) -> SimulationResult:
+        """Run one resolved netlist using the provided local work directory."""
         if not netlist.exists():
             return SimulationResult(
                 status=ExecutionStatus.ERROR,
                 errors=[f"Netlist file not found: {netlist}"],
             )
         if self._remote_host:
-            return self._run_remote(netlist, params)
-        return self._run_local(netlist, params)
+            return self._run_remote(netlist, params, work_dir=work_dir)
+        return self._run_local(netlist, params, work_dir=work_dir)
+
+    def _new_parallel_work_dir(self, netlist: Path) -> Path:
+        """Reserve a collision-free local workspace path for one parallel task."""
+        base_dir = (
+            Path(self._work_dir)
+            if self._work_dir is not None
+            else artifact_dir("spectre")
+        )
+        return base_dir / f"{netlist.stem}__{uuid.uuid4().hex[:8]}"
 
     # -- parallel simulation API ---------------------------------------------
 
-    def _ensure_pool(self) -> ThreadPoolExecutor:
-        """Lazily create the thread pool on first submit."""
-        if self._pool is None:
-            self._pool = ThreadPoolExecutor(max_workers=self._max_workers)
-        return self._pool
+    def parallel_pool(
+        self,
+        max_workers: int = DEFAULT_PARALLEL_WORKERS,
+    ) -> SpectrePool:
+        """Create an explicitly owned pool for incremental submissions.
+
+        Use it as a context manager so all submitted work finishes and the
+        executor is released deterministically::
+
+            with sim.parallel_pool(max_workers=4) as pool:
+                first = pool.submit(Path("tb_comparator.scs"))
+                second = pool.submit(Path("tb_dac.scs"))
+                results = pool.wait_all([first, second])
+        """
+        return SpectrePool(self, max_workers=max_workers)
 
     def set_max_workers(self, n: int) -> None:
-        """Change the maximum number of concurrent simulations.
+        """Set concurrency for the deprecated simulator-level submit API.
 
-        Takes effect on the next :meth:`submit` call if the pool hasn't been
-        created yet, or after :meth:`shutdown` + next submit.
+        New code should pass ``max_workers`` to :meth:`run_parallel` or
+        :meth:`parallel_pool`. The compatibility pool cannot be resized after
+        its first submission; call :meth:`shutdown` before changing it.
         """
-        self._max_workers = n
-        if self._pool is not None:
-            logger.warning(
-                "Pool already running with previous max_workers. "
-                "Call shutdown() first to apply the new limit."
+        warnings.warn(
+            "SpectreSimulator.set_max_workers() is deprecated; pass "
+            "max_workers to run_parallel() or parallel_pool() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        n = _validate_max_workers(n)
+        if self._legacy_pool is not None and n != self._legacy_max_workers:
+            raise RuntimeError(
+                "Cannot resize an active compatibility pool; call shutdown() "
+                "first or use parallel_pool(max_workers=...)"
             )
+        self._legacy_max_workers = n
 
-    def submit(self, netlist: Path, params: dict | None = None) -> Future[SimulationResult]:
-        """Submit a simulation to run in the background.
+    def submit(
+        self,
+        netlist: Path,
+        params: dict | None = None,
+    ) -> Future[SimulationResult]:
+        """Submit through the deprecated simulator-owned compatibility pool."""
+        warnings.warn(
+            "SpectreSimulator.submit() is deprecated; submit through "
+            "an explicit parallel_pool() context instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if self._legacy_pool is None:
+            self._legacy_pool = self.parallel_pool(
+                max_workers=self._legacy_max_workers,
+            )
+        return self._legacy_pool.submit(netlist, params)
 
-        Returns a :class:`~concurrent.futures.Future` immediately.  The
-        simulation runs in a worker thread — each gets its own remote
-        directory (uuid-based), so there are no file conflicts.  The SSH
-        ControlMaster connection is shared automatically.
-
-        Example::
-
-            sim = SpectreSimulator.from_env()
-            t1 = sim.submit(Path("tb_comparator.scs"))
-            t2 = sim.submit(Path("tb_dac.scs"))
-            # ... do other work ...
-            result1 = t1.result()
-            result2 = t2.result()
-        """
-        pool = self._ensure_pool()
-        netlist = Path(netlist).resolve()
-        params = params or {}
-        return pool.submit(self.run_simulation, netlist, params)
+    def shutdown(self) -> None:
+        """Release the deprecated simulator-owned compatibility pool."""
+        if self._legacy_pool is None:
+            return
+        self._legacy_pool.shutdown()
+        self._legacy_pool = None
 
     def run_parallel(
         self,
         tasks: list[tuple[Path, dict]],
-        max_workers: int | None = None,
+        max_workers: int = DEFAULT_PARALLEL_WORKERS,
     ) -> list[SimulationResult]:
-        """Submit multiple simulations and wait for all to complete.
+        """Run one fixed batch with a scoped executor.
 
-        Convenience wrapper around :meth:`submit`.  For fire-and-forget or
-        incremental submission, use :meth:`submit` directly.
-
-        *max_workers* overrides the instance default for this batch only.
+        Each call owns its executor, so batches with different concurrency
+        limits cannot leak state into one another. For incremental submission,
+        use :meth:`parallel_pool`.
         """
-        old = self._max_workers
-        if max_workers is not None:
-            self._max_workers = max_workers
-            # Force new pool with the override
-            self.shutdown()
-
-        futures = [self.submit(Path(netlist), params) for netlist, params in tasks]
-        results = self.wait_all(futures)
-
-        if max_workers is not None:
-            self._max_workers = old
-            self.shutdown()
-
-        return results
+        _validate_max_workers(max_workers)
+        if not tasks:
+            return self.wait_all([])
+        with self.parallel_pool(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(Path(netlist), params)
+                for netlist, params in tasks
+            ]
+            return pool.wait_all(futures)
 
     @staticmethod
     def wait_all(futures: list[Future[SimulationResult]]) -> list[SimulationResult]:
@@ -733,12 +869,6 @@ class SpectreSimulator:
         passed = sum(1 for r in results if r.status == ExecutionStatus.SUCCESS)
         print(f"[parallel] Done: {passed}/{len(results)} succeeded")
         return results
-
-    def shutdown(self) -> None:
-        """Shut down the worker pool. A new pool is created on next submit."""
-        if self._pool is not None:
-            self._pool.shutdown(wait=True)
-            self._pool = None
 
     def check_license(self) -> dict[str, Any]:
         """Check Spectre license availability on the remote host.
@@ -847,7 +977,13 @@ class SpectreSimulator:
 
     # -- private helpers ----------------------------------------------------
 
-    def _run_local(self, netlist: Path, params: dict) -> SimulationResult:
+    def _run_local(
+        self,
+        netlist: Path,
+        params: dict,
+        *,
+        work_dir: Path | None,
+    ) -> SimulationResult:
         suffix = f"_{self._profile}" if self._profile else ""
         cadence_cshrc = (
             os.environ.get(f"VB_CADENCE_CSHRC{suffix}", "").strip()
@@ -859,7 +995,7 @@ class SpectreSimulator:
             spectre_cmd=self._spectre_cmd,
             spectre_args=self._spectre_args,
             timeout=self._timeout,
-            work_dir=self._work_dir,
+            work_dir=work_dir,
             output_format=self._output_format,
             cadence_cshrc=cadence_cshrc or None,
         )
@@ -881,11 +1017,20 @@ class SpectreSimulator:
                 ssh_config_path=self._ssh_config_path,
                 timeout=self._timeout,
                 persistent_shell=True,
+                backend=self._ssh_backend,
+                max_sessions=self._ssh_max_sessions,
+                proxy_url=self._ssh_proxy_url,
                 verbose=True,
             )
         return self._ssh_runner
 
-    def _run_remote(self, netlist: Path, params: dict) -> SimulationResult:
+    def _run_remote(
+        self,
+        netlist: Path,
+        params: dict,
+        *,
+        work_dir: Path | None,
+    ) -> SimulationResult:
         runner = self._get_ssh_runner()
         timings: dict[str, float] = {}
         overall_started = time.perf_counter()
@@ -906,7 +1051,11 @@ class SpectreSimulator:
                 errors=["Remote work dir is not configured"],
             )
 
-        base_output_dir = Path(self._work_dir) if self._work_dir is not None else artifact_dir("spectre", netlist.stem)
+        base_output_dir = (
+            Path(work_dir)
+            if work_dir is not None
+            else artifact_dir("spectre", netlist.stem)
+        )
         base_output_dir.mkdir(parents=True, exist_ok=True)
         run_result = _run_spectre_remote(
             netlist=netlist,

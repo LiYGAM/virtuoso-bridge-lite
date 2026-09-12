@@ -29,7 +29,9 @@ historical `function(client, ...)` entry points are retained for compatibility.
 
 ## Standard Simulation Flow
 
-See **[simulation-flow.md](simulation-flow.md)** for the complete 8-step guide (clean sessions → open GUI → run → read results), common pitfalls, and optimization loop patterns.
+See **[simulation-flow.md](simulation-flow.md)** for the standard sequence
+(clean sessions → open GUI → run → read results), common pitfalls, and
+optimization loop patterns.
 
 ## Session Management
 
@@ -104,7 +106,8 @@ Adds the full disk dump on top of the same dict.  Layout:
 ├── state_from_skill.txt           ~16 raw SKILL probe outputs in [label] value format
 └── {history_name}/                newest run
     ├── {history_name}.log         OA library log
-    └── {point_subdir}/.../netlist/{input.scs,netlist,exprOutputs.json}
+    └── {point_subdir}/.../netlist/
+        {netlist,input.scs,qpInformation.ils,exprOutputs.json,paramInfo.ils}
         + psf/spectre.out + psf/logFile
                                     per-point (all corners), packed via tar
 ```
@@ -168,15 +171,32 @@ the raw exported CSV under `"raw_csv"`.
 ```python
 client.maestro.export_waveform(session,
     'dB20(mag(VF("/VOUT") / VF("/VSIN")))',
-    "output/gain_db.txt", analysis="ac")
+    "output/gain_db.txt",
+    analysis="ac",
+    history="Interactive.7",
+    precision=12,
+    width=20,
+    number_notation="none",
+)
 
 client.maestro.export_waveform(session,
     'getData("out" ?result "noise")',
     "output/noise.txt", analysis="noise")
 ```
 
-Calls `maeOpenResults` → `selectResults` → `ocnPrint` → `maeCloseResults`,
-then scp's the text file back.
+Calls `maeOpenResults` → `selectResults` → `ocnPrint`, then downloads the
+text file through the configured transport and removes the collision-safe remote
+temporary file. Pass `history=` when you already have the value returned by
+`run_and_wait()` so the export cannot drift to a newer run.
+
+Formatting controls are validated before any SKILL is sent:
+
+- `precision` must be 1–16 significant digits.
+- `width` must be at least 4 characters; use a value at least as large as
+  `precision` when all requested digits must be visible.
+- `number_notation` accepts `"suffix"`, `"engineering"`, `"scientific"`, or
+  `"none"`. The default is `"scientific"`; `"none"` skips per-value formatting
+  and is substantially faster for large exports.
 
 ### open_waveform_viewer — interactive ViVA/AWV plot
 
@@ -242,7 +262,7 @@ client.maestro.set_analysis("TRAN2", "tran", enable=False)
 client.maestro.add_output("OutPlot", "TRAN2", output_type="net", signal_name="/OUT")
 
 # Expression output
-client.maestro.add_output("maxOut", "TRAN2", output_type="point", expr='ymax(VT(\\"/OUT\\"))')
+client.maestro.add_output("maxOut", "TRAN2", output_type="point", expr='ymax(VT("/OUT"))')
 
 # Spec: maxOut < 400mV
 client.maestro.set_spec("maxOut", "TRAN2", lt="400m")
@@ -334,8 +354,8 @@ client.maestro.set_job_control_mode("Local")
 
 | Python | SKILL | Description |
 |--------|-------|-------------|
-| `client.maestro.run_simulation(*, session="", callback="")` | `maeRunSimulation` | Run (async), returns history name |
-| `client.maestro.run_and_wait(*, session="", timeout=600)` | `maeRunSimulation(?callback ...)` + SSH poll | **Recommended.** Run + wait without blocking SKILL channel |
+| `client.maestro.run_simulation(*, session="", callback="", timeout=None)` | `maeRunSimulation` | Run (async), returns history name; `timeout` bounds acceptance of the run request |
+| `client.maestro.run_and_wait(*, session="", timeout=600)` | `maeRunSimulation(?callback ...)` + SSH poll | **Recommended.** Run + wait without blocking SKILL channel; `timeout` is one end-to-end budget for request acceptance and completion polling |
 
 ```python
 # Recommended: run_and_wait (no race condition, SKILL stays free)
@@ -350,12 +370,17 @@ history, status = client.maestro.run_and_wait(session=session, timeout=600)
 
 | Python | SKILL | Description |
 |--------|-------|-------------|
-| `client.maestro.create_netlist_for_corner(test, corner, output_dir)` | `maeCreateNetlistForCorner` | Export netlist for one corner |
+| `client.maestro.create_netlist_for_corner(test, corner, output_dir, *, session="")` | `maeCreateNetlistForCorner` | Export netlist for one corner, optionally from an explicit session |
 | `client.maestro.export_output_view(filepath, *, view="Detail")` | `maeExportOutputView` | Export results to CSV |
 | `client.maestro.write_script(filepath)` | `maeWriteScript` | Export setup as SKILL script |
 
 ```python
-client.maestro.create_netlist_for_corner("TRAN2", "myCorner_2", "./myNetlistDir")
+client.maestro.create_netlist_for_corner(
+    "TRAN2",
+    "myCorner_2",
+    "./myNetlistDir",
+    session=session,
+)
 client.maestro.export_output_view("./results.csv")
 client.maestro.write_script("mySetupScript.il")
 ```

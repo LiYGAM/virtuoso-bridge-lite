@@ -333,6 +333,9 @@ def export_waveform(
     *,
     analysis: str = "ac",
     history: str = "",
+    precision: int | None = None,
+    width: int | None = None,
+    number_notation: str | None = None,
 ) -> str:
     """Export a waveform via OCEAN to a local text file.
 
@@ -342,9 +345,43 @@ def export_waveform(
         local_path: where to save locally
         analysis: which analysis to select ("ac", "tran", "noise", etc.)
         history: explicit history name; auto-detected if empty
+        precision: optional ocnPrint significant digits (1-16).  Omitted by
+            default so the user's OCEAN setup remains authoritative.
+        width: optional ocnPrint column width in characters (at least 4).
+            To display every requested significant digit, use a width greater
+            than or equal to precision.
+        number_notation: optional ocnPrint number format ('suffix,
+            'engineering, 'scientific, or 'none).  Defaults to 'scientific
+            for backward compatibility.  'none skips per-value formatting
+            and is significantly faster on large exports.
 
     Returns the local file path.
     """
+    if precision is not None:
+        if type(precision) is not int:
+            raise TypeError("precision must be an int or None")
+        if not 1 <= precision <= 16:
+            raise ValueError("precision must be between 1 and 16")
+    if width is not None:
+        if type(width) is not int:
+            raise TypeError("width must be an int or None")
+        if width < 4:
+            raise ValueError("width must be at least 4")
+    valid_notations = {"suffix", "engineering", "scientific", "none"}
+    if number_notation is not None:
+        if type(number_notation) is not str:
+            raise TypeError("number_notation must be a str or None")
+        if number_notation not in valid_notations:
+            raise ValueError(
+                f"number_notation must be one of {sorted(valid_notations)}"
+            )
+
+    format_args = f" ?numberNotation '{number_notation or 'scientific'}"
+    if precision is not None:
+        format_args += f" ?precision {precision}"
+    if width is not None:
+        format_args += f" ?width {width}"
+
     # Auto-detect history name from the current results dir.
     # The path shape is `.../maestro/results/maestro/{history}/...` where
     # `{history}` can be any name Cadence wrote — Interactive.N, sweep_*,
@@ -380,8 +417,7 @@ def export_waveform(
     client.execute_skill(f'openResults("{results_dir}")')
     client.execute_skill(f'selectResults("{analysis}")')
     client.execute_skill(
-        f'ocnPrint({expression} '
-        f'?numberNotation \'scientific ?numSpaces 1 '
+        f'ocnPrint({expression}{format_args} ?numSpaces 1 '
         f'?output "{remote_path}")')
 
     client.download_file(remote_path, local_path)

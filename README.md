@@ -3,10 +3,6 @@
 </p>
 
 <p align="center">
-  <a href="https://oosmetrics.com/repo/Arcadia-1/virtuoso-bridge-lite"><img src="https://api.oosmetrics.com/api/v1/badge/achievement/8d369c0f-7036-4e79-9ed3-a71689ba4660.svg" alt="oosmetrics — Top 5 in Fullstack by acceleration (2026-05-09)"/></a>
-</p>
-
-<p align="center">
   <a href="https://github.com/Arcadia-1/virtuoso-bridge-lite/stargazers"><img src="https://img.shields.io/github/stars/Arcadia-1/virtuoso-bridge-lite?style=flat-square&color=f5c542&logo=github&v=20260523" alt="GitHub stars"/></a>
   <a href="https://github.com/Arcadia-1/virtuoso-bridge-lite/network/members"><img src="https://img.shields.io/github/forks/Arcadia-1/virtuoso-bridge-lite?style=flat-square&color=f5c542" alt="GitHub forks"/></a>
   <a href="stats/README.md"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FArcadia-1%2Fvirtuoso-bridge-lite%2Fmain%2Fstats%2Fclones-badge.json&style=flat-square&v=2" alt="Clones"/></a>
@@ -21,6 +17,10 @@
   <a href="https://github.com/Arcadia-1/virtuoso-bridge-lite/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"/></a>
 </p>
 
+<p align="center">
+  English | <a href="READMEs/README.zh-CN.md">简体中文</a> | <a href="READMEs/README.zh-TW.md">繁體中文</a>
+</p>
+
 A new infrastructure for **Agentic Analog and Mixed-Signal Design**. LLM Agents drive Cadence Virtuoso instances — locally or remotely — turning tedious handcrafting into automated design flows.
 
 ### Why is this a "New Infrastructure"?
@@ -28,6 +28,7 @@ A new infrastructure for **Agentic Analog and Mixed-Signal Design**. LLM Agents 
 **1. Deep Virtuoso Integration** — Control across Schematic, Layout, Maestro, and Spectre.
 - **Flexible programming**: execute inline SKILL, load `.il` files, or use Python APIs
 - **Four design domains**: schematic editing, layout generation, simulation setup (Maestro), and standalone Spectre with PSF parsing
+- **Deterministic schematic planning**: explicit connectivity plus hard/soft grid, polarity-row, differential-pair, pin-column, and output-stage constraints
 
 **2. Scalable Architecture** — Multi-server, multi-session, built for distributed design clusters.
 - Multi-profile SSH: connect to N design servers, each with independent tunnel
@@ -35,9 +36,9 @@ A new infrastructure for **Agentic Analog and Mixed-Signal Design**. LLM Agents 
 - Verified across macOS, Windows, and Linux
 
 **3. AI-Native Design** — Built for coding agents (Claude Code, Cursor, etc.) to drive Virtuoso.
-- CLI-first: `virtuoso-bridge start/status/restart`, no GUI needed
+- CLI-first lifecycle and diagnostics: `virtuoso-bridge start/status/restart`
 - Ships with pre-defined agent skill files (`skills/`) — the agent knows how to use the bridge immediately
-- Optimized for high-frequency agent interactions with persistent SSH tunnels
+- Optimized for high-frequency agent interactions with resilient, role-aware SSH routing
 
 > **If you are an AI agent**, read [`AGENTS.md`](AGENTS.md) first and follow its setup checklist.
 
@@ -57,8 +58,9 @@ Spectre.
 
 ### Python environment selection
 
-Python entry points discover the nearest parent `.env` containing
-`VB_REMOTE_HOST` or `VB_LOCAL_PORT`, then load it with `override=True`; this can
+Python entry points discover the nearest parent `.env` containing a bridge host
+role (`VB_REMOTE_HOST`, `VB_GUI_HOST`, `VB_DAEMON_HOST`, and related roles) or
+`VB_LOCAL_PORT`, then load it with `override=True`; this can
 change a long-lived process from local to remote mode. Pin the intended file
 before constructing a client when embedding the bridge:
 
@@ -89,13 +91,128 @@ virtuoso-bridge start          # starts tunnel and prints the CIW load(...) line
 virtuoso-bridge status         # tunnel + Virtuoso daemon + Spectre availability
 ```
 
+If the daemon is not loaded yet, the normal manual `load(...)` remains valid.
+For an opt-in X11 bootstrap, first select an explicit top-level CIW and then
+inject only the generated setup command:
+
+```bash
+virtuoso-bridge list-windows --top-level --json
+virtuoso-bridge bootstrap --window 0x3000012
+```
+
+`bootstrap` refuses windows that are not identified as a CIW and does not
+accept arbitrary SKILL text.
+
+### Split GUI and daemon hosts
+
+`VB_REMOTE_HOST` remains the simple one-host setting. In installations where
+Virtuoso runs on a GUI/login host but `ipcBeginProcess()` launches the daemon on
+a compute host, configure the roles explicitly:
+
+```dotenv
+VB_GUI_HOST=gui-host-a
+VB_DEPLOY_HOST=gui-host-a
+VB_DAEMON_HOST=compute-host-b
+VB_SPECTRE_HOST=compute-host-b
+VB_REMOTE_USER=user
+VB_JUMP_HOST=gui-host-a
+
+# Must be readable from the CIW and daemon host; /tmp is often isolated.
+VB_REMOTE_SCRATCH_ROOT=/home/user/.virtuoso-bridge
+```
+
+The defaults are deployment = GUI and Spectre = legacy/daemon host. The shared
+jump host is suppressed automatically when the target itself is the jump host.
+`status` reads a daemon identity file written from the CIW banner, so it can
+diagnose a daemon/tunnel host mismatch even when the TCP endpoint is wrong.
+
 On Windows PowerShell, replace the activation line with
 `.\.venv\Scripts\Activate.ps1`.
+
+### Single-connection SSH concurrency
+
+OpenSSH `ControlMaster` is not usable with every Windows SSH build. For real
+multi-session multiplexing inside one bridge process, install the Paramiko
+backend and select it explicitly:
+
+```bash
+uv pip install -e '.[ssh]'
+```
+
+```dotenv
+VB_SSH_BACKEND=paramiko
+VB_SSH_MAX_SESSIONS=10
+# Optional: route the first SSH hop through an unauthenticated SOCKS5 proxy.
+VB_SSH_PROXY=socks5://127.0.0.1:10800
+```
+
+Commands and file transfers then share one authenticated target SSH Transport;
+each operation opens a channel on that Transport. Bulk and recursive transfers
+use the same tar plans as the OpenSSH backend; text uploads use the shared atomic
+staging plan, while single-file downloads use SFTP. `VB_SSH_MAX_SESSIONS` is a
+client-side gate and must be no greater than the target sshd `MaxSessions`.
+Waiting work queues at the gate
+instead of opening another command connection. There is no automatic fallback
+to independent SSH connections.
+
+`VB_SSH_PROXY` is optional and applies only to Paramiko-backed commands and file
+transfers, including SFTP. It does not affect the OpenSSH `-L` tunnel created by
+`virtuoso-bridge start`; environments that also need this tunnel to traverse
+SOCKS5 must configure an OpenSSH `ProxyCommand` in the SSH config used by the
+bridge. `VB_SSH_PROXY` accepts an explicit `socks5://host:port` URL without
+credentials and asks the proxy to resolve the proxied first-hop hostname. For
+direct connections the proxy opens the target SSH socket. With `VB_JUMP_HOST`
+or one `ProxyJump` hop, it opens the jump-host socket and Paramiko reaches the
+target through that SSH transport. Proxy failures are reported directly; the
+bridge does not fall back to a direct or OpenSSH command connection.
+While the proxy is active, SSH config lookup forces `CanonicalizeHostname=no`
+so OpenSSH cannot resolve the proxied first-hop hostname locally before
+Paramiko opens the SOCKS5 connection.
+
+The Paramiko backend reads `VB_SSH_CONFIG` when set, otherwise the normal user
+and system SSH config files. It honors `Include`, host aliases,
+`HostName`/`User`/`Port`, `IdentityFile`, `IdentitiesOnly`, and one `ProxyJump`
+hop. Explicit `VB_REMOTE_*`, `VB_JUMP_*`, and key arguments take precedence.
+`ProxyCommand` fails during initialization unless an explicit `VB_SSH_PROXY`
+overrides it. Chained `ProxyJump` routes and a missing explicit `VB_SSH_CONFIG`
+also fail instead of being silently ignored.
+Both the target and jump host must already have keys in the applicable user or
+system `known_hosts` files; unknown and changed keys are rejected. The backend
+honors `UserKnownHostsFile`, `GlobalKnownHostsFile`, and `HostKeyAlias`. Run the
+documented prerequisite `ssh <host> echo ok` once with OpenSSH to review and
+record a new host key before selecting Paramiko. Paramiko cannot enforce an
+OpenSSH `RevokedHostKeys` file or KRL, so any configured value other than `none`
+fails during initialization instead of silently bypassing revocation policy.
+
+`MaxStartups` governs unauthenticated TCP handshakes, while `MaxSessions`
+governs channels on one authenticated connection. The Paramiko backend avoids
+one handshake per parallel job, but it cannot override the server's
+`MaxSessions`. The long-lived Virtuoso TCP port-forward created by
+`virtuoso-bridge start` remains a standalone, non-ControlMaster OpenSSH process
+because it must survive after the starting CLI and any shared command master
+exit.
 
 ```python
 from virtuoso_bridge import VirtuosoClient
 client = VirtuosoClient.from_env()
 client.execute_skill("1+2")  # VirtuosoResult(status=SUCCESS, output='3')
+```
+
+For fail-fast access to standalone Spectre PSF ASCII artifacts, use the strict
+helpers instead of guessing filenames, keys, or value shapes:
+
+```python
+from pathlib import Path
+from virtuoso_bridge.spectre import SpectreSimulator
+from virtuoso_bridge.spectre.psf import frequency_hz, read_psf_ascii, result_file, vector
+
+result = SpectreSimulator.from_env(work_dir="output").run_simulation("tb.scs")
+if not result.ok:
+    raise RuntimeError(result.errors)
+raw_psf = Path(result.metadata["output_dir"])
+ac = read_psf_ascii(result_file(raw_psf, "*.ac"))
+frequency = frequency_hz(ac)
+vout = vector(ac, "VOUT")  # exact raw PSF key; missing/invalid data raises
 ```
 
 Useful first commands after the bridge is up:
@@ -153,7 +270,8 @@ All commands take `-p PROFILE` / `--env PATH` to pick a non-default config; run 
 | `windows` | List all open Virtuoso windows (number + name) |
 | `screenshot [ciw\|current\|N] [-o DIR\|FILE]` | Capture a window; defaults to the user artifact screenshots directory |
 | `dismiss-dialog` | X11 path: find and dismiss blocking GUI dialogs (saves you when SKILL channel deadlocks on a modal) |
-| `list-windows [--json]` | X11 path: enumerate Virtuoso-related windows, including frame/child IDs and suggested modal actions |
+| `list-windows [--top-level] [--json]` | X11 path: enumerate Virtuoso windows; `--top-level` returns one deduplicated entry per frame for CIW selection |
+| `bootstrap --window WINDOW_ID` | Opt-in X11 first load: inject only the generated `load(...)` into one explicit, verified CIW |
 | `dismiss-window WINDOW_ID [--action enter\|escape\|alt-y\|alt-n]` | X11 path: send an explicit action to one window ID returned by `list-windows` |
 | `window-input WINDOW_ID --expect-title TEXT --action move\|click\|drag --x X --y Y --allow-live` | X11 path: send one bounds-checked pointer action to an explicitly confirmed current child window |
 | `request-status [REQUEST_ID]` | Read the daemon's request ledger over SSH/local filesystem without using the CIW request channel |
@@ -258,11 +376,11 @@ output/20260422_142137__MyLib__myTB/
 └── Interactive.N/
     ├── Interactive.N.{log,rdb,msg.db}           # run-level (rdb = SQLite)
     └── <pt>/<tb>/
-        ├── netlist/   → netlist, input.scs, qpInformation.ils, paramInfo.ils
+        ├── netlist/   → netlist, input.scs, qpInformation.ils, exprOutputs.json, paramInfo.ils
         └── psf/       → spectre.out, logFile, dcOp.dc, *.ac, *.tran, ...
 ```
 
-Per-point `netlist/` keeps only the 4 files that actually describe the design (main SPICE netlist, testbench top level, FOM definitions, corner label). Psf keeps stdout + logs + non-binary analysis results. The full rule set — including what's commented out and why — lives in [`src/virtuoso_bridge/virtuoso/maestro/snapshot_filter.yaml`](src/virtuoso_bridge/virtuoso/maestro/snapshot_filter.yaml); edit the YAML (uncomment / comment lines) to add or drop files, no code change needed. Binary waveforms (`*.raw`, `wavedb/`) are never pulled — read scalar results through `client.maestro.read_results()` instead.
+Per-point `netlist/` keeps only the 5 files that describe the runnable design and outputs (main SPICE netlist, testbench top level, SKILL and JSON output-expression definitions, corner label). Psf keeps stdout + logs + non-binary analysis results. The full rule set — including what's commented out and why — lives in [`src/virtuoso_bridge/virtuoso/maestro/snapshot_filter.yaml`](src/virtuoso_bridge/virtuoso/maestro/snapshot_filter.yaml); edit the YAML (uncomment / comment lines) to add or drop files, no code change needed. Binary waveforms (`*.raw`, `wavedb/`) are never pulled — read scalar results through `client.maestro.read_results()` instead.
 
 ## Exposing skills to your coding agent
 
@@ -301,7 +419,7 @@ same pattern — point their skills path at `skills/` in this repo.
 
 - **VirtuosoClient** — pure TCP SKILL client. Sends SKILL as JSON, gets results. No SSH awareness.
 - **SpectreSimulator** — runs standalone Spectre simulations locally or through SSH, then parses PSF ASCII results into Python data.
-- **SSHClient** — maintains a persistent ControlMaster connection for TCP port-forwarding, remote shell commands, and file transfer. Optional — bypassed in local mode.
+- **SSHClient** — resolves GUI, deployment, daemon, and Spectre host roles; maintains a standalone TCP port-forward to the daemon host and uses OpenSSH or process-local Paramiko transports for role-specific commands and files. Optional — bypassed in local mode.
 
 Fully decoupled: VirtuosoClient works with any TCP endpoint — SSH tunnel, VPN, direct LAN, or local. Multiple connection profiles are supported, each managing an independent tunnel to a separate design server.
 
@@ -380,13 +498,3 @@ If you use virtuoso-bridge in academic work, please cite:
 - **Xintian Li** — Tsinghua University
 - **Nan Sun** — Tsinghua University
 - **Lu Jie** — Tsinghua University
-
-## Star History
-
-<a href="https://star-history.com/#Arcadia-1/virtuoso-bridge-lite&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Arcadia-1/virtuoso-bridge-lite&type=Date&theme=dark"/>
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Arcadia-1/virtuoso-bridge-lite&type=Date"/>
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Arcadia-1/virtuoso-bridge-lite&type=Date"/>
-  </picture>
-</a>

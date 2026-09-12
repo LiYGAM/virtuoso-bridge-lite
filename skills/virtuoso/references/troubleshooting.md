@@ -70,17 +70,23 @@ If the run directory already exists, the dialog "Run Directory exists but has no
 ### Maestro dialogs block the SKILL channel
 GUI dialogs ("Specify history name", "No analyses enabled", etc.) block the entire CIW event loop. All `execute_skill` calls will timeout until the dialog is dismissed.
 
-**Detection:** if `maeWaitUntilDone` returns empty/nil, a dialog is likely blocking.
+**Detection:** `client.maestro.run_and_wait(...)` times out, or an ordinary
+`execute_skill()` call times out while a modal form is visible in Virtuoso.
+Do not depend on another SKILL call for initial recovery: the dialog may have
+blocked the same CIW event loop that serves the bridge.
 
-**Recovery:**
-```python
-client.execute_skill("hiFormDone(hiGetCurrentForm())", timeout=5)
+**Recovery (out of band through X11):**
+```bash
+virtuoso-bridge dismiss-dialog
+virtuoso-bridge list-windows --top-level --json
+virtuoso-bridge dismiss-window WINDOW_ID --action enter
+virtuoso-bridge screenshot ciw -o output/debug.png
 ```
-If still stuck, the user must manually dismiss the dialog in Virtuoso. Take a screenshot to diagnose:
-```python
-client.execute_skill('hiWindowSaveImage(?target hiGetCurrentWindow() ?path "/tmp/debug.png" ?format "png" ?toplevel t)')
-client.download_file("/tmp/debug.png", "output/debug.png")
-```
+
+The first command recognizes common modal dialogs automatically. Use the
+explicit window commands when no known-dialog rule matches. A short
+`hiFormDone(hiGetCurrentForm())` call is only a secondary option after the
+SKILL channel responds again.
 
 ### ASSEMBLER-8127: cellview already open in edit mode
 `maeMakeEditable()` fails with a modal dialog when the same cellview is already open in editable mode in another session (e.g. `fnxSession21` has it open while you try from `fnxSession0`). This dialog **completely blocks** the SKILL channel — even `hiFormDone` cannot reach it.
@@ -178,8 +184,8 @@ Or skip SKILL string-matching entirely and filter on the Python side via `client
 ### `mae*` functions undefined (`*Error* undefined function`)
 Older Virtuoso versions may not have `mae*` API. Use `asi*` equivalents instead. See the "asi\* Fallback" section in `maestro-skill-api.md` for the full mapping table. Detection: `fboundp('maeRunSimulation)`.
 
-### `maeGetSetup(?typeName "globalVar")` may return nil
-Use `asiGetDesignVarList(asiGetCurrentSession())` as a fallback.
+### `maeGetSetup(?typeName "globalVar")` reports an unsupported type
+`"globalVar"` is not a valid `maeGetSetup` type in IC23.1 ISR16. Do not use it as a variable-discovery API. Use `asiGetDesignVarList(asiGetCurrentSession())` to read design variables; use `maeGetVar` / `maeSetVar` for one named variable. In IC23.1, `maeGetSetup` supports the types reported by its error message, including `"tests"`, `"corners"`, `"variables"`, and `"parameters"`.
 
 ### Global vs test-level variables
 `maeSetVar("f" "1G")` sets a **global** variable. To set a test-level variable:
@@ -202,4 +208,6 @@ CIW is overloaded or a dialog is blocking. Check Virtuoso GUI state before retry
 The cellview doesn't exist or is locked by another process. Verify with `ddGetObj(lib cell view)` before opening.
 
 ### `.il line 16` SKILL probe failure
-The RAMIC daemon setup script failed to load. Re-run `load("/tmp/virtuoso_bridge_zhangz/setup.il")` in CIW.
+The RAMIC daemon setup script failed to load. Run `virtuoso-bridge status` and
+paste the exact generated `load("...")` line into CIW, or use the explicit
+`list-windows --top-level` + `bootstrap --window WINDOW_ID` flow.

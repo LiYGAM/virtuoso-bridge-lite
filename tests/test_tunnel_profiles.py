@@ -141,6 +141,7 @@ def test_remote_setup_path_and_port_are_profile_scoped(monkeypatch) -> None:
     )
     assert fake.uploads[compat_setup_path] == setup
     assert 'setShellEnvVar("RB_PORT" "65263")' in setup
+    assert 'setShellEnvVar("RB_IDENTITY_PATH"' in setup
     assert 'setShellEnvVar("RB_BIND_HOST" "127.0.0.1")' in setup
     assert 'setShellEnvVar("RB_PROFILE" "t28_digital")' in setup
     assert 'setShellEnvVar("RB_AUTH_TOKEN_FILE" "/tmp/virtuoso_bridge_designer/90590/virtuoso_bridge_t28_digital/auth.token")' in setup
@@ -940,3 +941,58 @@ def test_tunnel_run_command_only_retries_explicit_read_only_operations() -> None
     client.run_command("test -f /tmp/marker", operation_class="read_only")
 
     assert calls == [False, True]
+
+
+def test_status_diagnoses_banner_host_when_tunnel_endpoint_is_wrong(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "_load_cli_env", lambda: None)
+    monkeypatch.setattr(cli, "_print_spectre_status", lambda profile, suffix: None)
+    monkeypatch.setattr(cli, "_CLI_PROFILE", ["split"])
+    monkeypatch.setenv("VB_GUI_HOST_split", "gui-a")
+    monkeypatch.setenv("VB_DEPLOY_HOST_split", "gui-a")
+    monkeypatch.setenv("VB_DAEMON_HOST_split", "gui-a")
+    monkeypatch.setenv("VB_REMOTE_USER_split", "designer")
+
+    class _FakeSSHClient:
+        @staticmethod
+        def read_state(profile=None):
+            return {
+                "port": 65271,
+                "setup_path": "/shared/virtuoso_setup.il",
+                "daemon_endpoint_hostname": "gui-a.example.edu",
+            }
+
+        @staticmethod
+        def is_running(profile=None):
+            return True
+
+        @classmethod
+        def from_env(cls, **_kwargs):
+            return cls()
+
+        def read_daemon_identity(self):
+            return {"host": "compute-b", "ip": "192.0.2.20"}
+
+        def probe_daemon_endpoint_hostname(self):
+            return "gui-a.example.edu"
+
+        def close(self):
+            pass
+
+    class _FakeVirtuosoClient:
+        def __init__(self, host, port, timeout):
+            pass
+
+        def test_connection(self, timeout=5):
+            return False
+
+    monkeypatch.setattr("virtuoso_bridge.transport.tunnel.SSHClient", _FakeSSHClient)
+    monkeypatch.setattr("virtuoso_bridge.virtuoso.basic.bridge.VirtuosoClient", _FakeVirtuosoClient)
+
+    rc = cli._print_status()
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[daemon host]" in out
+    assert "compute-b" in out
+    assert "gui-a.example.edu" in out
+    assert "VB_DAEMON_HOST_split=compute-b" in out

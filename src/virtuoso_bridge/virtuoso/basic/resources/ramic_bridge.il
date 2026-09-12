@@ -29,6 +29,11 @@ RBLocal = (RBBindHost == "127.0.0.1")                                           
 RBAuthTokenFile = if(getShellEnvVar("RB_AUTH_TOKEN_FILE") getShellEnvVar("RB_AUTH_TOKEN_FILE") "")
 RBRequestStateFile = if(getShellEnvVar("RB_REQUEST_STATE_FILE") getShellEnvVar("RB_REQUEST_STATE_FILE") "")
 RBProfile = if(getShellEnvVar("RB_PROFILE") getShellEnvVar("RB_PROFILE") "")
+RBIdentityPath = if(getShellEnvVar("RB_IDENTITY_PATH") then
+                getShellEnvVar("RB_IDENTITY_PATH")
+            else
+                ""
+            )
 RBEcho = nil                                                                     ; Echo bridging messages for debugging
 RBDLog = nil                                                                     ; Enable daemon logging to /tmp/RB.log
 
@@ -53,6 +58,20 @@ unless(boundp('RBLastIP) RBLastIP = "")
 unless(boundp('RBStatCount) RBStatCount = 0)
 unless(boundp('RBStatErrors) RBStatErrors = 0)
 unless(boundp('RBStatUptime) RBStatUptime = 0)
+
+; Persist the daemon banner next to the generated setup file.  The CLI can
+; read this through the deployment/GUI host even when its TCP tunnel points
+; at the wrong machine, which makes split-host bootstrap failures diagnosable.
+procedure(RBWriteIdentity()
+    when(RBIdentityPath && strlen(RBIdentityPath) > 0
+        errset(
+            let((port)
+                port = outfile(RBIdentityPath)
+                when(port
+                    fprintf(port "host=%s\nip=%s\npid=%L\nbind=%s\n"
+                        RBLastHost RBLastIP RBLastPid RBLastBind)
+                    close(port)))))
+)
 
 procedure(RBIpcDataHandler(ipcId data)
   ; Handler for successful data received from the Python daemon.
@@ -127,6 +146,7 @@ procedure(RBIpcErrHandler(ipcId data)
                     RBLastHost = substring(tok 6))
                 when(strlen(tok) > 3 && equal(substring(tok 1 3) "ip=")
                     RBLastIP = substring(tok 4)))
+            RBWriteIdentity()
             ; First banner of this daemon's lifetime --> announce
             ; "ready" with the populated identity.  RBStart printed
             ; only "launching" earlier; this is the authoritative

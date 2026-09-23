@@ -1797,9 +1797,18 @@ let((result winName ciwNum)
                 daemon_request_digest = str(
                     header.get("request_digest_sha256") or ""
                 )
+                # Authentication is rejected before the daemon computes a request digest.
+                # Only this exact pre-admission response may omit the digest.
+                auth_rejected = (
+                    not daemon_request_digest
+                    and header.get("status") == "rejected"
+                    and header.get("marker") == "NAK"
+                    and payload_bytes == b"AUTH_REQUIRED"
+                )
                 if (
                     request_digest_sha256
                     and daemon_request_digest != request_digest_sha256
+                    and not auth_rejected
                 ):
                     raise _V3FrameError("VBR3 request digest mismatch")
                 payload = payload_bytes.decode("utf-8")

@@ -521,6 +521,28 @@ def test_protocol_v3_rejects_incomplete_or_tampered_frames(mutation: str) -> Non
     assert result.metadata["frame_integrity"] == "invalid"
 
 
+@pytest.mark.parametrize("status,marker,payload,digest,accepted", [
+    ("rejected", "NAK", b"AUTH_REQUIRED", None, True),
+    ("rejected", "NAK", b"AUTH_REQUIRED", "wrong", False),
+    ("succeeded", "STX", b"AUTH_REQUIRED", None, False),
+    ("rejected", "NAK", b"OTHER_ERROR", None, False),
+    ("rejected", "STX", b"AUTH_REQUIRED", None, False),
+])
+def test_protocol_v3_auth_rejection_without_digest(status, marker, payload, digest, accepted):
+    raw = _v3_frame("auth-request", payload, status=status, marker=marker,
+                    request_digest_sha256=digest)
+    result = VirtuosoClient._parse_response(raw, 0.1, request_id="auth-request",
+                                           request_digest_sha256="a" * 64)
+    assert result.status == ExecutionStatus.ERROR
+    if accepted:
+        assert result.errors == ["AUTH_REQUIRED"]
+        assert result.completion == CompletionStatus.NOT_DISPATCHED
+        assert result.metadata["frame_integrity"] == "verified"
+    else:
+        assert result.completion == CompletionStatus.TIMED_OUT_UNKNOWN
+        assert result.metadata["frame_integrity"] == "invalid"
+
+
 def test_protocol_v3_falls_back_only_on_exact_legacy_rejection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

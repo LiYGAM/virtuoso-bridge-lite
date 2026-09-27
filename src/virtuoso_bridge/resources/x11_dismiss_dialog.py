@@ -155,7 +155,175 @@ def _read_window_info(win_id):
     return {"geometry": geometry, "mapped": mapped}
 
 
-WINDOW_INPUT_ACTIONS = ("move", "click", "drag")
+WINDOW_INPUT_ACTIONS = ("move", "click", "drag", "text", "key")
+
+
+def keyboard_chords(action, text=None, key=None):
+    """Validate a bounded request; never interpret text as shortcuts."""
+    names = {"Tab": "Tab", "Enter": "Return", "Return": "Return",
+             "Esc": "Escape", "Escape": "Escape", "Backspace": "BackSpace",
+             "Delete": "Delete", "Left": "Left", "Right": "Right",
+             "Up": "Up", "Down": "Down", "Home": "Home", "End": "End",
+             "Space": "space"}
+    if action == "text":
+        if key is not None or not text or len(text) > 256:
+            raise ValueError("text requires 1-256 printable ASCII characters and no key")
+        if any(ord(c) < 32 or ord(c) > 126 for c in text):
+            raise ValueError("text supports printable ASCII only; use key for control keys")
+        return [[ord(c)] for c in text]
+    if action == "key":
+        if text is not None or not key:
+            raise ValueError("key requires one named key/chord and no text")
+        parts = key.split("+")
+        mods = {"Ctrl": "Control_L", "Shift": "Shift_L", "Alt": "Alt_L"}
+        if len(parts) > 4 or len(set(parts[:-1])) != len(parts[:-1]):
+            raise ValueError("invalid key modifiers")
+        if any(p not in mods for p in parts[:-1]):
+            raise ValueError("supported modifiers: Ctrl, Shift, Alt")
+        last = parts[-1]
+        symbol = names.get(last)
+        if symbol is None and len(last) == 1 and ord(last) < 128 and last.isalnum():
+            symbol = ord(last.lower())
+        if symbol is None:
+            raise ValueError("unsupported key name")
+        return [[mods[p] for p in parts[:-1]] + [symbol]]
+    if text is not None or key is not None:
+        raise ValueError("text/key payload is only valid for keyboard actions")
+    return None
+
+
+def _configure_keyboard_x11(xlib, xtst):
+    p, u = ctypes.c_void_p, ctypes.c_ulong
+    xlib.XGetInputFocus.argtypes = [p, ctypes.POINTER(u), ctypes.POINTER(ctypes.c_int)]
+    xlib.XQueryTree.argtypes = [p, u, ctypes.POINTER(u), ctypes.POINTER(u),
+                              ctypes.POINTER(ctypes.POINTER(u)), ctypes.POINTER(ctypes.c_uint)]
+    xlib.XFree.argtypes = [p]
+    xlib.XStringToKeysym.argtypes = [ctypes.c_char_p]
+    xlib.XStringToKeysym.restype = u
+    xlib.XKeysymToKeycode.argtypes = [p, u]
+    xlib.XKeysymToKeycode.restype = ctypes.c_ubyte
+    xlib.XKeycodeToKeysym.argtypes = [p, ctypes.c_ubyte, ctypes.c_int]
+    xlib.XKeycodeToKeysym.restype = u
+    xlib.XQueryKeymap.argtypes = [p, ctypes.c_void_p]
+    xlib.XQueryPointer.argtypes = [p, u, ctypes.POINTER(u), ctypes.POINTER(u)] + [ctypes.POINTER(ctypes.c_int)] * 4 + [ctypes.POINTER(ctypes.c_uint)]
+    xtst.XTestFakeKeyEvent.argtypes = [p, ctypes.c_uint, ctypes.c_int, u]
+    xtst.XTestFakeKeyEvent.restype = ctypes.c_int
+
+
+def _keyboard_focus(xlib, dpy, target):
+    focus, revert = ctypes.c_ulong(), ctypes.c_int()
+    xlib.XGetInputFocus(dpy, ctypes.byref(focus), ctypes.byref(revert))
+    original = focus.value
+    current = original
+    for _ in range(64):
+        if current == target:
+            return original
+        if current in (0, 1):
+            break
+        root, parent, count = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_uint()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        ok = xlib.XQueryTree(dpy, current, ctypes.byref(root), ctypes.byref(parent),
+                            ctypes.byref(children), ctypes.byref(count))
+        if children:
+            xlib.XFree(children)
+        if not ok or parent.value == current:
+            break
+        current = parent.value
+    raise RuntimeError("keyboard focus is outside target window; click the intended field first")
+
+
+def _keyboard_idle(xlib, dpy, target):
+    keys = ctypes.create_string_buffer(32)
+    xlib.XQueryKeymap(dpy, keys)
+    if any(bytearray(keys.raw)):
+        raise RuntimeError("physical keys are held; refusing keyboard input")
+    root, child, mask = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_uint()
+    coords = [ctypes.c_int() for _ in range(4)]
+    if not xlib.XQueryPointer(dpy, target, ctypes.byref(root), ctypes.byref(child),
+                             ctypes.byref(coords[0]), ctypes.byref(coords[1]),
+                             ctypes.byref(coords[2]), ctypes.byref(coords[3]), ctypes.byref(mask)):
+        raise RuntimeError("cannot inspect keyboard modifier state")
+    # NumLock is harmless for the supported non-keypad symbols; other modifiers
+    # (including CapsLock and mouse buttons) can alter input semantics.
+    if mask.value & ~16:
+        raise RuntimeError("active modifiers/buttons (including CapsLock); refusing input")
+
+
+def _keyboard_codes(xlib, dpy, chords):
+    result = []
+    shift = xlib.XKeysymToKeycode(dpy, xlib.XStringToKeysym(b"Shift_L"))
+    for chord in chords:
+        codes = []
+        for symbol in chord:
+            sym = symbol if isinstance(symbol, int) else xlib.XStringToKeysym(symbol.encode("ascii"))
+            code = xlib.XKeysymToKeycode(dpy, sym)
+            if not code:
+                raise ValueError("key is absent from current X keyboard map")
+            if xlib.XKeycodeToKeysym(dpy, code, 0) != sym:
+                if not shift or xlib.XKeycodeToKeysym(dpy, code, 1) != sym:
+                    raise ValueError("key requires an unsupported keyboard layout/group")
+                if shift not in codes:
+                    codes.append(shift)
+            if code not in codes:
+                codes.append(code)
+        result.append(codes)
+    return result
+
+
+def send_keyboard_input(display, prepared, timing, refresh_preflight, dry_run=False):
+    """Require existing target focus; release every injected key even on failure."""
+    result = dict(prepared)
+    result.update(sent=False, events_sent=0, retry_safe=False)
+    dpy, held = None, []
+    try:
+        xlib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("X11") or "libX11.so.6")
+        xtst = ctypes.cdll.LoadLibrary(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+        _configure_pointer_x11(xlib, xtst)
+        _configure_keyboard_x11(xlib, xtst)
+        dpy = xlib.XOpenDisplay(display.encode("ascii"))
+        if not dpy:
+            raise RuntimeError("cannot open display")
+        target = int(prepared["window_id"], 0)
+        result["focus_before"] = hex(_keyboard_focus(xlib, dpy, target))
+        _keyboard_idle(xlib, dpy, target)
+        codes = _keyboard_codes(xlib, dpy, prepared["chords"])
+        refreshed = refresh_preflight()
+        if refreshed["fingerprint"] != prepared["fingerprint"]:
+            raise RuntimeError("target fingerprint changed")
+        result["dry_run"] = dry_run
+        if dry_run:
+            result["planned_chords"] = codes
+            return result
+        if timing["settle_ms"]:
+            time.sleep(timing["settle_ms"] / 1000.0)
+        for chord in codes:
+            _keyboard_focus(xlib, dpy, target)
+            _keyboard_idle(xlib, dpy, target)
+            for code in chord:
+                held.append(code)
+                result["sent"] = True
+                _xtest_or_raise(xtst.XTestFakeKeyEvent, "XTestFakeKeyEvent", dpy, code, True, 0)
+                result["events_sent"] += 1
+            for code in reversed(chord):
+                _xtest_or_raise(xtst.XTestFakeKeyEvent, "XTestFakeKeyEvent", dpy, code, False, 0)
+                held.remove(code)
+                result["events_sent"] += 1
+            _sync_or_raise(xlib, dpy, "keyboard input")
+            time.sleep(0.005)
+        result["delivery"] = "events-sent; application effect requires separate verification"
+    except Exception as exc:
+        result["error"] = str(exc)
+        result["completion"] = "unknown" if result["sent"] else "not-sent"
+    finally:
+        if dpy:
+            for code in reversed(held):
+                try:
+                    xtst.XTestFakeKeyEvent(dpy, code, False, 0)
+                except Exception:
+                    pass
+            xlib.XFlush(dpy)
+            xlib.XCloseDisplay(dpy)
+    return result
 WINDOW_INPUT_POSTCONDITIONS = (
     "none", "still-mapped", "unmapped", "same-fingerprint", "title-contains",
 )
@@ -230,8 +398,9 @@ def _validate_window_input_timing(settle_ms=50, hold_ms=0,
     return values
 
 
-def preflight_window_input(windows, window_id, expect_title, action, x, y,
-                           button=1, to_x=None, to_y=None, window_info=None):
+def preflight_window_input(windows, window_id, expect_title, action, x=None, y=None,
+                           button=1, to_x=None, to_y=None, window_info=None,
+                           text=None, key=None):
     """Validate a pointer operation without opening X11 or emitting events.
 
     ``windows`` must be a freshly discovered list from :func:`discover_windows`
@@ -242,6 +411,11 @@ def preflight_window_input(windows, window_id, expect_title, action, x, y,
         raise ValueError("--expect-title is required")
     if action not in WINDOW_INPUT_ACTIONS:
         raise ValueError("unsupported action: %s" % action)
+    chords = keyboard_chords(action, text, key)
+    if chords is not None:
+        if any(v is not None for v in (x, y, to_x, to_y)):
+            raise ValueError("keyboard actions do not accept pointer coordinates")
+        x, y = 0, 0
     try:
         button = int(button)
     except (TypeError, ValueError):
@@ -302,6 +476,10 @@ def preflight_window_input(windows, window_id, expect_title, action, x, y,
         "relative": {"x": x, "y": y},
         "root": {"x": root_x + x, "y": root_y + y},
     }
+    if chords is not None:
+        if expect_title != title:
+            raise ValueError("keyboard actions require the exact window title")
+        prepared["chords"] = chords
     if action == "drag":
         prepared["relative"].update({"to_x": to_x, "to_y": to_y})
         prepared["root"].update({"to_x": root_x + to_x, "to_y": root_y + to_y})
@@ -480,15 +658,15 @@ def _evaluate_window_input_postcondition(postcondition, before, after,
     return result
 
 
-def window_input(display, window_id, expect_title, action, x, y, button=1,
+def window_input(display, window_id, expect_title, action, x=None, y=None, button=1,
                  to_x=None, to_y=None, dry_run=False, settle_ms=50,
                  hold_ms=0, drag_duration_ms=0, drag_steps=1,
-                 postcondition="none", post_expect_title=None):
+                 postcondition="none", post_expect_title=None, text=None, key=None):
     """Discover, refresh, bounds-check, then send one explicit pointer action."""
     windows = discover_windows(display)
     info = _read_window_info(window_id)
     prepared = preflight_window_input(
-        windows, window_id, expect_title, action, x, y, button, to_x, to_y, info,
+        windows, window_id, expect_title, action, x, y, button, to_x, to_y, info, text, key,
     )
     timing = _validate_window_input_timing(
         settle_ms, hold_ms, drag_duration_ms, drag_steps,
@@ -498,7 +676,7 @@ def window_input(display, window_id, expect_title, action, x, y, button=1,
     if postcondition == "title-contains" and not post_expect_title:
         raise ValueError("title-contains requires --post-expect-title")
     state_before = _prepared_window_input_state(prepared)
-    if dry_run:
+    if dry_run and action not in ("text", "key"):
         result = dict(prepared)
         result.update({
             "sent": False,
@@ -516,12 +694,18 @@ def window_input(display, window_id, expect_title, action, x, y, button=1,
         current_info = _read_window_info(window_id)
         return preflight_window_input(
             current_windows, window_id, expect_title, action, x, y, button,
-            to_x, to_y, current_info,
+            to_x, to_y, current_info, text, key,
         )
 
-    result = send_window_input(
-        display, prepared, timing=timing, refresh_preflight=refresh_preflight,
-    )
+    if action in ("text", "key"):
+        result = send_keyboard_input(display, prepared, timing, refresh_preflight, dry_run)
+        if dry_run:
+            result["state_before"] = state_before
+            return result
+    else:
+        result = send_window_input(
+            display, prepared, timing=timing, refresh_preflight=refresh_preflight,
+        )
     state_after = _capture_window_input_state(display, window_id)
     result["state_before"] = state_before
     result["state_after"] = state_after
@@ -1149,6 +1333,8 @@ def main():
     input_target = None
     expect_title = None
     input_x = None
+    input_text = None
+    input_key = None
     input_y = None
     input_to_x = None
     input_to_y = None
@@ -1199,6 +1385,22 @@ def main():
                 print(json.dumps({"error": "--window-input requires a window id"}))
                 sys.exit(2)
             input_target = args[i + 1]
+            i += 1
+        elif args[i] in ("--text", "--text-base64", "--key"):
+            if i + 1 >= len(args):
+                print(json.dumps({"error": "keyboard payload is missing"}))
+                sys.exit(2)
+            if args[i] == "--text-base64":
+                import base64
+                try:
+                    input_text = base64.b64decode(args[i + 1]).decode("utf-8")
+                except Exception:
+                    print(json.dumps({"error": "invalid base64 text payload"}))
+                    sys.exit(2)
+            elif args[i] == "--text":
+                input_text = args[i + 1]
+            else:
+                input_key = args[i + 1]
             i += 1
         elif args[i] == "--expect-title":
             if i + 1 >= len(args):
@@ -1270,14 +1472,14 @@ def main():
         try:
             if not dry_run and not allow_live:
                 raise ValueError("--allow-live is required")
-            if input_x is None or input_y is None:
+            if action not in ("text", "key") and (input_x is None or input_y is None):
                 raise ValueError("--window-input requires --x and --y")
             active_display = _unique_window_env(x11_envs, input_target)
             result = window_input(
                 active_display, input_target, expect_title, action, input_x, input_y,
                 input_button, input_to_x, input_to_y, dry_run, settle_ms,
                 hold_ms, drag_duration_ms, drag_steps, postcondition,
-                post_expect_title,
+                post_expect_title, input_text, input_key,
             )
             result["display"] = active_display
         except ValueError as exc:

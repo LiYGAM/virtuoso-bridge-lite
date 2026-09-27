@@ -274,6 +274,7 @@ All commands take `-p PROFILE` / `--env PATH` to pick a non-default config; run 
 | `bootstrap --window WINDOW_ID` | Opt-in X11 first load: inject only the generated `load(...)` into one explicit, verified CIW |
 | `dismiss-window WINDOW_ID [--action enter\|escape\|alt-y\|alt-n]` | X11 path: send an explicit action to one window ID returned by `list-windows` |
 | `window-input WINDOW_ID --expect-title TEXT --action move\|click\|drag --x X --y Y --allow-live` | X11 path: send one bounds-checked pointer action to an explicitly confirmed current child window |
+| `window-input WINDOW_ID --expect-title TEXT --action text\|key --text=TEXT / --key Ctrl+A --allow-live` | Send keyboard input to an already focused target; see [keyboard constraints](docs/window-keyboard-input.md) |
 | `request-status [REQUEST_ID]` | Read the daemon's request ledger over SSH/local filesystem without using the CIW request channel |
 | `deployment-status` | Compare packaged, staged, and running daemon/SKILL identity; see [activation status](READMEs/README.zh-CN.md#部署和窗口操作的状态判断) |
 | `snapshot [-o DIR] [--history H]` | Dump the focused Virtuoso window (maestro/schematic/...) — brief by default, full disk dump with `-o` |

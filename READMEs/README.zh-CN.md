@@ -241,6 +241,8 @@ virtuoso-bridge load my_script.il
 `dismiss-window` 和 `window-input` 会先定位唯一的 DISPLAY，再使用该 DISPLAY
 对应的 XAUTHORITY。没有匹配窗口或同一 XID 出现在多个 DISPLAY 时会拒绝操作；
 可通过 `VB_DISPLAY` 明确选择。`window-input --dry-run` 同样执行这些检查，但不发送输入。
+`window-input` 也支持 `--action text --text=...` 和 `--action key --key Ctrl+A`，
+要求完整标题匹配且焦点已在目标窗口内。参见[键盘输入约束与示例](../docs/window-keyboard-input.md)。
 
 ## 导出 Maestro 运行快照
 

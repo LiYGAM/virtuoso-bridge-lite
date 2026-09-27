@@ -2184,12 +2184,22 @@ def cli_dismiss_window(*, window_id: str, action: str = "enter") -> int:
     return 0 if ok else 1
 
 
+def _decode_keyboard_text(value: str) -> str:
+    import base64
+    import binascii
+    try:
+        return base64.b64decode(value, validate=True).decode("utf-8")
+    except (ValueError, UnicodeError, binascii.Error) as exc:
+        raise argparse.ArgumentTypeError("invalid base64 UTF-8 text") from exc
+
+
 def cli_window_input(*, window_id: str, expect_title: str, action: str,
                      x: int, y: int, button: int, to_x: int | None,
                      to_y: int | None, allow_live: bool, dry_run: bool,
                      settle_ms: int, hold_ms: int, drag_duration_ms: int,
                      drag_steps: int, postcondition: str,
-                     post_expect_title: str | None) -> int:
+                     post_expect_title: str | None, text: str | None = None,
+                     key: str | None = None) -> int:
     """Perform one explicitly confirmed, bounds-checked X11 pointer action."""
     _load_cli_env()
     from virtuoso_bridge.virtuoso import x11
@@ -2200,6 +2210,8 @@ def cli_window_input(*, window_id: str, expect_title: str, action: str,
         window_id,
         expect_title=expect_title,
         action=action,
+        text=text,
+        key=key,
         x=x,
         y=y,
         button=button,
@@ -3036,11 +3048,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp_window_input.add_argument("window_id", help="Child id reported by list-windows")
     sp_window_input.add_argument("--expect-title", required=True,
                                  help="Required substring of the currently discovered child title")
-    sp_window_input.add_argument("--action", required=True, choices=["move", "click", "drag"],
+    sp_window_input.add_argument("--action", required=True, choices=["move", "click", "drag", "text", "key"],
                                  help="Pointer action to perform")
-    sp_window_input.add_argument("--x", required=True, type=int,
+    keyboard_payload = sp_window_input.add_mutually_exclusive_group()
+    keyboard_payload.add_argument("--text", help="1-256 printable ASCII characters")
+    keyboard_payload.add_argument("--text-base64", dest="text", type=_decode_keyboard_text,
+                                  help="Base64 UTF-8 transport for shell wrappers")
+    sp_window_input.add_argument("--key", help="Named key or chord, e.g. Tab or Ctrl+A")
+    sp_window_input.add_argument("--x", type=int,
                                  help="Relative X coordinate inside the target window")
-    sp_window_input.add_argument("--y", required=True, type=int,
+    sp_window_input.add_argument("--y", type=int,
                                  help="Relative Y coordinate inside the target window")
     sp_window_input.add_argument("--to-x", type=int,
                                  help="Drag endpoint relative X coordinate (drag only)")
@@ -3362,6 +3379,8 @@ def main(argv: list[str] | None = None) -> int:
             window_id=getattr(args, "window_id"),
             expect_title=getattr(args, "expect_title"),
             action=getattr(args, "action"),
+            text=getattr(args, "text", None),
+            key=getattr(args, "key", None),
             x=getattr(args, "x"),
             y=getattr(args, "y"),
             button=getattr(args, "button", 1),

@@ -31,13 +31,15 @@ def _get_display(display: str | None) -> str | None:
     return os.getenv("VB_DISPLAY") or None
 
 
-def _run(runner: SSHRunner | None, cmd: str, timeout: int):
+def _run(runner: SSHRunner | None, cmd: str, timeout: int, *, retry_transport_errors=True):
     """Dispatch a shell command via SSH or local subprocess.
 
     Returns an object exposing ``.returncode`` / ``.stdout`` / ``.stderr``
     so the call sites can be agnostic to mode.
     """
     if runner is not None:
+        if not retry_transport_errors:
+            return runner.run_command(cmd, timeout=timeout, retry_transport_errors=False)
         return runner.run_command(cmd, timeout=timeout)
     import subprocess
     from types import SimpleNamespace
@@ -247,8 +249,10 @@ def window_input(
     *,
     expect_title: str,
     action: str,
-    x: int,
-    y: int,
+    x: int | None = None,
+    y: int | None = None,
+    text: str | None = None,
+    key: str | None = None,
     button: int = 1,
     to_x: int | None = None,
     to_y: int | None = None,
@@ -263,7 +267,7 @@ def window_input(
     display: str | None = None,
     profile: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Send explicitly opted-in pointer input to one discovered child window.
+    """Send explicitly opted-in pointer or keyboard input to a child window.
 
     The remote helper repeats discovery and reads the target's current mapped
     geometry immediately before sending any XTest event.  Keeping the
@@ -279,11 +283,21 @@ def window_input(
     cmd = (
         f"{py} {script} --window-input {shlex.quote(window_id)} "
         f"--expect-title {shlex.quote(expect_title)} "
-        f"--action {shlex.quote(action)} --x {int(x)} --y {int(y)} "
+        f"--action {shlex.quote(action)} "
         f"--button {int(button)} --settle-ms {int(settle_ms)} "
         f"--hold-ms {int(hold_ms)} --drag-duration-ms {int(drag_duration_ms)} "
         f"--drag-steps {int(drag_steps)} --postcondition {shlex.quote(postcondition)}"
     )
+    if x is not None:
+        cmd += f" --x {int(x)}"
+    if y is not None:
+        cmd += f" --y {int(y)}"
+    if text is not None:
+        import base64
+        encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        cmd += f" --text-base64 {shlex.quote(encoded)}"
+    if key is not None:
+        cmd += f" --key {shlex.quote(key)}"
     if allow_live:
         cmd += " --allow-live"
     if dry_run:
@@ -296,7 +310,21 @@ def window_input(
         cmd += f" --post-expect-title {shlex.quote(post_expect_title)}"
     if resolved:
         cmd += f" {resolved}"
-    return _parse_result(_run(runner, cmd, timeout=15))
+    if action in ("text", "key"):
+        try:
+            results = _parse_result(_run(runner, cmd, timeout=15, retry_transport_errors=False))
+        except Exception as exc:
+            results = [{"error": "keyboard transport failed: %s" % exc}]
+    else:
+        results = _parse_result(_run(runner, cmd, timeout=15))
+    if action in ("text", "key"):
+        if not results:
+            results = [{"error": "keyboard helper returned no receipt"}]
+        for result in results:
+            result["retry_safe"] = False
+            if "error" in result and "completion" not in result:
+                result["completion"] = "unknown"
+    return results
 
 
 def dismiss_dialogs(

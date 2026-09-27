@@ -172,7 +172,7 @@ class _Runner:
         self.uploads: list[tuple[Path, str]] = []
         self.stdout_by_marker = stdout_by_marker
 
-    def run_command(self, command: str, timeout=None):
+    def run_command(self, command: str, timeout=None, **kwargs):
         self.commands.append(command)
         if command.startswith("mkdir -p "):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -238,7 +238,7 @@ def test_window_input_preflight_converts_relative_coordinates_and_orders_drag() 
 @pytest.mark.parametrize(
     ("kwargs", "error"),
     [
-        ({"action": "key", "x": 1, "y": 1}, "unsupported action"),
+        ({"action": "unknown", "x": 1, "y": 1}, "unsupported action"),
         ({"action": "click", "x": 1, "y": 1, "button": 4}, "button must be"),
         ({"action": "click", "x": 843, "y": 1}, "outside current target bounds"),
         ({"action": "drag", "x": 1, "y": 1}, "drag requires both"),
@@ -515,7 +515,9 @@ def test_x11_wrapper_builds_live_window_input_command(monkeypatch) -> None:
     command = next(cmd for cmd in runner.commands if "--window-input" in cmd)
     assert "--window-input 0x4203583" in command
     assert "--expect-title 'ADE Explorer'" in command
-    assert "--action click --x 20 --y 30 --button 1" in command
+    assert "--action click" in command
+    assert "--x 20 --y 30" in command
+    assert "--button 1" in command
     assert "--settle-ms 50 --hold-ms 0 --drag-duration-ms 0 --drag-steps 1" in command
     assert "--allow-live" in command
 
@@ -565,6 +567,7 @@ def test_window_input_cli_parser_dispatches_only_with_live_acknowledgement(monke
     ]) == 0
     assert calls == [{
         "window_id": "0x4203583", "expect_title": "ADE", "action": "move",
+        "text": None, "key": None,
         "x": 20, "y": 30, "button": 1, "to_x": None, "to_y": None, "allow_live": True,
         "dry_run": False, "settle_ms": 50, "hold_ms": 0,
         "drag_duration_ms": 0, "drag_steps": 1, "postcondition": "none",

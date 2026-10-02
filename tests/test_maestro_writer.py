@@ -75,6 +75,22 @@ def test_run_simulation_forwards_timeout_to_skill_request() -> None:
     assert client.skill_kwargs == [{"timeout": 90}]
 
 
+def test_run_simulation_passes_explicit_run_mode() -> None:
+    client = _RecordingClient()
+
+    run_simulation(
+        client,
+        session="session4",
+        callback="done",
+        run_mode='Monte Carlo "Sampling"',
+    )
+
+    assert client.expressions == [
+        'maeRunSimulation(?session "session4" ?callback "done" '
+        '?runMode "Monte Carlo \\"Sampling\\"")'
+    ]
+
+
 def test_run_and_wait_uses_one_timeout_budget(monkeypatch) -> None:
     client = _RecordingClient()
     clock = [100.0]
@@ -95,7 +111,7 @@ def test_run_and_wait_uses_one_timeout_budget(monkeypatch) -> None:
     monkeypatch.setattr(writer, "_wait_until_done", fake_wait)
     monkeypatch.setattr(writer.uuid, "uuid4", lambda: SimpleNamespace(hex="deadbeef"))
 
-    history, status = run_and_wait(client, timeout=60)
+    history, status = run_and_wait(client, run_mode="Monte Carlo Sampling", timeout=60)
 
     assert (history, status) == ('"Interactive.1"', "done")
     assert start_timeouts == [60]

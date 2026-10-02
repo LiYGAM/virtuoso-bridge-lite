@@ -441,7 +441,8 @@ def snapshot(client: VirtuosoClient, *,
     * ``session`` — focused davSession id (``""`` if focus isn't a
       maestro window)
     * ``app`` / ``lib`` / ``cell`` / ``view`` / ``mode`` / ``unsaved`` —
-      parsed from focused window title
+      parsed from focused window title; unknown ``unsaved`` is ``None``
+    * ``state`` — structured context/access/evidence for the focused window
     * ``raw_sections`` — list of ``(label, raw_text)`` tuples (the
       same content as ``state_from_skill.txt`` when ``output_root``
       is given)
@@ -460,11 +461,14 @@ def snapshot(client: VirtuosoClient, *,
     sess = win["session"]
     lib, cell = win["lib"], win["cell"]
     view = win["view"] or "maestro"
+    identified_gui = (
+        win["state"]["context"] == "gui" and bool(sess and lib and cell)
+    )
 
     # Brief mode (no output_root) → 4 probes, 1 round-trip.
     # Disk-dump mode → full 16+ probes, 2 round-trips, plus path /
     # history info needed by _dump_to_dir.
-    if not sess:
+    if not identified_gui:
         bundle = {}
     elif output_root is None:
         bundle = brief_bundle(client, sess=sess, lib=lib, cell=cell, view=view)
@@ -477,12 +481,16 @@ def snapshot(client: VirtuosoClient, *,
         "lib":          lib, "cell": cell, "view": view,
         "mode":         win["mode"],
         "unsaved":      win["unsaved"],
+        "state":        win["state"],
         "raw_sections": bundle.get("raw_sections") or [],
     }
 
     if output_root is not None:
-        if not sess:
-            raise RuntimeError("No focused maestro window.")
+        if not identified_gui:
+            raise RuntimeError(
+                "The focused Maestro window could not be identified safely; "
+                f"context={win['state']['context']} access={win['state']['access']}."
+            )
         # If the caller pinned a specific history (--history CLI flag),
         # use it verbatim — skip the auto-pick.  Otherwise fall back to
         # the mtime-first resolution below.

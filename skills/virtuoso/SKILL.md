@@ -6,13 +6,30 @@ description: "Bridge to remote Cadence Virtuoso via Python API. TRIGGER when use
 # Virtuoso Skill
 
 > **CRITICAL: Do NOT invent SKILL code or API calls from memory.**
-> Before writing any SKILL expression or calling any Python API function:
-> 1. **Search `references/`** for the function name or keyword
-> 2. **Check `examples/`** for a working example of the same operation
-> 3. **Read the actual function signature** (`help()` for Python, `references/*.md` for SKILL)
+> SKILL function names, signatures, and PDK device parameters are **not reliably
+> included in LLM training data** — and they differ between Virtuoso versions
+> (e.g. IC618 vs IC231). Before writing any SKILL expression, calling
+> any SKILL function, or using any library cell:
 >
-> If the function is not documented in references or examples, it probably does not exist
-> or has a different name. Never guess parameter names -- verify first.
+> 1. **Quick check (repo):** search `references/` and `examples/` for the function
+>    name or operation — fastest, no round-trip.
+> 2. **REQUIRED — verify against the installed Cadence docs** (the ground truth for
+>    *this* Virtuoso version):
+>    - SKILL function → `virtuoso-bridge skill-find <name>` (syntax + description),
+>      then `virtuoso-bridge skill-info <name>` (full documentation page)
+>    - Concept / topic → `virtuoso-bridge doc-search "<query>"` (searches all
+>      installed doc sets)
+>    - New host/profile → run `virtuoso-bridge doc-info` **once per session** to
+>      identify the active Virtuoso version and documentation layout before
+>      interpreting any doc results
+> 3. **Library cells:** confirm existence (`ddGetLibList` / `ddGetObj`) and read
+>    the actual cell (symbol pins, CDF params) before instantiating or setting
+>    parameters — never assume pin names or parameter names.
+>
+> If `skill-find` does not find a function, try `doc-search` with related terms
+> before concluding anything. A miss in repo references is NOT evidence that a
+> function does not exist. Never guess parameter names — verify first.
+> Full protocol + command reference: `references/local-docs.md`.
 
 ## Mental Model
 
@@ -40,17 +57,84 @@ You control a remote Cadence Virtuoso through `virtuoso-bridge`. Python runs loc
 
 Always use the highest level that works. Drop to a lower level only when needed.
 
-**Never guess function names.** If the function isn't in the examples below, read the relevant `references/` file before writing the call. Fabricating a wrong name wastes time debugging in CIW.
+**Never guess function names.** If the function isn't in the examples below, verify it
+against the installed Cadence documentation (see "Documentation protocol") before
+writing the call. Fabricating a wrong name wastes time debugging in CIW.
+
+## Documentation protocol (mandatory)
+
+The SKILL language, its per-version function set, and PDK device parameters are
+the part of this stack most likely to be **wrong from memory**. Verify against the
+docs *installed on the target Virtuoso* — not from general knowledge — before:
+
+- writing any SKILL expression that calls a function you haven't used before
+  in this session,
+- instantiating a library cell or setting CDF parameters on one,
+- relying on version-dependent behavior (a function that exists in IC231 may be
+  absent or renamed in IC618, and vice versa).
+
+### The four verification commands
+
+| Goal | Command | What you get |
+|------|---------|--------------|
+| Identify the active version + doc layout (once per host) | `virtuoso-bridge doc-info` | Virtuoso version (from install metadata), doc root, doc-set count, SKILL Finder status, More-Info index status, `skdfref` style (chapter vs per-function) |
+| Find a SKILL function by name | `virtuoso-bridge skill-find <name> [--mode fuzzy\|prefix\|suffix\|exact\|regex]` | Best-matching functions with **exact syntax** and one-line description from the installed `.fnd` database |
+| Read the full docs for a SKILL function | `virtuoso-bridge skill-info <name>` | The installed More-Info page as plain text: signature, argument descriptions, return values, examples |
+| Search all installed documentation | `virtuoso-bridge doc-search "<query>" [-n N]` | Ranked matches (path + title + snippet) across every installed doc set — user guides, API references, FAQs |
+
+All four support `--json` (for parsing), `-p PROFILE` (multi-profile setups), and
+`--env FILE`. `doc-search` additionally supports `--doc-root` (explicit local
+roots, no bridge needed), `--rebuild-index`, and `--cache-dir`. Python equivalents:
+`client.doc_info()`, `client.find_skill(query, mode=...)`,
+`client.get_skill_more_info(func)`, `client.search_docs(query)`.
+
+### Standard verification flow
+
+```bash
+# 1. Once per session / per host: which Virtuoso, what docs are installed?
+virtuoso-bridge doc-info
+
+# 2. Is the function there, and what is its EXACT syntax?
+virtuoso-bridge skill-find dbOpenCellViewByType
+#    → dbOpenCellViewByType( { gt_lib | nil } t_cellName lt_viewName [ t_viewTypeName [ t_mode [ d_contextCellView ] ] ] ) => d_cellView / nil
+
+# 3. Full argument descriptions, return values, examples:
+virtuoso-bridge skill-info dbOpenCellViewByType
+
+# 4. Concept-level questions (e.g. "how to create inherited net expression"):
+virtuoso-bridge doc-search "net expression label"
+```
+
+Interpret results through the `doc-info` output: `skdfref` style tells you whether
+function pages are individual files (`per-function`, e.g. IC231) or one large
+chapter file with anchors (`chapter`, e.g. IC618) — `skill-info` handles both
+transparently, but it matters when reading doc paths by hand.
+
+### Library-cell verification
+
+Before instantiating a cell or setting parameters on it:
+
+1. **Existence** — confirm the lib/cell/view triple is real:
+   `client.execute_skill('ddGetObj("lib" "cell")')` (iterate `ddGetLibList()`
+   if you only know the cell name).
+2. **Pins/parameters** — read them from the live cellview, never from memory:
+   open the symbol view and list terms, or use `schGetParams` / `dbGetq` on an
+   instance. CDF parameter names are PDK-specific (e.g. `fingers` is editable
+   while `nf` is read-only on many PDKs — see "Create a schematic" below).
+3. **Semantics** — for PDK device behavior (terminal order, multi-finger
+   semantics, corner behavior), search the PDK/user documentation:
+   `virtuoso-bridge doc-search "<device> <parameter>"`.
 
 ### Five domains
 
 | Domain | What it does | Python package | API docs |
 |--------|-------------|----------------|----------|
-| **Schematic** | Create/edit schematics, wire instances, add pins | `client.schematic.*` | `references/schematic-python-api.md`, `references/schematic-skill-api.md` |
+| **Schematic** | Create/edit schematics, wire instances, add pins | `client.schematic.*` | `references/schematic-python-api.md`, `references/schematic-skill-api.md`, `references/schematic-manifest-import.md` |
 | **Symbol** | Generate, edit, and read symbol views | `client.symbol.*` | `references/symbol-python-api.md` |
 | **Layout** | Create/edit layout, add shapes/vias/instances | `client.layout.*` | `references/layout-python-api.md`, `references/layout-skill-api.md` |
 | **Maestro** | Read/write ADE Assembler config, run simulations | `client.maestro.*` | `references/maestro-python-api.md`, `references/maestro-skill-api.md` |
 | **Library** | Read/create/rename/delete libraries, bind technology | `client.library.*` | `references/library-python-api.md` |
+| **SOS** | Status, checkout, safe cancel-checkout, checkin, and initial registration for one cellview | `client.sos.*` | `references/sos-python-api.md` |
 | **Netlist (si)** | Batch netlist generation without Maestro | `simInitEnvWithArgs` + `si` CLI | See "Batch Netlist (si)" section below |
 | **SKILL Finder** | Search SKILL function names and get detailed docs | `client.find_skill()`, `client.get_skill_more_info()` | `references/skill-finder-python-api.md` |
 | **General** | File transfer, screenshots, raw SKILL, .il loading | `client.*` | See below |
@@ -84,6 +168,8 @@ All `virtuoso-bridge` CLI commands and Python scripts must run inside the activa
 ### Then
 
 - **Check examples first**: `examples/01_virtuoso/` — don't reinvent from scratch.
+- **Run `virtuoso-bridge doc-info`** once to pin the active Virtuoso version and
+  doc layout (see "Documentation protocol (mandatory)").
 - **Open the window**: `client.open_window(lib, cell, view="layout")` so the user sees what you're doing.
 
 ## Client basics
@@ -130,6 +216,7 @@ client.run_shell_command("ls /tmp/")             # run shell on remote
 client.list_windows()                            # list all open windows
 client.screenshot(target="ciw")                   # screenshot to the user artifact directory
 client.screenshot(output="output", target="ciw")  # explicit repo-local output
+client.sos.status_cellview("LIB", "CELL", "schematic")
 ```
 
 ### Batch attribute fetch: `fetch()` / `fetch_one()`
@@ -239,11 +326,12 @@ Load on demand — each contains detailed API docs and edge-case guidance:
 | `references/simulation-flow.md` | **Standard simulation flow** — ordered lifecycle, pitfalls, optimization loops |
 | `references/netlist.md` | CDL/Spectre netlist formats, spiceIn import |
 | `references/troubleshooting.md` | Known gotchas, GUI blocking, CDF quirks, connection issues |
+| `references/shared-ciw-dialogs.md` | Process-scoped read-only dialog inspection, shared-CIW guard, and explicit recovery boundaries |
 | `references/cellview-on-disk-layout.md` | What's inside each view on disk (`sch.oa`, `data.dm` binary format, `maestro.sdb`/`active.state` XML skeleton, lock files, SOS markers); which files are text-editable vs must go through DFII API |
 | `references/schematic-recreation.md` | Recreate schematic from existing design (grid layout, diff pair conventions) |
 | `references/batch-netlist-si.md` | Generate netlists without Maestro using si batch translator |
 | `references/skill-finder-python-api.md` | `skill-find` (search SKILL by name) and `skill-info` (More Info docs) |
-| `virtuoso-bridge doc-search <query>` | Search installed Cadence documentation via the bridge or explicit `--doc-root` paths |
+| `references/local-docs.md` | **Local-documentation protocol** — verify SKILL code + library cells against the installed Cadence docs: `doc-info` / `skill-find` / `skill-info` / `doc-search`, doc-root anatomy (IC618 vs IC231), version identification, caching, troubleshooting |
 
 ## Examples
 
@@ -362,6 +450,19 @@ with client.schematic.create(LIB, CELL) as sch:
     sch.add(pin("OUT", -1.0, 0.25, "R0", direction="output"))
     # schCheck + dbSave happen automatically on context exit
 ```
+
+When the caller must classify the errors/warnings from one check instead of
+only knowing whether the batch executed, use the explicit diagnostic API:
+
+```python
+report = client.schematic.check_and_save(LIB, CELL)
+for diagnostic in report.diagnostics:
+    print(diagnostic.severity, diagnostic.code, diagnostic.message)
+```
+
+It brackets the current `schCheck` / `dbSave` log output, so old CIW messages
+are not returned. A blocked modal is reported through out-of-band X11 metadata
+and is never dismissed automatically.
 
 **Key rules:**
 - **Use `add_net_label_to_transistor`** for MOS D/G/S/B — it auto-detects stub direction. Never manually `add_wire` between terminals.
@@ -498,9 +599,9 @@ results = client.maestro.read_results(
 
 # 5. If run_and_wait times out while a modal is visible, recover outside the
 #    blocked SKILL channel, then diagnose before deciding whether to rerun:
-#    $ virtuoso-bridge dismiss-dialog
+#    $ virtuoso-bridge inspect-dialogs --pid PID --json
 #    $ virtuoso-bridge list-windows --top-level --json
-#    $ virtuoso-bridge dismiss-window WINDOW_ID --action enter
+#    Only send a key to a verified explicit window/action with user authorization.
 ```
 
 ### Output read/export guardrails (collision-safe)
@@ -628,29 +729,33 @@ When `execute_skill()` times out, possible causes:
 
 | Cause | Symptom | Fix |
 |-------|---------|-----|
-| **Modal dialog** | GUI popup blocking CIW | `virtuoso-bridge dismiss-dialog` |
-| **Auto dialog finder missed a modal** | GUI popup visible, SKILL channel blocked | `virtuoso-bridge list-windows --top-level --json`, then `virtuoso-bridge dismiss-window WINDOW_ID --action enter` |
+| **Modal dialog** | GUI popup blocking CIW | `virtuoso-bridge inspect-dialogs --pid PID --json`; preserve user dialogs |
+| **Unknown candidate window** | GUI popup visible, SKILL channel blocked | Inspect out-of-band and ask the user; do not guess an action |
 | **Long operation** | Simulation or netlist running | Wait, or use `?waitUntilDone nil` |
-| **CIW input prompt** | CIW waiting for typed input | `dismiss-dialog` (sends Enter) |
+| **CIW input prompt** | CIW waiting for typed input | Ask the user to complete their input; do not inject Enter |
 | **Bridge disconnected** | All calls fail immediately | `virtuoso-bridge restart` |
 
 **Dialog recovery (bypasses SKILL, uses X11 directly):**
 
 ```bash
-# Find and dismiss all blocking Virtuoso dialogs
-virtuoso-bridge dismiss-dialog
+# Inspect the selected CIW without changing the GUI
+virtuoso-bridge inspect-dialogs --pid PID --json
 
-# Inspect X11 windows and dismiss one explicitly
+# With explicit authorization for this exact window and action:
 virtuoso-bridge list-windows --top-level --json
 virtuoso-bridge dismiss-window 0x4203583 --action enter
 
 # From Python
-client.dismiss_dialog()
+client.dialogs.inspect(pid=PID)
 ```
 
-Uses `xwininfo` to find virtuoso-owned dialog windows and `XTestFakeKeyEvent` to send the requested key action. Works even when the SKILL channel is completely stuck.
+Inspection bypasses SKILL using SSH/X11. See `references/shared-ciw-dialogs.md`
+for ownership checks and the opt-in per-client guard. Bulk dismissal requires
+explicit legacy opt-in and must not be used as shared-CIW automatic recovery.
 
-**Prevention:** Always `dbSave(cv)` before `hiCloseWindow(win)`. Never use `?waitUntilDone t` in simulation calls. Add dialog-recovery in simulation loops (see "Run a simulation" section).
+**Prevention:** Resolve unsaved changes before closing windows, and use asynchronous
+simulation callbacks. In shared CIWs enable the read-only guard; never automatically
+save/discard human edits or dismiss their forms.
 
 ## Related skills
 

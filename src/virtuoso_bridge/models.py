@@ -115,6 +115,7 @@ class VirtuosoInterface(ABC):
         timeout: float = 30.0,
         operation_class: OperationClass = OperationClass.UNKNOWN,
         request_id: str | None = None,
+        retry_connect: bool = True,
     ) -> VirtuosoResult:
         """Execute SKILL code in Virtuoso."""
 

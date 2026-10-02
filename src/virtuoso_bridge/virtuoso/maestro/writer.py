@@ -11,6 +11,8 @@ import time
 import uuid
 
 from virtuoso_bridge import VirtuosoClient
+from virtuoso_bridge.models import ExecutionStatus, VirtuosoResult
+from virtuoso_bridge.virtuoso.dialogs import DialogBlockedError
 from virtuoso_bridge.virtuoso.ops import escape_skill_string
 
 
@@ -21,6 +23,8 @@ def _q(client: VirtuosoClient, expr: str, timeout: float | None = None) -> str:
     kwargs = {"timeout": timeout} if timeout is not None else {}
     r = client.execute_skill(expr, **kwargs)
     if r.errors:
+        if getattr(r, "metadata", {}).get("dialog_guard"):
+            raise DialogBlockedError(r)
         raise RuntimeError(f"SKILL error: {r.errors[0]}")
     return r.output or ""
 
@@ -336,7 +340,8 @@ def set_job_policy(client: VirtuosoClient, policy, *,
 
 
 def run_simulation(client: VirtuosoClient, *, session: str = "",
-                   callback: str = "", timeout: float | None = None) -> str:
+                   callback: str = "", run_mode: str = "",
+                   timeout: float | None = None) -> str:
     """maeRunSimulation — run simulation (async, returns immediately).
 
     Returns the history name (e.g. "Interactive.1").
@@ -344,6 +349,7 @@ def run_simulation(client: VirtuosoClient, *, session: str = "",
     Args:
         session: session name (default: current session)
         callback: SKILL procedure name to call when run finishes
+        run_mode: explicit Maestro run mode; empty preserves the Cadence default
         timeout: socket timeout for Maestro to accept the run request
     """
     parts = "maeRunSimulation("
@@ -351,6 +357,8 @@ def run_simulation(client: VirtuosoClient, *, session: str = "",
         parts += f'?session "{escape_skill_string(session)}" '
     if callback:
         parts += f'?callback "{escape_skill_string(callback)}" '
+    if run_mode:
+        parts += f'?runMode "{escape_skill_string(run_mode)}" '
     parts = parts.rstrip() + ")"
     return _q(client, parts, timeout=timeout)
 
@@ -377,7 +385,9 @@ def _wait_until_done(client: VirtuosoClient, marker: str,
     callback that ``echo``s ``done`` to ``marker`` when the run finishes.
     Local mode reads the file directly via stdlib; remote mode ``ssh
     cat``s it every 2 s on the SSH channel, keeping the SKILL channel
-    free for other work (dialog dismissal, screenshots, ...).
+    free for other work (read-only dialog inspection, ...). Shared mode checks
+    blockers out-of-band at most once every ten seconds, without cancelling
+    a simulation or waiting for the full completion timeout.
 
     Not public — call :func:`run_and_wait` instead, which sets up the
     callback + marker and calls this helper.
@@ -388,6 +398,7 @@ def _wait_until_done(client: VirtuosoClient, marker: str,
     runner = client.ssh_runner
 
     deadline = _time.monotonic() + timeout
+    next_dialog_check = 0.0
     while True:
         remaining = deadline - _time.monotonic()
         if remaining <= 0:
@@ -412,6 +423,22 @@ def _wait_until_done(client: VirtuosoClient, marker: str,
         remaining = deadline - _time.monotonic()
         if remaining <= 0:
             break
+        dialogs = getattr(client, "dialogs", None)
+        if dialogs is not None and dialogs.enabled and _time.monotonic() >= next_dialog_check:
+            blocked = dialogs.preflight(timeout=min(5.0, remaining))
+            next_dialog_check = _time.monotonic() + 10.0
+            if blocked is not None:
+                blocked.errors = [
+                    "Simulation completion wait stopped: shared CIW has a blocker "
+                    "or cannot be inspected. Bridge did not request simulation cancellation."
+                ]
+                blocked.metadata.pop("request_sent", None)
+                blocked.metadata.update(outcome="unknown", phase="completion_wait",
+                                        completion_marker=marker)
+                raise DialogBlockedError(blocked)
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break
         _time.sleep(min(2.0, remaining))
 
     raise TimeoutError(f"Simulation did not finish within {timeout}s")
@@ -421,75 +448,8 @@ def _strip_skill_atom(raw: str) -> str:
     return (raw or "").strip().strip('"')
 
 
-def _diagnose_run_not_started(client: VirtuosoClient, session: str) -> dict[str, str]:
-    """Collect quick diagnostics when maeRunSimulation returns nil."""
-    info: dict[str, str] = {
-        "session": session or "",
-        "test": "",
-        "enabled_analyses": "",
-        "is_explorer_window": "unknown",
-        "current_form": "",
-    }
-
-    try:
-        test = _strip_skill_atom(_q(client, f'car(maeGetSetup(?session "{session}"))'))
-        if test and test != "nil":
-            info["test"] = test
-    except Exception:  # noqa: BLE001
-        pass
-
-    if info["test"]:
-        try:
-            # Best-effort probe: some older Virtuoso/Maestro environments may not
-            # expose maeGetEnabledAnalysis, so keep diagnostics partial on failure.
-            enabled = _q(
-                client,
-                f'maeGetEnabledAnalysis("{info["test"]}" ?session "{session}")',
-            )
-            info["enabled_analyses"] = (enabled or "").strip()
-        except Exception:  # noqa: BLE001
-            pass
-
-    try:
-        is_explorer = _q(
-            client,
-            'let((s) s = car(errset(sevSession(hiGetCurrentWindow()))) if(s then "t" else "nil"))',
-        )
-        info["is_explorer_window"] = _strip_skill_atom(is_explorer)
-    except Exception:  # noqa: BLE001
-        pass
-
-    try:
-        form = _q(client, 'let((f) f = hiGetCurrentForm() when(f f~>name))')
-        info["current_form"] = _strip_skill_atom(form)
-    except Exception:  # noqa: BLE001
-        pass
-
-    return info
-
-
-def _try_recover_blocking_form(client: VirtuosoClient, info: dict[str, str]) -> bool:
-    """Best-effort unblock if a modal form is active. Returns True if attempted."""
-    form_name = info.get("current_form", "")
-    if not form_name or form_name == "nil":
-        return False
-
-    try:
-        # First try SKILL-side dismissal for current modal form.
-        _q(client, 'let((f) f = hiGetCurrentForm() when(f hiFormDone(f)) t)')
-    except Exception:  # noqa: BLE001
-        pass
-
-    try:
-        # If SKILL channel is partially blocked, use X11 fallback.
-        client.dismiss_dialog()
-    except Exception:  # noqa: BLE001
-        pass
-    return True
-
-
 def run_and_wait(client: VirtuosoClient, *, session: str = "",
-                 timeout: int = 600) -> tuple[str, str]:
+                 run_mode: str = "", timeout: int = 600) -> tuple[str, str]:
     """Run simulation and wait for completion without blocking SKILL.
 
     Uses maeRunSimulation(?callback ...) to register a completion callback
@@ -497,7 +457,7 @@ def run_and_wait(client: VirtuosoClient, *, session: str = "",
     The callback writes a marker file; Python polls it via SSH.
 
     The SKILL channel remains free during the wait — you can still
-    execute_skill, dismiss dialogs, take screenshots, etc.
+    execute_skill, inspect dialogs, take screenshots, etc.
 
     ``timeout`` is an end-to-end budget covering the simulation-start request
     and completion polling. Returns (history, status) — e.g.
@@ -522,56 +482,51 @@ def run_and_wait(client: VirtuosoClient, *, session: str = "",
     # Define callback that writes marker file when simulation finishes.
     # Use system("echo ... > file") instead of outfile/fprintf to avoid
     # SKILL I/O buffering issues in callback context.
-    client.execute_skill(f'''
+    _q(client, f'''
 procedure(_vb_sim_done_{nonce}(session runID)
   system(sprintf(nil "echo done > {marker}"))
   printf("[%s sim done] run %L\\n" nth(2 parseString(getCurrentTime())) runID))
-''')
+''', timeout=remaining_timeout())
 
     # Start simulation with callback — atomic, no race condition.
-    # If Virtuoso returns nil here, no run was started and the callback
-    # can never fire, so fail fast instead of entering endless marker polling.
+    # Without an acknowledged history, do not assume callback polling or a
+    # second run request is safe.
     # Cold Maestro netlisting may take longer than the bridge default before
     # maeRunSimulation returns the history name; use the remaining caller budget.
     history = run_simulation(client, session=session,
                              callback=f"_vb_sim_done_{nonce}",
+                             run_mode=run_mode,
                              timeout=remaining_timeout())
     history_name = _strip_skill_atom(history)
     if not history_name or history_name == "nil":
-        info = _diagnose_run_not_started(client, session)
-        recovered = _try_recover_blocking_form(client, info)
-
-        # One retry after recovery if we had an active modal form.
-        if recovered:
-            history = run_simulation(client, session=session,
-                                     callback=f"_vb_sim_done_{nonce}",
-                                     timeout=remaining_timeout())
-            history_name = _strip_skill_atom(history)
-
-        if not history_name or history_name == "nil":
-            _remove_marker(runner, marker)
-            test = info.get("test", "") or "<unknown>"
-            analyses = info.get("enabled_analyses", "") or "<unknown>"
-            explorer = info.get("is_explorer_window", "unknown")
-            form = info.get("current_form", "") or "<none>"
-            extra = (
-                f"session={session}, test={test}, enabled_analyses={analyses}, "
-                f"explorer_window={explorer}, current_form={form}."
+        # Do not query the SKILL channel again: a user dialog may now block it.
+        # Retain the callback marker so a late completion remains observable.
+        message = (
+            "maeRunSimulation returned nil (no history acknowledged). "
+            "No form was dismissed and the simulation was not retried. "
+            "Use read-only dialogs.inspect(pid=...) to diagnose blockers; "
+            "verify run state before retrying. "
+            f"session={session or '<current>'}, completion_marker={marker}"
+        )
+        dialogs = getattr(client, "dialogs", None)
+        if dialogs is not None and dialogs.enabled:
+            failure = VirtuosoResult(
+                status=ExecutionStatus.ERROR, errors=[message],
+                metadata={"completion_marker": marker, "session": session},
             )
-            logger.warning(
-                "Simulation did not start after diagnostics/recovery attempt: %s",
-                extra,
+            failure = dialogs.annotate_failure(
+                failure, timeout=max(0, deadline - time.monotonic()),
             )
-            raise RuntimeError(
-                "maeRunSimulation returned nil (simulation not started). "
-                "If this is ADE Explorer, use Explorer run path "
-                "(sevRun(sevSession(window))) instead of maeRunSimulation. "
-                "Also verify at least one analysis is enabled and no modal dialog "
-                "is blocking the GUI. " + extra
-            )
+            raise DialogBlockedError(failure)
+        raise RuntimeError(message)
 
     # Poll marker via SSH (SKILL channel stays free)
-    status = _wait_until_done(client, marker, timeout=remaining_timeout())
+    try:
+        status = _wait_until_done(client, marker, timeout=remaining_timeout())
+    except DialogBlockedError as exc:
+        exc.result.metadata.update(history=history_name, session=session,
+                                   phase="completion_wait")
+        raise
     return history, status
 
 

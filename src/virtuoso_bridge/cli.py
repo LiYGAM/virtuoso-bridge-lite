@@ -326,16 +326,16 @@ def _start_one_profile(
                     print(f"  Load in Virtuoso CIW: load(\"{setup_path}\")")
             return 0
 
-        settle = 1.0
-        if _deadline is not None:
-            settle = min(settle, _restart_remaining(_deadline, "tunnel settle"))
-        time.sleep(settle)
-        if not SSHClient.is_running(profile):
+        if not _wait_for_tunnel_running(profile, timeout=min(5.0, _restart_remaining(_deadline, "tunnel settle")) if _deadline is not None else 5.0):
             print("[warning] Tunnel process exited shortly after start.")
-            print("Try starting the tunnel manually:")
+            print("For foreground SSH diagnosis (stop it before retrying `start`):")
             ssh_env = remote_ssh_env_from_os(profile)
-            port = ssh.port
-            manual_cmd = f"ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -N -L {port}:127.0.0.1:{port}"
+            local_port = ssh.port
+            remote_port = ssh.remote_port
+            manual_cmd = (
+                "ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -N "
+                f"-L {local_port}:127.0.0.1:{remote_port}"
+            )
             if ssh_env.jump_host:
                 jump = f"{ssh_env.jump_user or ssh_env.remote_user}@{ssh_env.jump_host}" if (ssh_env.jump_user or ssh_env.remote_user) else ssh_env.jump_host
                 manual_cmd += f" -J {jump}"
@@ -347,6 +347,19 @@ def _start_one_profile(
         return 0
     finally:
         ssh.close()
+
+
+def _wait_for_tunnel_running(profile: str | None, timeout: float = 5.0) -> bool:
+    """Allow a freshly detached SSH listener time to become observable."""
+    from virtuoso_bridge.transport.tunnel import SSHClient
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        if SSHClient.is_running(profile):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
 
 
 def _start_one() -> int:
@@ -748,6 +761,7 @@ def _restart_daemon_one(
         auth_token=resolve_auth_token(profile, create=False),
         profile=profile,
     )
+    client.daemon_token = _state_or_local_daemon_token(state, profile)
     try:
         user_check = check_daemon_user(
             client,
@@ -1020,6 +1034,39 @@ def cli_autoload(action: str, *, timeout: float = 10.0) -> int:
 
 # -- status -----------------------------------------------------------------
 
+def _state_or_local_daemon_token(state: dict | None, profile: str | None) -> str | None:
+    """Token for a bare diagnostics client: SSH fetch or local read.
+
+    The token never lives in state.json (normally readable); it is fetched
+    over SSH for remote daemons or read from the local token file.  Both
+    fallbacks are read-only — the daemon (or `local()`) provisions the file;
+    diagnostics never create one and never raise.
+    """
+    from virtuoso_bridge import daemon_auth
+    from virtuoso_bridge.transport.tunnel import _is_localhost
+
+    remote = bool((state or {}).get("remote_host")) and not _is_localhost(
+        (state or {}).get("remote_host")
+    )
+    if remote:
+        try:
+            from virtuoso_bridge.transport.tunnel import SSHClient
+
+            ssh = SSHClient.from_env(keep_remote_files=True, profile=profile, create_auth_token=False)
+            try:
+                result = ssh.ssh_runner.run_command(
+                    "cat ~/.virtuoso-bridge/bridge_token 2>/dev/null", timeout=5,
+                )
+                token = (result.stdout or "").strip()
+                return token.lower() if result.returncode == 0 and daemon_auth.is_valid_token(token) else None
+            finally:
+                ssh.close()
+        except Exception as exc:
+            print(f"[warning] daemon token unavailable: {exc}")
+            return None
+    return daemon_auth.read_local_token()
+
+
 def _print_load_hint(setup_path: str) -> None:
     """Print CIW load command and .cdsinit auto-load suggestion."""
     print("\n  Load in Virtuoso CIW:")
@@ -1171,6 +1218,7 @@ def _print_status() -> int:
                 auth_token=resolve_auth_token(profile, create=False),
                 profile=profile,
             )
+            vc.daemon_token = _state_or_local_daemon_token(state, profile)
             ok = vc.test_connection(timeout=5)
             print(f"\n[daemon] {'OK - connected to Virtuoso CIW' if ok else 'NO RESPONSE'}")
             if ok:
@@ -1201,6 +1249,7 @@ def _print_status() -> int:
 
                 # Query Virtuoso environment info
                 for skill_expr, label in [
+                    ('getpid()', 'virtuoso pid'),
                     ('getHostName()', 'CIW host'),
                     ('getCurrentTime()', 'time'),
                     ('getVersion()', 'version'),
@@ -2093,13 +2142,16 @@ def cli_development(action, *, timeout=15, limit=50, output=None):
     return 0
 
 
-def cli_dismiss_dialog() -> int:
+def cli_dismiss_dialog(*, legacy_bulk: bool = False) -> int:
     """Find and dismiss blocking Virtuoso GUI dialogs via X11."""
+    if not legacy_bulk:
+        print("Bulk dismissal is disabled. Use inspect-dialogs --pid PID, then an explicitly authorized dismiss-window action. --legacy-bulk enables unsafe legacy behavior.")
+        return 1
     _load_cli_env()
     from virtuoso_bridge.virtuoso import x11
     runner, user = _make_ssh_runner()
 
-    dialogs = x11.dismiss_dialogs(runner, user, profile=_get_cli_profile())
+    dialogs = x11.dismiss_dialogs(runner, user, profile=_get_cli_profile(), allow_legacy_bulk=True)
     if _CLI_JSON_ENVELOPE[0]:
         print(json.dumps(dialogs, ensure_ascii=False))
         return 1 if any("error" in d or d.get("still_mapped") for d in dialogs) else 0
@@ -2114,7 +2166,42 @@ def cli_dismiss_dialog() -> int:
             print(f"  Dismissed: {d['dismissed']}")
         elif "title" in d:
             print(f'  Found: "{d["title"]}" at ({d.get("x",0)},{d.get("y",0)})')
-    return 0
+    return 1 if any("error" in d or d.get("still_mapped") for d in dialogs) else 0
+
+
+def cli_inspect_dialogs(
+    *, pid: int, display: str | None = None, ciw_window: str | None = None,
+    timeout: float = 15, json_output: bool = False,
+) -> int:
+    """Read one explicit GUI process; never construct a SKILL client."""
+    import json
+    from virtuoso_bridge.virtuoso import x11
+    from virtuoso_bridge.virtuoso.dialogs import DialogInspection, DialogTarget, parse_inspection
+
+    try:
+        target = DialogTarget(pid=pid, display=display, ciw_window=ciw_window)
+    except ValueError as exc:
+        print(f"Invalid inspection target: {exc}", file=sys.stderr)
+        return 1
+    try:
+        load_vb_env()
+        runner, user = _make_ssh_runner()
+        payload = x11.inspect_dialogs(
+            runner, user, pid=pid, display=display, ciw_window=ciw_window,
+            profile=_get_cli_profile(), timeout=timeout,
+        )
+        report = parse_inspection(payload, target)
+    except (Exception, SystemExit) as exc:
+        report = DialogInspection(status="indeterminate", target=target, diagnostics=[str(exc)])
+    if json_output:
+        print(json.dumps(report.model_dump(), indent=2, ensure_ascii=False))
+    else:
+        print(f"CIW {report.target.pid}: {report.status}")
+        for item in report.dialogs:
+            print(f"  {item.get('window_id', '?')}: {item.get('title') or '(untitled)'}")
+        for message in report.diagnostics:
+            print(f"  {message}")
+    return {"clear": 0, "blocked": 2, "indeterminate": 1}[report.status]
 
 
 def cli_list_windows(*, json_output: bool = False, top_level: bool = False) -> int:
@@ -2152,7 +2239,9 @@ def cli_list_windows(*, json_output: bool = False, top_level: bool = False) -> i
     return 0
 
 
-def cli_dismiss_window(*, window_id: str, action: str = "enter") -> int:
+def cli_dismiss_window(
+    *, window_id: str, action: str = "enter", display: str | None = None,
+) -> int:
     """Dismiss one explicit X11 window id via XTest."""
     _load_cli_env()
     from virtuoso_bridge.virtuoso import x11
@@ -2163,6 +2252,7 @@ def cli_dismiss_window(*, window_id: str, action: str = "enter") -> int:
         user,
         window_id,
         action=action,
+        display=display,
         profile=_get_cli_profile(),
     )
     if _CLI_JSON_ENVELOPE[0]:
@@ -2270,12 +2360,14 @@ def cli_bootstrap(*, window_id: str, timeout: int = 12) -> int:
     bridge = SSHClient.from_env(keep_remote_files=True, profile=profile)
     try:
         port = int((state or {}).get("port") or bridge.port)
+        daemon_token = bridge.ensure_daemon_token()
         deadline = time.monotonic() + max(timeout, 0)
+        probe_timeout = max(1, min(5, timeout or 1))
         identity: dict[str, str] = {}
         while True:
             try:
-                client = VirtuosoClient(host="127.0.0.1", port=port, timeout=1, auth_token=bridge.auth_token, profile=profile)
-                if client.test_connection(timeout=1):
+                client = VirtuosoClient(host="127.0.0.1", port=port, timeout=probe_timeout, auth_token=bridge.auth_token, daemon_token=daemon_token, profile=profile)
+                if client.test_connection(timeout=probe_timeout):
                     print("[daemon] OK - bootstrap completed and the CIW is reachable.")
                     return 0
             except Exception:
@@ -2410,6 +2502,7 @@ def cli_doc_search(
     list_roots: bool,
     json_output: bool,
     rebuild_index: bool,
+    cache_dir: str | None = None,
 ) -> int:
     """Search installed Cadence documentation locally or through the bridge."""
     import json as _json
@@ -2422,7 +2515,7 @@ def cli_doc_search(
         roots = resolve_doc_roots(doc_roots)
         payload: dict[str, object]
         if list_roots:
-            payload = {"ok": True, "doc_roots": [str(root) for root in roots]}
+            payload = {"ok": True, "doc_roots": [str(root) for root in roots], "results": []}
         else:
             if not query:
                 print("Error: query argument required for 'doc-search'", file=sys.stderr)
@@ -2430,6 +2523,9 @@ def cli_doc_search(
             if not roots:
                 print("Error: no existing Cadence doc roots found for --doc-root.", file=sys.stderr)
                 return 1
+            local_cache_root = (
+                Path(cache_dir).expanduser() if cache_dir else runtime_cache_dir("docs_search") / "local"
+            )
             payload = {
                 "ok": True,
                 "query": query,
@@ -2437,7 +2533,7 @@ def cli_doc_search(
                 "results": search_docs(
                     query,
                     roots,
-                    cache_root=runtime_cache_dir("docs_search") / "local",
+                    cache_root=local_cache_root,
                     limit=max(limit, 0),
                     rebuild=rebuild_index,
                 ),
@@ -2458,7 +2554,12 @@ def cli_doc_search(
             if not query:
                 print("Error: query argument required for 'doc-search'", file=sys.stderr)
                 return 1
-            client_payload = client.search_docs(query, limit=max(limit, 0), rebuild_index=rebuild_index)
+            client_payload = client.search_docs(
+                query,
+                limit=max(limit, 0),
+                rebuild_index=rebuild_index,
+                cache_dir=cache_dir,
+            )
             payload = {
                 "ok": True,
                 "query": query,
@@ -2500,6 +2601,87 @@ def cli_doc_search(
         snippet = result.get("snippet")
         if snippet:
             print(f"  {snippet}")
+    return 0
+
+
+def cli_doc_info(
+    *,
+    doc_roots: list[Path],
+    json_output: bool,
+) -> int:
+    """Report Virtuoso version + documentation structure for doc roots."""
+    import json as _json
+    import sys
+
+    if doc_roots:
+        from virtuoso_bridge.virtuoso.docs_search import doc_root_info_local, resolve_doc_roots
+
+        roots = resolve_doc_roots(doc_roots)
+        payload: dict[str, object] = {
+            "ok": True,
+            "doc_roots": doc_root_info_local(roots),
+        }
+        if not payload["doc_roots"]:
+            print(
+                "Error: no existing Cadence doc roots found for --doc-root.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        _load_cli_env()
+        from virtuoso_bridge import VirtuosoClient
+
+        client = VirtuosoClient.from_env(profile=_get_cli_profile())
+        payload = client.doc_info()
+        if not payload.get("doc_roots"):
+            print(
+                "Error: no Cadence doc roots found. Pass --doc-root or configure "
+                "a Virtuoso Bridge profile with access to the Cadence installation.",
+                file=sys.stderr,
+            )
+            return 1
+
+    if json_output:
+        print(_json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+
+    for info in payload["doc_roots"]:
+        if not isinstance(info, dict):
+            continue
+        version = info.get("virtuoso_version") or "unknown"
+        source = info.get("version_source") or "none"
+        if source == "none":
+            version_text = "unknown (no version evidence)"
+        else:
+            version_text = f"{version} (source: {source})"
+        finder = info.get("skill_finder") or {}
+        tgf = info.get("api_more_info") or {}
+        skdfref = info.get("skdfref") or {}
+        print(f"doc root      : {info.get('doc_root')}")
+        print(f"install root  : {info.get('install_root')}")
+        print(f"virtuoso      : {version_text}")
+        sample = ", ".join(info.get("doc_sets_sample", [])[:8])
+        more = "" if len(info.get("doc_sets_sample", [])) <= 8 else ", ..."
+        print(f"doc sets      : {info.get('doc_set_count')} ({sample}{more})")
+        finder_state = (
+            f"found, {finder.get('fnd_count')} .fnd files"
+            if finder.get("found")
+            else "NOT FOUND"
+        )
+        print(f"skill finder  : {finder.get('path')} ({finder_state})")
+        tgf_state = (
+            f"found, {tgf.get('tgf_bytes')} bytes"
+            if tgf.get("found")
+            else "NOT FOUND"
+        )
+        print(f"more-info tgf : {tgf.get('tgf')} ({tgf_state})")
+        style = (
+            f"{skdfref.get('style')} ({skdfref.get('html_count')} html pages)"
+            if skdfref.get("found")
+            else "not present"
+        )
+        print(f"skdfref       : {style}")
+        print()
     return 0
 
 
@@ -2766,6 +2948,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit one stable machine-readable command envelope",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    sp_sos = subparsers.add_parser("sos", help="Operate on one SOS-managed cellview")
+    sos_actions = sp_sos.add_subparsers(dest="sos_action", required=True)
+    for action in (
+        "status", "co", "cancel-co", "ci", "register", "doctor", "reconcile",
+        "session-doctor", "session-restart", "lock-info",
+    ):
+        sub = sos_actions.add_parser(action)
+        sub.add_argument("lib")
+        sub.add_argument("cell")
+        sub.add_argument("view")
+        sub.add_argument("-p", "--profile", default=None, help="Connection profile")
+        sub.add_argument("--env", default=None, help="Explicit .env file path")
+        sub.add_argument("--json", action="store_true", help="Output structured JSON")
+        sub.add_argument("--timeout", type=float, default=60)
+        sub.add_argument("--soscmd", default=None,
+                         help="SOS executable or site wrapper on the GUI host")
+        if action in {"co", "cancel-co", "ci", "register", "session-restart"}:
+            sub.add_argument("--dry-run", action="store_true")
+        if action == "session-restart":
+            sub.add_argument("--yes", action="store_true",
+                             help="Confirm one controlled SOS session restart")
+            sub.add_argument(
+                "--force-cadence-disconnect", action="store_true",
+                help="Allow exitsos -F after a confirmed normal-exit refusal",
+            )
+        if action in {"ci", "register"}:
+            sub.add_argument("-m", "--message", required=True)
+        if action == "reconcile":
+            sub.add_argument("--receipt", required=True,
+                             help="Prior unknown SOS JSON result")
+
     recovery = subparsers.add_parser("recovery", help="Inspect and execute authorized bounded recovery")
     recovery.add_argument("recovery_action", choices=["policy", "inspect", "run", "watch", "stop", "worker", "resolve"])
     recovery.add_argument("policy_action", nargs="?", choices=["status", "grant", "revoke"])
@@ -3005,6 +3218,17 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Connection profile")
     sp_dismiss.add_argument("--env", default=None,
                             help="Explicit .env file path (highest priority)")
+    sp_dismiss.add_argument("--legacy-bulk", action="store_true",
+                            help="Explicitly enable unsafe legacy bulk dismissal")
+
+    sp_inspect = subparsers.add_parser("inspect-dialogs", help="Read-only dialog inspection of one explicit CIW process")
+    sp_inspect.add_argument("--pid", type=int, required=True, help="Virtuoso process PID on the GUI host")
+    sp_inspect.add_argument("--display", default=None, help="Optional expected DISPLAY; otherwise read from that PID")
+    sp_inspect.add_argument("--ciw-window", default=None, help="Optional expected CIW X11 window id")
+    sp_inspect.add_argument("--timeout", type=float, default=15, help="Inspection time budget in seconds")
+    sp_inspect.add_argument("--json", action="store_true", help="Output structured inspection")
+    sp_inspect.add_argument("-p", "--profile", default=None, help="Connection profile")
+    sp_inspect.add_argument("--env", default=None, help="Explicit .env file path")
 
     sp_screen = subparsers.add_parser("screen", help="Capture X11 desktop without SKILL")
     sp_screen.add_argument("-o", "--output", default=None)
@@ -3030,6 +3254,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp_dismiss_window = subparsers.add_parser(
         "dismiss-window", help="Dismiss one explicit X11 window id")
     sp_dismiss_window.add_argument("window_id", help="X11 window id, e.g. 0x4203583")
+    sp_dismiss_window.add_argument(
+        "--display", default=None,
+        help="Exact X display from inspection; required for inspection-based recovery",
+    )
     sp_dismiss_window.add_argument(
         "--action",
         default="enter",
@@ -3198,8 +3426,33 @@ def build_parser() -> argparse.ArgumentParser:
     sp_doc_search.add_argument("-n", "--limit", type=int, default=10, help="Maximum results to return")
     sp_doc_search.add_argument("--json", action="store_true", help="Output results as JSON")
     sp_doc_search.add_argument("--rebuild-index", action="store_true", help="Force rebuilding the local documentation search index")
+    sp_doc_search.add_argument("--cache-dir", default=None, help="Override the local docs-search cache directory (default: user cache)")
     sp_doc_search.add_argument("-p", "--profile", default=None, help="Connection profile")
     sp_doc_search.add_argument("--env", default=None, help="Explicit .env file path (highest priority)")
+
+    sp_doc_info = subparsers.add_parser(
+        "doc-info",
+        help="Report Virtuoso version + documentation structure for doc roots",
+        description=(
+            "Reports, for each resolved Cadence documentation root: the active "
+            "Virtuoso version (parsed from install-root .sdp names or the install "
+            "directory name), documentation-set count, SKILL Finder database, "
+            "More Info .tgf, and skdfref page style (chapter vs per-function). "
+            "Docs differ between Virtuoso versions — run this first so lookups "
+            "target the correct tree. Omit --doc-root to discover docs through "
+            "the active Virtuoso Bridge profile."
+        ),
+    )
+    sp_doc_info.add_argument(
+        "--doc-root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Cadence doc root; may be repeated",
+    )
+    sp_doc_info.add_argument("--json", action="store_true", help="Output results as JSON")
+    sp_doc_info.add_argument("-p", "--profile", default=None, help="Connection profile")
+    sp_doc_info.add_argument("--env", default=None, help="Explicit .env file path (highest priority)")
 
     sp_windows = subparsers.add_parser("windows", help="List all open Virtuoso windows")
     sp_windows.add_argument("-p", "--profile", default=None,
@@ -3285,7 +3538,13 @@ def main(argv: list[str] | None = None) -> int:
     if _CLI_JSON_ENVELOPE[0] and hasattr(args, "quiet"):
         args.quiet = False
     _CLI_PROFILE[0] = None
-    set_runtime_env_file(getattr(args, "env", None))
+    if args.command == "sos" and getattr(args, "json", False):
+        from contextlib import redirect_stdout
+
+        with redirect_stdout(sys.stderr):
+            set_runtime_env_file(getattr(args, "env", None))
+    else:
+        set_runtime_env_file(getattr(args, "env", None))
     if getattr(args, "bind_venv", False):
         profile_arg = getattr(args, "profile", None)
         if not profile_arg:
@@ -3301,6 +3560,20 @@ def main(argv: list[str] | None = None) -> int:
         _CLI_PROFILE[0] = profile
     _CLI_ALLOW_REMOTE_BIND[0] = getattr(args, "allow_remote_bind", None)
     dispatch = {
+        "sos": lambda: cli_sos(
+            action=getattr(args, "sos_action"),
+            lib=getattr(args, "lib"),
+            cell=getattr(args, "cell"),
+            view=getattr(args, "view"),
+            message=getattr(args, "message", None),
+            dry_run=getattr(args, "dry_run", False),
+            timeout=getattr(args, "timeout", 60),
+            soscmd=getattr(args, "soscmd", None),
+            receipt=getattr(args, "receipt", None),
+            json_output=getattr(args, "json", False),
+            yes=getattr(args, "yes", False),
+            force_cadence_disconnect=getattr(args, "force_cadence_disconnect", False),
+        ),
         "recovery": lambda: cli_recovery(args),
         "init": lambda: cli_init(
             remote=getattr(args, "remote", None),
@@ -3346,6 +3619,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_protocol_version=getattr(args, "expected_protocol_version"),
         ),
         "license": cli_license,
+
         "load": lambda: cli_load(
             file=getattr(args, "file"),
             timeout=getattr(args, "timeout", 60),
@@ -3366,7 +3640,11 @@ def main(argv: list[str] | None = None) -> int:
         "context": lambda: cli_development("context", timeout=args.timeout, limit=args.limit, output=args.output),
         "loaded-scripts": lambda: cli_development("loaded-scripts", timeout=args.timeout, output=args.output),
         "screen": lambda: cli_screen(getattr(args, "output", None), getattr(args, "display", None), getattr(args, "window_id", None)),
-        "dismiss-dialog": cli_dismiss_dialog,
+        "dismiss-dialog": lambda: cli_dismiss_dialog(legacy_bulk=getattr(args, "legacy_bulk", False)),
+        "inspect-dialogs": lambda: cli_inspect_dialogs(
+            pid=args.pid, display=args.display, ciw_window=args.ciw_window,
+            timeout=args.timeout, json_output=getattr(args, "json", False),
+        ),
         "list-windows": lambda: cli_list_windows(
             json_output=getattr(args, "json", False),
             top_level=getattr(args, "top_level", False),
@@ -3374,6 +3652,7 @@ def main(argv: list[str] | None = None) -> int:
         "dismiss-window": lambda: cli_dismiss_window(
             window_id=getattr(args, "window_id"),
             action=getattr(args, "action", "enter"),
+            display=getattr(args, "display", None),
         ),
         "window-input": lambda: cli_window_input(
             window_id=getattr(args, "window_id"),
@@ -3421,6 +3700,11 @@ def main(argv: list[str] | None = None) -> int:
             list_roots=getattr(args, "list_roots", False),
             json_output=getattr(args, "json", False),
             rebuild_index=getattr(args, "rebuild_index", False),
+            cache_dir=getattr(args, "cache_dir", None),
+        ),
+        "doc-info": lambda: cli_doc_info(
+            doc_roots=getattr(args, "doc_root", []),
+            json_output=getattr(args, "json", False),
         ),
     }
     screenshot_target = getattr(args, "target", None)
@@ -3526,3 +3810,145 @@ _SCREENSHOT_OUTPUT: list[str | None] = [None]
 
 def _get_cli_profile() -> str | None:
     return _CLI_PROFILE[0]
+
+def cli_sos(*, action: str, lib: str, cell: str, view: str,
+            message: str | None = None, dry_run: bool = False,
+            timeout: float = 60, soscmd: str | None = None,
+            receipt: str | None = None, json_output: bool = False,
+            yes: bool = False, force_cadence_disconnect: bool = False) -> int:
+    """Run one explicit SOS cellview operation."""
+    import json
+    import sys
+    from contextlib import redirect_stdout
+
+    from virtuoso_bridge import VirtuosoClient
+
+    options = {"timeout": timeout}
+    if soscmd is not None:
+        options["soscmd"] = soscmd
+    previous = None
+    reconciliation = None
+    if action == "reconcile":
+        if receipt is None:
+            raise ValueError("SOS reconcile requires --receipt")
+        previous = json.loads(Path(receipt).read_text(encoding="utf-8-sig"))
+        from virtuoso_bridge.virtuoso.sos.diagnostics import validate_receipt
+
+        reconciliation = validate_receipt(lib, cell, view, previous, timeout)
+
+    with redirect_stdout(sys.stderr):
+        try:
+            client = VirtuosoClient.from_env(profile=_get_cli_profile())
+        except Exception as exc:
+            if action != "reconcile" or not isinstance(previous, dict):
+                raise
+            operation, target, _before = reconciliation
+            payload = {
+                "ok": False,
+                "action": "reconcile",
+                "outcome": "unknown",
+                "operation": operation,
+                "assessment": "unavailable",
+                "operation_confirmed": False,
+                "target": target,
+                "diagnostics": [
+                    f"Bridge connection unavailable: {exc}",
+                    "No operation was retried; the original result remains unknown.",
+                ],
+            }
+        else:
+            if action == "status":
+                payload = client.sos.status_cellview(lib, cell, view, **options).to_dict()
+            elif action == "co":
+                payload = client.sos.checkout_cellview(
+                    lib, cell, view, dry_run=dry_run, **options,
+                ).to_dict()
+            elif action == "cancel-co":
+                payload = client.sos.cancel_checkout_cellview(
+                    lib, cell, view, dry_run=dry_run, **options,
+                ).to_dict()
+            elif action in {"ci", "register"}:
+                operation = (
+                    client.sos.register_cellview if action == "register"
+                    else client.sos.checkin_cellview
+                )
+                payload = operation(
+                    lib, cell, view, message=message or "", dry_run=dry_run, **options,
+                ).to_dict()
+            elif action == "doctor":
+                payload = client.sos.diagnose_cellview(lib, cell, view, **options)
+            elif action == "session-doctor":
+                payload = client.sos.diagnose_session_cellview(lib, cell, view, **options)
+            elif action == "lock-info":
+                try:
+                    payload = client.sos.lock_info_cellview(
+                        lib, cell, view, **options,
+                    ).to_dict()
+                except Exception as exc:
+                    payload = {
+                        "ok": False,
+                        "action": "lock_info",
+                        "outcome": "blocked",
+                        "target": {"lib": lib, "cell": cell, "view": view},
+                        "before": None,
+                        "lock": None,
+                        "diagnostics": [str(exc)],
+                    }
+            elif action == "session-restart":
+                if not dry_run and not yes:
+                    raise ValueError("SOS session-restart requires --dry-run or --yes")
+                payload = client.sos.restart_session_cellview(
+                    lib, cell, view, dry_run=dry_run,
+                    force_cadence_disconnect=force_cadence_disconnect, **options,
+                )
+            else:
+                payload = client.sos.reconcile_cellview(
+                    lib, cell, view, receipt=previous, **options,
+                )
+
+    if json_output:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    else:
+        _print_sos_result(payload, fallback=(lib, cell, view))
+    outcome = payload.get("outcome")
+    if outcome in {"success", "noop", "dry_run"}:
+        return 0
+    if outcome == "unknown":
+        return 3
+    return 1
+
+def _print_sos_result(payload: dict, *, fallback: tuple[str, str, str] = ("", "", "")) -> None:
+    target = payload.get("target") or {}
+    lib, cell, view = fallback
+    print(f"{payload.get('action', 'sos')}: {payload.get('outcome', 'unknown')}")
+    print(f"target: {target.get('lib', lib)}/{target.get('cell', cell)}/{target.get('view', view)}")
+    if target.get("workarea"):
+        print(f"workarea: {target['workarea']}")
+    before = payload.get("before") or {}
+    if before:
+        state_label = "checked out" if before.get("state") == "O" else before.get("state")
+        print(
+            "state: "
+            f"{state_label} revision={before.get('revision')} "
+            f"change={before.get('change')} lock={before.get('lock')}"
+        )
+    session = payload.get("session") or payload.get("session_after") or {}
+    if session:
+        print(
+            "session: "
+            f"running={session.get('running')} offline={session.get('offline_code')} "
+            f"mode={session.get('nowin_code')} project={session.get('project', '')}"
+        )
+    lock = payload.get("lock") or {}
+    if lock:
+        print(
+            "lock: "
+            f"scope={lock.get('scope')} owner={lock.get('owner', '')} "
+            f"workarea={lock.get('workarea', '')} path={lock.get('checkout_path', '')}"
+        )
+    for check in payload.get("checks") or []:
+        print(f"check: {check.get('name')}: {'ok' if check.get('ok') else 'blocked'}: {check.get('detail')}")
+    for diagnostic in payload.get("diagnostics") or []:
+        print(f"diagnostic: {diagnostic}")
+
+_print_result = _print_sos_result

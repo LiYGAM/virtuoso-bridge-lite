@@ -17,8 +17,10 @@ import ctypes.util
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
+import threading
 import time
 
 try:
@@ -26,11 +28,32 @@ try:
 except NameError:
     string_types = (str,)
 
+try:
+    integer_types = (int, long)
+except NameError:
+    integer_types = (int,)
+
 VIRTUOSO_WM_CLASSES = ["virtuoso", "libManager"]
 KNOWN_MODAL_ACTIONS = {
     "ade explorer update and run": "enter",
     "ade assembler message 1749": "alt-o",
 }
+
+_INSPECTION_TIMEOUT_SECONDS = 2.0
+_INSPECTION_TOTAL_TIMEOUT_SECONDS = 15.0
+_MAX_INSPECTION_WINDOWS = 1024
+_MAX_OWNERSHIP_DEPTH = 16
+_MAX_ROOT_WINDOW_CHILDREN = 16384
+_MAX_FRAME_SEARCH_DEPTH = 8
+_MAX_X11_NATIVE_QUERIES = 4096
+
+
+class _InspectionFailure(Exception):
+    pass
+
+
+class _InspectionBudgetExceeded(_InspectionFailure):
+    pass
 
 
 def find_x11_envs(user=None):
@@ -873,6 +896,929 @@ def classify_windows(windows):
     return classified
 
 
+def _decode_text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value
+
+
+def _bounded_check_output(command, env=None, timeout=_INSPECTION_TIMEOUT_SECONDS):
+    """Run one inspection probe with a Python 2 compatible wall-clock bound."""
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+    except OSError as exc:
+        raise _InspectionFailure("cannot run %s: %s" % (command[0], str(exc)))
+
+    timed_out = [False]
+
+    def terminate_on_timeout():
+        if process.poll() is None:
+            timed_out[0] = True
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    timer = threading.Timer(timeout, terminate_on_timeout)
+    timer.daemon = True
+    timer.start()
+    try:
+        stdout, stderr = process.communicate()
+    finally:
+        timer.cancel()
+
+    if timed_out[0]:
+        raise _InspectionFailure("%s timed out" % command[0])
+    if process.returncode:
+        detail = (_decode_text(stderr) or "").strip()
+        if detail:
+            raise _InspectionFailure("%s failed: %s" % (command[0], detail))
+        raise _InspectionFailure("%s failed with exit code %s" % (command[0], process.returncode))
+    return _decode_text(stdout)
+
+
+def _read_process_x11_env(pid):
+    """Read one explicitly selected process; never enumerate other processes."""
+    proc_root = "/proc/%d" % pid
+    try:
+        stat_data = _decode_text(open(proc_root + "/stat", "rb").read())
+        cmdline_data = open(proc_root + "/cmdline", "rb").read()
+        environ_data = open(proc_root + "/environ", "rb").read()
+    except (IOError, OSError) as exc:
+        raise _InspectionFailure(
+            "process %d is unavailable or stale: %s" % (pid, str(exc))
+        )
+
+    stat_tail = stat_data.rsplit(")", 1)
+    if len(stat_tail) != 2 or not stat_tail[1].strip():
+        raise _InspectionFailure("process %d metadata is unavailable" % pid)
+    if stat_tail[1].strip().split(None, 1)[0] == "Z":
+        raise _InspectionFailure("process %d is a zombie" % pid)
+
+    argv = [part for part in cmdline_data.split(b"\x00") if part]
+    if not argv:
+        raise _InspectionFailure("process %d command line is unavailable" % pid)
+    executable = os.path.basename(_decode_text(argv[0])).lower()
+    decoded_argv = [_decode_text(part) for part in argv]
+    if executable != "virtuoso" or "-nograph" in decoded_argv:
+        raise _InspectionFailure(
+            "process %d is not a live interactive Virtuoso process" % pid
+        )
+
+    process_env = {"DISPLAY": None, "XAUTHORITY": None, "HOSTNAME": None}
+    for chunk in environ_data.split(b"\x00"):
+        if b"=" not in chunk:
+            continue
+        key, value = chunk.split(b"=", 1)
+        key = _decode_text(key)
+        if key in process_env:
+            process_env[key] = _decode_text(value)
+    if not process_env["DISPLAY"]:
+        raise _InspectionFailure("process %d has no DISPLAY in its environment" % pid)
+    return process_env
+
+
+def _normalize_xid(value):
+    if isinstance(value, integer_types):
+        number = int(value)
+    elif isinstance(value, string_types):
+        text = value.strip().lower()
+        if not re.match(r"^(?:0x[0-9a-f]+|[0-9]+)$", text):
+            raise ValueError("invalid X11 window id: %s" % value)
+        number = int(text, 16 if text.startswith("0x") else 10)
+    else:
+        raise ValueError("invalid X11 window id: %s" % value)
+    if number <= 0:
+        raise ValueError("invalid X11 window id: %s" % value)
+    return "0x%x" % number
+
+
+def _parse_xprop_inspection(output):
+    metadata = {
+        "pid": None,
+        "transient_for": None,
+        "client_leader": None,
+        "client_machine": None,
+        "modal": False,
+        "title": "",
+        "class": [],
+    }
+    titles = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        values = re.findall(r'"((?:\\.|[^"\\])*)"', line)
+        if line.startswith("_NET_WM_PID("):
+            match = re.search(r"=\s*([0-9]+)\s*$", line)
+            if match and int(match.group(1)) > 0:
+                metadata["pid"] = int(match.group(1))
+        elif line.startswith("WM_TRANSIENT_FOR("):
+            match = re.search(r"(?:#\s*)?(0x[0-9a-fA-F]+|[0-9]+)\s*$", line)
+            if match and int(match.group(1), 0) > 0:
+                metadata["transient_for"] = _normalize_xid(match.group(1))
+        elif line.startswith("WM_CLIENT_LEADER("):
+            match = re.search(r"(?:#\s*)?(0x[0-9a-fA-F]+|[0-9]+)\s*$", line)
+            if match and int(match.group(1), 0) > 0:
+                metadata["client_leader"] = _normalize_xid(match.group(1))
+        elif line.startswith("WM_CLIENT_MACHINE(") and values:
+            metadata["client_machine"] = values[0]
+        elif line.startswith("_NET_WM_STATE("):
+            metadata["modal"] = "_NET_WM_STATE_MODAL" in line
+        elif line.startswith("WM_NAME(") and values:
+            titles["wm"] = values[0]
+        elif line.startswith("_NET_WM_NAME(") and values:
+            titles["net"] = values[0]
+        elif line.startswith("WM_CLASS(") and values:
+            metadata["class"] = values
+    metadata["title"] = titles.get("wm") or titles.get("net") or ""
+    return metadata
+
+
+def _parse_window_info_text(output):
+    geometry = {}
+    mapped = False
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        try:
+            if line.startswith("Absolute upper-left X:"):
+                geometry["x"] = int(line.split(":", 1)[1].strip())
+            elif line.startswith("Absolute upper-left Y:"):
+                geometry["y"] = int(line.split(":", 1)[1].strip())
+            elif line.startswith("Width:"):
+                geometry["w"] = int(line.split(":", 1)[1].strip())
+            elif line.startswith("Height:"):
+                geometry["h"] = int(line.split(":", 1)[1].strip())
+            elif "Map State:" in line and "IsViewable" in line:
+                mapped = True
+        except (ValueError, IndexError):
+            pass
+    return {"geometry": geometry, "mapped": mapped}
+
+
+def _inspection_subprocess_env(process_env):
+    env = os.environ.copy()
+    env["DISPLAY"] = process_env["DISPLAY"]
+    xauthority = process_env.get("XAUTHORITY")
+    if xauthority:
+        env["XAUTHORITY"] = xauthority
+    else:
+        env.pop("XAUTHORITY", None)
+    return env
+
+
+class _XWindowAttributes(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("width", ctypes.c_int),
+        ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int),
+        ("depth", ctypes.c_int),
+        ("visual", ctypes.c_void_p),
+        ("root", ctypes.c_ulong),
+        ("window_class", ctypes.c_int),
+        ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int),
+        ("backing_store", ctypes.c_int),
+        ("backing_planes", ctypes.c_ulong),
+        ("backing_pixel", ctypes.c_ulong),
+        ("save_under", ctypes.c_int),
+        ("colormap", ctypes.c_ulong),
+        ("map_installed", ctypes.c_int),
+        ("map_state", ctypes.c_int),
+        ("all_event_masks", ctypes.c_long),
+        ("your_event_mask", ctypes.c_long),
+        ("do_not_propagate_mask", ctypes.c_long),
+        ("override_redirect", ctypes.c_int),
+        ("screen", ctypes.c_void_p),
+    ]
+
+
+_X_ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+
+class _X11InventoryConnection(object):
+    """Small read-only Xlib surface used by bounded dialog inspection."""
+
+    def __init__(self, display, process_env):
+        xlib_path = ctypes.util.find_library("X11")
+        if not xlib_path:
+            raise _InspectionFailure("libX11 not found")
+        self._xlib = ctypes.cdll.LoadLibrary(xlib_path)
+        self._display = None
+        self._closed = False
+        self._x_error = False
+        self._previous_error_handler = None
+        self._error_handler_installed = False
+        self._error_callback = _X_ERROR_HANDLER(self._handle_x_error)
+        self._declare_signatures()
+
+        previous = {}
+        missing = object()
+        for key in ("DISPLAY", "XAUTHORITY"):
+            previous[key] = os.environ.get(key, missing)
+        try:
+            os.environ["DISPLAY"] = display
+            xauthority = process_env.get("XAUTHORITY")
+            if xauthority:
+                os.environ["XAUTHORITY"] = xauthority
+            else:
+                os.environ.pop("XAUTHORITY", None)
+            display_name = display.encode("utf-8") if display else None
+            self._display = self._xlib.XOpenDisplay(display_name)
+        finally:
+            for key, value in previous.items():
+                if value is missing:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        if not self._display:
+            raise _InspectionFailure("cannot open display %s" % display)
+        self._previous_error_handler = self._xlib.XSetErrorHandler(
+            ctypes.cast(self._error_callback, ctypes.c_void_p)
+        )
+        self._error_handler_installed = True
+        self._root = int(self._xlib.XDefaultRootWindow(self._display))
+
+    def _declare_signatures(self):
+        window_pointer = ctypes.POINTER(ctypes.c_ulong)
+        self._xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self._xlib.XOpenDisplay.restype = ctypes.c_void_p
+        self._xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self._xlib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        self._xlib.XDefaultRootWindow.restype = ctypes.c_ulong
+        self._xlib.XQueryTree.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(window_pointer),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        self._xlib.XQueryTree.restype = ctypes.c_int
+        self._xlib.XGetWindowAttributes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(_XWindowAttributes),
+        ]
+        self._xlib.XGetWindowAttributes.restype = ctypes.c_int
+        self._xlib.XTranslateCoordinates.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        self._xlib.XTranslateCoordinates.restype = ctypes.c_int
+        self._xlib.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+        self._xlib.XSetErrorHandler.restype = ctypes.c_void_p
+        self._xlib.XFree.argtypes = [ctypes.c_void_p]
+        self._xlib.XFree.restype = ctypes.c_int
+
+    def _handle_x_error(self, _display, _event):
+        self._x_error = True
+        return 0
+
+    def _begin_request(self):
+        self._x_error = False
+
+    def _request_failed(self, status):
+        return not status or self._x_error
+
+    def root(self):
+        return self._root
+
+    def children(self, window_id):
+        root_return = ctypes.c_ulong()
+        parent_return = ctypes.c_ulong()
+        children_return = ctypes.POINTER(ctypes.c_ulong)()
+        count_return = ctypes.c_uint()
+        self._begin_request()
+        status = self._xlib.XQueryTree(
+            self._display,
+            int(window_id),
+            ctypes.byref(root_return),
+            ctypes.byref(parent_return),
+            ctypes.byref(children_return),
+            ctypes.byref(count_return),
+        )
+        if self._request_failed(status):
+            if children_return:
+                self._xlib.XFree(ctypes.cast(children_return, ctypes.c_void_p))
+            raise _InspectionFailure(
+                "cannot query X11 window tree for %s" % _normalize_xid(window_id)
+            )
+        try:
+            return [int(children_return[index]) for index in range(count_return.value)]
+        finally:
+            if children_return:
+                self._xlib.XFree(ctypes.cast(children_return, ctypes.c_void_p))
+
+    def attributes(self, window_id):
+        attributes = _XWindowAttributes()
+        self._begin_request()
+        status = self._xlib.XGetWindowAttributes(
+            self._display, int(window_id), ctypes.byref(attributes)
+        )
+        if self._request_failed(status):
+            raise _InspectionFailure(
+                "cannot read X11 window attributes for %s"
+                % _normalize_xid(window_id)
+            )
+        absolute_x = ctypes.c_int(attributes.x)
+        absolute_y = ctypes.c_int(attributes.y)
+        if attributes.map_state == 2:  # IsViewable
+            child_return = ctypes.c_ulong()
+            self._begin_request()
+            translated = self._xlib.XTranslateCoordinates(
+                self._display,
+                int(window_id),
+                self._root,
+                0,
+                0,
+                ctypes.byref(absolute_x),
+                ctypes.byref(absolute_y),
+                ctypes.byref(child_return),
+            )
+            if self._request_failed(translated):
+                raise _InspectionFailure(
+                    "cannot translate X11 window coordinates for %s"
+                    % _normalize_xid(window_id)
+                )
+        return {
+            "mapped": attributes.map_state == 2,  # IsViewable
+            "window_class": int(attributes.window_class),
+            "depth": int(attributes.depth),
+            "override_redirect": bool(attributes.override_redirect),
+            "geometry": {
+                "x": int(absolute_x.value),
+                "y": int(absolute_y.value),
+                "w": int(attributes.width),
+                "h": int(attributes.height),
+            },
+        }
+
+    def close(self):
+        if not self._closed and self._display:
+            self._xlib.XCloseDisplay(self._display)
+        if not self._closed and self._error_handler_installed:
+            self._xlib.XSetErrorHandler(self._previous_error_handler)
+        self._closed = True
+        self._display = None
+
+
+def _open_x11_inventory(display, process_env):
+    return _X11InventoryConnection(display, process_env)
+
+
+def _inspect_window_inventory(
+    display, process_env, timeout=_INSPECTION_TOTAL_TIMEOUT_SECONDS
+):
+    """Collect bounded read-only metadata for relevant mapped X11 shells.
+
+    Xlib filters the root tree in one process, so hundreds of unmapped menu
+    windows do not each spawn xwininfo/xprop. Traversal stops at an application
+    shell and does not inventory its widget subtree. Non-WM shells hidden below
+    more than ``_MAX_FRAME_SEARCH_DEPTH`` anonymous containers are unsupported
+    and fail closed instead of producing a clear result. InputOnly nodes cannot
+    render dialogs and are omitted; invisible keyboard/pointer grabs are outside
+    this visual dialog-shell inspection contract.
+    """
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError):
+        raise _InspectionFailure("inspection timeout must be positive and finite")
+    if isinstance(timeout, bool) or budget <= 0 or budget != budget or budget == float("inf"):
+        raise _InspectionFailure("inspection timeout must be positive and finite")
+    clock = getattr(time, "monotonic", time.time)
+    deadline = clock() + budget
+
+    def check_budget():
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise _InspectionBudgetExceeded("X11 inspection budget exhausted")
+        return remaining
+
+    def probe(command, env):
+        remaining = check_budget()
+        try:
+            return _bounded_check_output(
+                command,
+                env=env,
+                timeout=min(_INSPECTION_TIMEOUT_SECONDS, remaining),
+            )
+        except _InspectionFailure:
+            if deadline - clock() <= 0:
+                raise _InspectionBudgetExceeded("X11 inspection budget exhausted")
+            raise
+
+    def connection_call(callback, *args):
+        native_queries[0] += 1
+        if native_queries[0] > _MAX_X11_NATIVE_QUERIES:
+            raise _InspectionFailure("too many native X11 queries to inspect safely")
+        check_budget()
+        value = callback(*args)
+        check_budget()
+        return value
+
+    properties = [
+        "_NET_WM_PID",
+        "WM_TRANSIENT_FOR",
+        "WM_CLIENT_LEADER",
+        "WM_CLIENT_MACHINE",
+        "_NET_WM_STATE",
+        "_NET_WM_NAME",
+        "WM_NAME",
+        "WM_CLASS",
+        "WM_STATE",
+        "_NET_WM_WINDOW_TYPE",
+    ]
+    env = _inspection_subprocess_env(process_env)
+    records = {}
+    order = []
+    native_queries = [0]
+    root_geometry = {}
+
+    def add_record(connection, window_number, frame_number, attributes, metadata_only=False):
+        window_id = _normalize_xid(window_number)
+        if window_id in records:
+            return records[window_id]
+        if len(order) >= _MAX_INSPECTION_WINDOWS:
+            raise _InspectionFailure("too many relevant X11 windows to inspect safely")
+        record = {
+            "id": window_id,
+            "frame_id": _normalize_xid(frame_number),
+            "title": "",
+            "class": [],
+            "geometry": (attributes or {}).get("geometry") or {},
+            "mapped": bool((attributes or {}).get("mapped")),
+            "pid": None,
+            "transient_for": None,
+            "client_leader": None,
+            "client_machine": None,
+            "modal": False,
+        }
+        if metadata_only:
+            record["metadata_only"] = True
+        records[window_id] = record
+        order.append(window_id)
+        try:
+            prop_output = probe(["xprop", "-id", window_id] + properties, env)
+            metadata = _parse_xprop_inspection(prop_output)
+            for key in (
+                "pid", "transient_for", "client_leader", "client_machine", "modal"
+            ):
+                record[key] = metadata[key]
+            record["title"] = metadata.get("title") or ""
+            record["class"] = metadata.get("class") or []
+            record["client_shell"] = bool(
+                re.search(r"(?m)^WM_STATE\(", prop_output)
+                or record["pid"] is not None
+                or record["transient_for"]
+                or record["client_leader"]
+                or record["client_machine"]
+                or record["modal"]
+                or record["class"]
+            )
+            geometry = record["geometry"]
+            root_w = root_geometry.get("w", 0)
+            root_h = root_geometry.get("h", 0)
+            # A property-free off-screen sentinel is not a visible dialog;
+            # this does not assign it a foreign owner or rule out input grabs.
+            record["nonvisual_sentinel"] = bool(
+                window_number == frame_number
+                and not metadata_only
+                and not record["client_shell"]
+                and not re.search(r"(?m)^\w+\(", prop_output)
+                and (attributes or {}).get("override_redirect")
+                and geometry.get("w") == 1 and geometry.get("h") == 1
+                and root_w > 0 and root_h > 0
+                and (geometry.get("x", 0) + 1 <= 0
+                     or geometry.get("y", 0) + 1 <= 0
+                     or geometry.get("x", 0) >= root_w
+                     or geometry.get("y", 0) >= root_h)
+            )
+        except _InspectionBudgetExceeded:
+            raise
+        except _InspectionFailure as exc:
+            record["metadata_error"] = str(exc)
+            record["client_shell"] = False
+        return record
+
+    check_budget()
+    connection = _open_x11_inventory(display, process_env)
+    try:
+        check_budget()
+        root = connection.root()
+        root_attributes = connection_call(connection.attributes, root)
+        root_geometry = (root_attributes or {}).get("geometry") or {}
+        root_children = connection_call(connection.children, root)
+        if len(root_children) > _MAX_ROOT_WINDOW_CHILDREN:
+            raise _InspectionFailure("too many root X11 windows to filter safely")
+
+        queue = []
+        for window_number in root_children:
+            attributes = connection_call(connection.attributes, window_number)
+            # InputOnly windows cannot render a dialog. They remain available
+            # for on-demand ownership metadata if a client shell references one.
+            if (
+                attributes is not None
+                and attributes.get("mapped")
+                and attributes.get("window_class") != 2
+            ):
+                queue.append((window_number, window_number, 0, attributes))
+
+        visited = set()
+        while queue:
+            window_number, frame_number, depth, attributes = queue.pop(0)
+            window_id = _normalize_xid(window_number)
+            if window_id in visited:
+                continue
+            visited.add(window_id)
+            record = add_record(
+                connection, window_number, frame_number, attributes
+            )
+            if record.get("nonvisual_sentinel"):
+                continue
+            if record.get("client_shell") and (
+                depth > 0 or not record.get("metadata_error")
+                and record.get("pid") is not None
+            ):
+                continue
+            if depth >= _MAX_FRAME_SEARCH_DEPTH:
+                raise _InspectionFailure(
+                    "mapped X11 frame %s exceeds supported shell nesting depth"
+                    % _normalize_xid(frame_number)
+                )
+            child_numbers = connection_call(connection.children, window_number)
+            for child_number in child_numbers:
+                child_attributes = connection_call(
+                    connection.attributes, child_number
+                )
+                if (child_attributes is not None and child_attributes.get("mapped")
+                        and child_attributes.get("window_class") != 2):
+                    queue.append(
+                        (child_number, frame_number, depth + 1, child_attributes)
+                    )
+
+        shell_frames = set(
+            record["frame_id"] for record in records.values()
+            if record.get("client_shell") and record["id"] != record["frame_id"]
+        )
+        for record in records.values():
+            if record["frame_id"] in shell_frames and not record.get("client_shell"):
+                record["container"] = True
+            elif record.get("mapped") and not record.get("client_shell"):
+                record["inspection_unknown"] = True
+                if not record.get("metadata_error"):
+                    record["metadata_error"] = (
+                        "mapped X11 branch has no inspectable client-shell metadata"
+                    )
+
+        pending = []
+        for record in records.values():
+            for field in ("transient_for", "client_leader"):
+                if record.get(field):
+                    pending.append(record[field])
+        while pending:
+            related_id = _normalize_xid(pending.pop(0))
+            if related_id in records:
+                continue
+            related_number = int(related_id, 16)
+            attributes = connection_call(connection.attributes, related_number)
+            related = add_record(
+                connection,
+                related_number,
+                related_number,
+                attributes,
+                metadata_only=True,
+            )
+            for field in ("transient_for", "client_leader"):
+                if related.get(field) and related[field] not in records:
+                    pending.append(related[field])
+    finally:
+        connection.close()
+
+    return [records[window_id] for window_id in order]
+
+
+def _local_hostnames(process_env):
+    names = set()
+    try:
+        runtime_hostname = socket.gethostname()
+    except (IOError, OSError):
+        runtime_hostname = None
+    for value in (process_env.get("HOSTNAME"), runtime_hostname):
+        if value:
+            names.add(value.strip().lower().rstrip("."))
+    return names
+
+
+def _client_machine_status(client_machine, local_hostnames):
+    if not client_machine:
+        return "absent"
+    candidate = client_machine.strip().lower().rstrip(".")
+    if not candidate or not local_hostnames:
+        return "unknown"
+    if candidate in local_hostnames:
+        return "local"
+    candidate_short = candidate.split(".", 1)[0]
+    local_shorts = set(name.split(".", 1)[0] for name in local_hostnames)
+    if candidate_short not in local_shorts:
+        return "foreign"
+    return "unknown"
+
+
+def _resolve_window_owner(window_id, records, selected_pid, local_hostnames):
+    """Resolve an exact PID through bounded X11 ownership relations."""
+    def resolve(current_id, trail, depth):
+        if depth > _MAX_OWNERSHIP_DEPTH:
+            return None, "ownership relation exceeded depth bound"
+        if current_id in trail:
+            return None, "ownership relation cycle at %s" % current_id
+        record = records.get(current_id)
+        if record is None:
+            return None, "ownership relation references missing window %s" % current_id
+
+        direct_pid = record.get("pid")
+        machine = record.get("client_machine")
+        machine_status = _client_machine_status(machine, local_hostnames)
+        if machine_status == "foreign" and (direct_pid is None or int(direct_pid) == selected_pid):
+            return "foreign-client:%s" % machine, None
+        if machine_status == "unknown" and (direct_pid is None or int(direct_pid) == selected_pid):
+            return None, "cannot match WM_CLIENT_MACHINE %s to the selected process host" % machine
+        relation_results = []
+        next_trail = trail + (current_id,)
+        for field in ("transient_for", "client_leader"):
+            related_id = record.get(field)
+            if related_id:
+                owner, reason = resolve(related_id, next_trail, depth + 1)
+                relation_results.append((owner, reason))
+
+        known = set(owner for owner, _reason in relation_results if owner is not None)
+        if direct_pid is not None:
+            known.add(int(direct_pid))
+            if len(known) > 1:
+                return None, "contradictory ownership metadata for %s" % current_id
+            return int(direct_pid), None
+        if len(known) > 1:
+            return None, "contradictory ownership metadata for %s" % current_id
+        unresolved = [reason for owner, reason in relation_results if owner is None]
+        if unresolved:
+            return None, unresolved[0]
+        if known:
+            return list(known)[0], None
+        if record.get("metadata_error"):
+            return None, record["metadata_error"]
+        return None, "window %s has no PID or ownership relation" % current_id
+
+    return resolve(window_id, (), 0)
+
+
+def _inspection_classification(record):
+    window = {
+        "frame_id": record.get("frame_id") or record["id"],
+        "window_id": record["id"],
+        "dismiss_id": record["id"],
+        "title": record.get("title") or "",
+        "class": record.get("class") or [],
+        "geometry": record.get("geometry") or {},
+        "mapped": bool(record.get("mapped")),
+    }
+    classified = classify_windows([window])[0]
+    if record.get("modal") and classified.get("kind") not in ("ciw", "known_modal"):
+        classified["kind"] = "dialog_candidate"
+        classified["suggested_action"] = "enter"
+    classified["modal"] = bool(record.get("modal"))
+    classified["suggested_action"] = None
+    return classified
+
+
+def _is_inspection_dialog(record, classified):
+    if (
+        not record.get("mapped")
+        or record.get("metadata_only")
+        or record.get("container")
+        or record.get("nonvisual_sentinel")
+        or classified.get("kind") == "ciw"
+    ):
+        return False
+    if record.get("inspection_unknown"):
+        return True
+    if record.get("modal"):
+        return True
+    if not _is_virtuoso_class(record.get("class")):
+        return False
+    return bool(record.get("metadata_error")) or classified.get("kind") in ("known_modal", "dialog_candidate")
+
+
+def _inspection_result(pid, display, ciw_window, status="indeterminate", diagnostics=None):
+    return {
+        "status": status,
+        "target": {
+            "pid": int(pid),
+            "display": display,
+            "ciw_window": ciw_window,
+        },
+        "dialogs": [],
+        "diagnostics": list(diagnostics or []),
+    }
+
+
+def inspect_dialogs(
+    pid, display=None, ciw_window=None,
+    timeout=_INSPECTION_TOTAL_TIMEOUT_SECONDS,
+):
+    """Inspect dialogs for one exact Virtuoso PID without injecting input."""
+    if isinstance(pid, bool):
+        return _inspection_result(0, display, ciw_window, diagnostics=["pid must be a positive integer"])
+    if isinstance(pid, integer_types):
+        selected_pid = int(pid)
+    elif isinstance(pid, string_types) and re.match(r"^[0-9]+$", pid.strip()):
+        selected_pid = int(pid.strip())
+    else:
+        return _inspection_result(0, display, ciw_window, diagnostics=["pid must be a positive integer"])
+    if selected_pid <= 0:
+        return _inspection_result(selected_pid, display, ciw_window, diagnostics=["pid must be a positive integer"])
+    try:
+        inspection_timeout = float(timeout)
+    except (TypeError, ValueError):
+        return _inspection_result(selected_pid, display, ciw_window, diagnostics=["inspection timeout must be positive and finite"])
+    if (
+        isinstance(timeout, bool)
+        or inspection_timeout <= 0
+        or inspection_timeout != inspection_timeout
+        or inspection_timeout == float("inf")
+    ):
+        return _inspection_result(selected_pid, display, ciw_window, diagnostics=["inspection timeout must be positive and finite"])
+
+    result = _inspection_result(selected_pid, display, ciw_window)
+    try:
+        process_env = _read_process_x11_env(selected_pid)
+    except _InspectionFailure as exc:
+        result["diagnostics"].append(str(exc))
+        return result
+
+    process_display = process_env.get("DISPLAY")
+    result["target"]["display"] = process_display
+    if not process_display:
+        result["diagnostics"].append(
+            "process %d has no DISPLAY in its environment" % selected_pid
+        )
+        return result
+    if display is not None and display != process_display:
+        result["diagnostics"].append(
+            "supplied DISPLAY %s disagrees with process DISPLAY %s"
+            % (display, process_display)
+        )
+        return result
+
+    try:
+        inventory = _inspect_window_inventory(
+            process_display, process_env, timeout=inspection_timeout
+        )
+    except _InspectionFailure as exc:
+        result["diagnostics"].append(str(exc))
+        return result
+    except Exception as exc:
+        result["diagnostics"].append("X11 inspection failed: %s" % str(exc))
+        return result
+
+    records = {}
+    for raw_record in inventory:
+        record = dict(raw_record)
+        try:
+            record["id"] = _normalize_xid(record["id"])
+            if record.get("frame_id"):
+                record["frame_id"] = _normalize_xid(record["frame_id"])
+            for field in ("transient_for", "client_leader"):
+                if record.get(field):
+                    record[field] = _normalize_xid(record[field])
+        except (KeyError, ValueError) as exc:
+            result["diagnostics"].append("invalid X11 inventory metadata: %s" % str(exc))
+            return result
+        records[record["id"]] = record
+
+    local_hostnames = _local_hostnames(process_env)
+
+    ciw_candidates = []
+    unknown_ciws = []
+    for record in records.values():
+        if not record.get("mapped"):
+            continue
+        if not _looks_like_ciw(record.get("title") or ""):
+            continue
+        if not _is_virtuoso_class(record.get("class")):
+            continue
+        owner, reason = _resolve_window_owner(
+            record["id"], records, selected_pid, local_hostnames
+        )
+        if owner == selected_pid:
+            ciw_candidates.append(record)
+        elif owner is None:
+            unknown_ciws.append((record, reason))
+
+    selected_ciw = None
+    if ciw_window is not None:
+        try:
+            requested_ciw = _normalize_xid(ciw_window)
+        except ValueError as exc:
+            result["diagnostics"].append(str(exc))
+            return result
+        record = records.get(requested_ciw)
+        if record is None or not record.get("mapped") or not _looks_like_ciw(record.get("title") or ""):
+            result["diagnostics"].append(
+                "selected ciw_window is not a mapped CIW"
+            )
+            return result
+        if not _is_virtuoso_class(record.get("class")):
+            result["diagnostics"].append(
+                "selected ciw_window is not a Virtuoso CIW"
+            )
+            return result
+        owner, reason = _resolve_window_owner(
+            requested_ciw, records, selected_pid, local_hostnames
+        )
+        if owner != selected_pid:
+            if owner is None:
+                result["diagnostics"].append(
+                    "cannot establish selected CIW ownership: %s" % reason
+                )
+            elif isinstance(owner, integer_types):
+                result["diagnostics"].append(
+                    "selected CIW belongs to PID %d, not PID %d"
+                    % (owner, selected_pid)
+                )
+            else:
+                result["diagnostics"].append(
+                    "selected CIW belongs to %s, not selected PID %d"
+                    % (owner, selected_pid)
+                )
+            return result
+        selected_ciw = record
+    else:
+        if len(ciw_candidates) > 1:
+            result["diagnostics"].append(
+                "more than one CIW belongs to PID %d" % selected_pid
+            )
+            return result
+        if not ciw_candidates:
+            if unknown_ciws:
+                result["diagnostics"].append(
+                    "cannot establish CIW ownership: %s" % unknown_ciws[0][1]
+                )
+            else:
+                result["diagnostics"].append(
+                    "no mapped CIW belongs to PID %d" % selected_pid
+                )
+            return result
+        selected_ciw = ciw_candidates[0]
+        result["target"]["ciw_window"] = selected_ciw["id"]
+
+    indeterminate = False
+    dialogs = []
+    for record in records.values():
+        classified = _inspection_classification(record)
+        if not _is_inspection_dialog(record, classified):
+            continue
+        owner, reason = _resolve_window_owner(
+            record["id"], records, selected_pid, local_hostnames
+        )
+        if owner is not None and owner != selected_pid:
+            continue
+        classified["source"] = "unknown"
+        classified["ownership"] = "target" if owner == selected_pid else "unknown"
+        dialogs.append(classified)
+        if owner is None:
+            indeterminate = True
+            result["diagnostics"].append(
+                "cannot establish ownership for dialog %s: %s"
+                % (record["id"], reason)
+            )
+
+    def xid_sort_key(window):
+        try:
+            return int(window.get("window_id") or "0", 16)
+        except (TypeError, ValueError):
+            return 0
+
+    result["dialogs"] = sorted(dialogs, key=xid_sort_key)
+    if indeterminate:
+        result["status"] = "indeterminate"
+    elif dialogs:
+        result["status"] = "blocked"
+    else:
+        result["status"] = "clear"
+    return result
+
+
 def discover_windows(display, top_level=False):
     """Enumerate Virtuoso windows, optionally returning one item per WM frame."""
     os.environ["DISPLAY"] = display
@@ -1363,6 +2309,10 @@ def main():
     args = sys.argv[1:]
     display = None
     do_dismiss = False
+    inspect_only = "--inspect-dialogs" in args
+    inspect_pid = None
+    inspect_ciw = None
+    inspect_timeout = _INSPECTION_TOTAL_TIMEOUT_SECONDS
     list_windows = False
     top_level = False
     dismiss_target = None
@@ -1391,6 +2341,38 @@ def main():
     while i < len(args):
         if args[i] == "--dismiss":
             do_dismiss = True
+        elif args[i] == "--inspect-dialogs":
+            inspect_only = True
+        elif args[i] == "--pid":
+            if i + 1 >= len(args):
+                print(json.dumps(_inspection_result(
+                    0, display, inspect_ciw,
+                    diagnostics=["--pid requires a positive integer"],
+                )))
+                sys.exit(2)
+            inspect_pid = args[i + 1]
+            i += 1
+        elif args[i] == "--ciw-window":
+            if i + 1 >= len(args):
+                print(json.dumps(_inspection_result(
+                    0, display, None,
+                    diagnostics=["--ciw-window requires an X11 window id"],
+                )))
+                sys.exit(2)
+            inspect_ciw = args[i + 1]
+            i += 1
+        elif args[i] == "--timeout" and inspect_only:
+            if i + 1 >= len(args):
+                print(json.dumps(_inspection_result(
+                    0, display, inspect_ciw,
+                    diagnostics=["--timeout requires a positive finite number"],
+                )))
+                sys.exit(1)
+            try:
+                inspect_timeout = float(args[i + 1])
+            except ValueError:
+                inspect_timeout = 0
+            i += 1
         elif args[i] == "--list-windows":
             list_windows = True
         elif args[i] == "--top-level":
@@ -1498,6 +2480,22 @@ def main():
         elif not args[i].startswith("-"):
             display = args[i]
         i += 1
+
+    if inspect_only:
+        if inspect_pid is None:
+            result = _inspection_result(
+                0, display, inspect_ciw,
+                diagnostics=["--inspect-dialogs requires --pid"],
+            )
+        else:
+            result = inspect_dialogs(
+                inspect_pid,
+                display=display,
+                ciw_window=inspect_ciw,
+                timeout=inspect_timeout,
+            )
+        print(json.dumps(result, sort_keys=True))
+        sys.exit(1 if result.get("status") == "indeterminate" else 0)
 
     if display:
         x11_envs = [{"DISPLAY": display, "XAUTHORITY": os.environ.get("XAUTHORITY")}]

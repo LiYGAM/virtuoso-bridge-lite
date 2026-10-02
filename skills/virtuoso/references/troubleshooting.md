@@ -77,16 +77,18 @@ blocked the same CIW event loop that serves the bridge.
 
 **Recovery (out of band through X11):**
 ```bash
-virtuoso-bridge dismiss-dialog
+virtuoso-bridge inspect-dialogs --pid PID --json
 virtuoso-bridge list-windows --top-level --json
-virtuoso-bridge dismiss-window WINDOW_ID --action enter
-virtuoso-bridge screenshot ciw -o output/debug.png
+# Only with explicit authorization for this window and action:
+virtuoso-bridge dismiss-window WINDOW_ID --action escape
 ```
 
-The first command recognizes common modal dialogs automatically. Use the
-explicit window commands when no known-dialog rule matches. A short
-`hiFormDone(hiGetCurrentForm())` call is only a secondary option after the
-SKILL channel responds again.
+The first command inspects one process without altering any window. A modal
+can come from the human sharing the CIW; do not automatically close or cancel
+it. CIW screenshots and form queries can use the blocked SKILL channel, so
+they are unsuitable as the first diagnostic. See
+[Shared CIW Dialog Protection](shared-ciw-dialogs.md) for the opt-in guard,
+structured outcomes, and watchdog limitations.
 
 ### ASSEMBLER-8127: cellview already open in edit mode
 `maeMakeEditable()` fails with a modal dialog when the same cellview is already open in editable mode in another session (e.g. `fnxSession21` has it open while you try from `fnxSession0`). This dialog **completely blocks** the SKILL channel — even `hiFormDone` cannot reach it.

@@ -91,6 +91,9 @@ class _Connection:
 
 def _load_functions(filename: str, names: set[str], namespace: dict[str, object]) -> dict[str, object]:
     namespace.setdefault("_monotonic", lambda: 0.0)
+    # Queue/drain unit fixtures begin after successful authentication.
+    namespace.setdefault("_authenticate_connection", lambda conn, request: (conn, request, False))
+    namespace.setdefault("_AuthenticatedConnection", type("SignedConnection", (), {}))
     source_path = RESOURCE_DIR / filename
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     functions = [

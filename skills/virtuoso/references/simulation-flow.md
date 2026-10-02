@@ -86,18 +86,18 @@ configuration or use out-of-band X11 recovery.
 
 ## Detecting Maestro session state
 
-There is **no direct SKILL API** to query whether a Maestro session is read-only, editable, or has unsaved changes. The `axl*` and `mae*` APIs (e.g. `maeIsEditable`, `axlGetSetupMode`) all return `nil`.
+There is **no direct SKILL API** known to query whether a Maestro session is
+read-only, editable, or has unsaved changes. The `axl*` and `mae*` APIs
+previously tested for this purpose (for example `maeIsEditable` and
+`axlGetSetupMode`) return `nil` in the validated IC6.1.8 environment.
 
-The only reliable method is parsing the **window title** via `hiGetWindowName`:
+Use the structured probe, which atomically binds windows to sessions and then
+parses recognized **window title** shapes:
 
 ```python
-r = client.execute_skill('''
-foreach(mapcar w hiGetWindowList()
-  let((s name)
-    s = car(errset(axlGetWindowSession(w)))
-    name = hiGetWindowName(w)
-    when(s list(s name))))
-''')
+state = client.maestro.get_session_state(session)
+if state.access == "unknown" or state.unsaved is None:
+    raise RuntimeError("Maestro state is not safe for a lifecycle mutation")
 ```
 
 | Title pattern | State |
@@ -106,7 +106,10 @@ foreach(mapcar w hiGetWindowList()
 | `...Assembler Editing: LIB CELL maestro*` | Editable, **has unsaved changes** (trailing `*`) |
 | `...Assembler Reading: LIB CELL maestro` | Read-only |
 
-Use this before calling `maeMakeEditable()` to avoid ASSEMBLER-8127 deadlock.
+Title parsing is version- and locale-sensitive. Unrecognized titles remain
+`unknown`; they are never assumed to mean Reading or clean. Use this state
+before calling `maeMakeEditable()` or closing a window to avoid targeting the
+wrong session or triggering an ASSEMBLER-8127/modal path.
 
 ## Closing Maestro sessions
 
@@ -180,4 +183,7 @@ for val in ["1p", "2p", "5p", "10p"]:
     # ... process results ...
 ```
 
-Add dialog recovery (`client.dismiss_dialog()`) in the loop if GUI dialogs may appear.
+For shared CIWs, enable `client.dialogs.enable_guard()` before the loop. Preserve
+user dialogs and inspect through SSH/X11 rather than dismissing current forms.
+See [Shared CIW Dialog Protection](shared-ciw-dialogs.md). Failed/uncertain runs
+must be reconciled before any explicit retry.

@@ -7,10 +7,12 @@ and dismiss those dialogs without touching the SKILL channel.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import shlex
+import time
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +61,7 @@ def _run(runner: SSHRunner | None, cmd: str, timeout: int, *, retry_transport_er
     )
 
 
-def _detect_remote_python(runner: SSHRunner | None) -> str:
+def _detect_remote_python(runner: SSHRunner | None, timeout: float = 10) -> str:
     """Find a Python interpreter (remote host or local).
 
     The X11 helper is intentionally Python 2/3 compatible because older EDA
@@ -71,7 +73,7 @@ def _detect_remote_python(runner: SSHRunner | None) -> str:
         '(python --version 2>&1 | grep -q "Python" && echo "CMD:python") || '
         '(python2 --version 2>&1 | grep -q "Python" && echo "CMD:python2") || '
         'echo "CMD:NONE"',
-        timeout=10,
+        timeout=timeout,
     )
     for line in (r.stdout or "").splitlines():
         if line.strip().startswith("CMD:") and line.strip() != "CMD:NONE":
@@ -218,6 +220,68 @@ def list_windows(
     return _parse_result(result)
 
 
+def inspect_dialogs(
+    runner: SSHRunner | None, user: str, *, pid: int,
+    display: str | None = None, ciw_window: str | None = None,
+    profile: str | None = None, timeout: float = 15,
+) -> dict[str, Any]:
+    """Read-only inspection of one CIW process, without broad DISPLAY discovery."""
+    import math
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError("pid must be a positive integer")
+    if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be positive and finite")
+    deadline = time.monotonic() + timeout
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("X11 inspection budget exhausted")
+        return value
+
+    if runner is None:
+        script = str(_HELPER_SCRIPT)
+        py = _detect_remote_python(None, timeout=remaining())
+    else:
+        # A content-addressed helper cannot be overwritten by another installed
+        # Bridge version sharing the same profile scratch directory.
+        digest = hashlib.sha256(_HELPER_SCRIPT.read_bytes()).hexdigest()[:16]
+        key = (user, profile, digest)
+        cached = getattr(runner, "_vb_dialog_helper", None)
+        if cached is not None and cached[0] == key:
+            script, py = cached[1:]
+        else:
+            root = default_virtuoso_bridge_dir(user, "x11", resolve_client_id(profile))
+            script = f"{root}/dialog_inspect_{digest}.py"
+            made = runner.run_command(f"mkdir -p {shlex.quote(root)}", timeout=remaining())
+            if made.returncode != 0:
+                raise RuntimeError(made.stderr or "cannot prepare X11 helper directory")
+            uploaded = runner.upload(_HELPER_SCRIPT, script, timeout=remaining())
+            if uploaded.returncode != 0:
+                raise RuntimeError(uploaded.stderr or "cannot upload X11 inspection helper")
+            py = _detect_remote_python(runner, timeout=remaining())
+            runner._vb_dialog_helper = (key, script, py)
+    cmd = f"{shlex.quote(py)} {shlex.quote(script)} --inspect-dialogs --pid {pid}"
+    if ciw_window is not None:
+        cmd += f" --ciw-window {shlex.quote(ciw_window)}"
+    if display is not None:
+        cmd += f" {shlex.quote(display)}"
+    execution_budget = remaining()
+    cmd += f" --timeout {execution_budget}"
+    result = _run(runner, cmd, timeout=execution_budget)
+    items = _parse_result(result)
+    reports = [item for item in items if isinstance(item, dict) and "status" in item]
+    if getattr(result, "returncode", 0) not in (0, 1) or len(items) != 1 or len(reports) != 1:
+        return {
+            "status": "indeterminate",
+            "target": {"pid": pid, "display": display, "ciw_window": ciw_window},
+            "dialogs": [],
+            "diagnostics": ["X11 helper failed or returned an invalid inspection: " + str(items)],
+        }
+    return reports[0]
+
+
 def dismiss_window(
     runner: SSHRunner | None,
     user: str,
@@ -237,7 +301,7 @@ def dismiss_window(
         f"--action {shlex.quote(action)}"
     )
     if resolved:
-        cmd += f" {resolved}"
+        cmd += f" {shlex.quote(resolved)}"
     result = _run(runner, cmd, timeout=15)
     return _parse_result(result)
 
@@ -332,11 +396,15 @@ def dismiss_dialogs(
     user: str,
     display: str | None = None,
     profile: str | None = None,
+    *,
+    allow_legacy_bulk: bool = False,
 ) -> list[dict[str, Any]]:
     """Find and dismiss all blocking dialog windows.
 
     Returns list of result dicts (found dialogs + dismissal results).
     """
+    if not allow_legacy_bulk:
+        return [{"error": "Bulk dialog dismissal is disabled. Inspect one CIW and use an explicit window/action; legacy bulk requires allow_legacy_bulk=True."}]
     load_vb_env()
     script = _ensure_helper(runner, user, profile)
     py = _detect_remote_python(runner)
@@ -406,4 +474,19 @@ def bootstrap_ciw(
     if resolved:
         cmd += f" {resolved}"
     result = _run(runner, cmd, timeout=20)
-    return _parse_result(result)
+    parsed = _parse_result(result)
+    selected = [
+        item for item in parsed
+        if window_id in (
+            item.get("requested_window_id"),
+            item.get("window_id"),
+            item.get("bootstrapped"),
+        )
+    ]
+    # Auto-detection may probe stale or inaccessible DISPLAY values before it
+    # reaches the selected CIW.  Keep those diagnostics, but never let them
+    # mask the result for the window the caller explicitly requested.
+    selected_success = [item for item in selected if "error" not in item]
+    selected_error = [item for item in selected if "error" in item]
+    remainder = [item for item in parsed if item not in selected]
+    return selected_success + selected_error + remainder

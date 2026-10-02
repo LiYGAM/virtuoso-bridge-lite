@@ -50,6 +50,45 @@ Read a schematic through the same client-bound API:
 data = client.schematic.read(lib, cell, include_positions=False)
 ```
 
+### Structured check/save diagnostics
+
+Use `check_and_save()` when automation needs the diagnostics from one explicit
+cellview rather than a generic batch result or the existing contents of the
+CIW:
+
+```python
+report = client.schematic.check_and_save(
+    lib,
+    cell,
+    capture_screenshot=True,  # optional lower-fidelity evidence
+    screenshot_output="output/check-save.png",
+)
+
+if not report.ok:
+    for diagnostic in report.diagnostics:
+        print(diagnostic.severity, diagnostic.code, diagnostic.message)
+```
+
+`report` includes the authoritative `schCheck` error/warning counts, whether
+`dbSave` succeeded, structured current-run messages, raw check/save log slices,
+modal-window metadata, and an optional CIW screenshot path. Status is one of
+`saved`, `check_failed`, `save_failed`, `blocked`, `timeout`,
+`operation_error`, or `protocol_error`.
+
+Cadence's public `schCheck(cv)` API returns counts, not message text. On
+releases that provide `hiGetLogFileName()` and `hiFlushLogFile()`, the bridge
+captures only the bytes appended to `CDS.log` during the check and save; it
+never classifies stale CIW history. This path is verified against IC6.1.8 and
+uses long-standing public APIs also present in newer Virtuoso releases. If log
+capture is unavailable or a PDK checker bypasses `CDS.log`, the counts remain
+authoritative and the report says that per-message text is unavailable.
+
+If a modal blocks the SKILL event loop, the call reports `blocked` and lists
+the modal through read-only X11 discovery. It does not dismiss the dialog.
+Because `client.screenshot()` also uses the blocked SKILL channel, screenshot
+capture is deliberately skipped in this state; use the modal title/window id
+for recovery. No OCR output is treated as an authoritative diagnostic.
+
 ## Deterministic constraint planning
 
 Use the optional Python-side planner when placement conventions should be
@@ -112,6 +151,29 @@ client.schematic.create_from_plan(dst_lib, dst_cell, plan)
 See `examples/01_virtuoso/schematic/12_plan_differential_pair.py` and
 `docs/adr/0002-deterministic-schematic-planner.md` for the complete acceptance
 example, conflict model, and explicit non-goals.
+
+### Exact-coordinate manifest import
+
+When a source editor already provides instance origins, transforms, endpoint
+coordinates, bends, junctions, and repeated ports, preserve that drawing with
+an explicit PDK process map:
+
+```python
+result = client.schematic.import_manifest(
+    "source.json",
+    "process-map.json",
+    processes=["pdk180", "pdk28"],
+    cells=["ota", "strongarm"],
+)
+pngs = client.schematic.capture_import_result(result, "output/evidence")
+```
+
+This path probes live master-pin centers before import, adapts source geometry
+to target-symbol pin offsets with exact axis constraints, creates both named
+connectivity and visible wires, runs `schCheck`, and verifies the result by
+reading it back.  It does not infer topology, placement, or PDK names.  See
+`references/schematic-manifest-import.md` and
+`examples/01_virtuoso/schematic_manifest/` for the JSON contracts.
 
 ### SKILL builder functions (ops)
 

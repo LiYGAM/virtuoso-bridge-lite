@@ -19,17 +19,9 @@ import re
 
 from virtuoso_bridge import VirtuosoClient
 
-from ._parse_skill import _parse_skill_str_list, _tokenize_top_level
+from .state import get_session_state, parse_maestro_title
 
 
-_MAE_TITLE_RE = re.compile(
-    r"ADE\s+(Assembler|Explorer)\s+(Editing|Reading):\s+"
-    r"(\S+)\s+(\S+)\s+([^\s*]+)(\*?)"
-    # Optional OpenAccess library checkout suffix:
-    # ``... maestro Version: 1 -CheckedOut`` or ``... maestro Version:7-CheckedOut``.
-    r"(?:\s+Version:\s*\S+(?:\s*-\s*\S+)?)?"
-    r"\s*$"
-)
 # A history is anchored by its .rdb metadata file (any user-given name —
 # Interactive.0.RO, closeloop_PVT_postsim, sweep_set.3, etc.).  Bare
 # directories matching Cadence's ``Interactive.N`` / ``MonteCarlo.N``
@@ -49,15 +41,14 @@ def _parse_mae_title(titles) -> dict:
     for n in titles or ():
         if not n:
             continue
-        m = _MAE_TITLE_RE.search(n)
-        if not m:
+        parsed = parse_maestro_title(n)
+        if parsed is None:
             continue
-        app, mode, lib, cell, view, star = m.groups()
         return {
-            "application": app.lower(),
-            "lib": lib, "cell": cell, "view": view,
-            "mode": mode,              # "Editing" / "Reading"
-            "unsaved": star == "*",
+            "application": parsed["application"],
+            "lib": parsed["lib"], "cell": parsed["cell"], "view": parsed["view"],
+            "mode": str(parsed["access"]).title(),
+            "unsaved": parsed["unsaved"],
         }
     return {}
 
@@ -66,49 +57,25 @@ def _fetch_window_state(client: VirtuosoClient) -> dict:
     """One SKILL round-trip → focused window info, title parsed.
 
     Keys: ``session`` (davSession — ``""`` if focus isn't a maestro
-    window), ``title``, ``all_titles``, ``all_sessions``, plus the
-    parsed fields from the focused title: ``application / lib / cell /
+    window), ``title``, a structured ``state``, plus the parsed fields
+    from the focused title: ``application / lib / cell /
     view / mode / unsaved`` (empty / None when nothing parsed).
 
     davSession is Cadence's own attribute for the bound maestro
     session on ADE Assembler windows — avoids sdb-scp disambiguation.
     """
-    r = client.execute_skill(
-        'let((cw) '
-        'cw = hiGetCurrentWindow() '
-        'list('
-        '  if(cw hiGetWindowName(cw) nil) '
-        '  if(cw cw->davSession nil) '
-        '  mapcar(lambda((w) hiGetWindowName(w)) hiGetWindowList()) '
-        '  maeGetSessions()))'
-    )
-    body = (r.output or "").strip()
-    if body.startswith("(") and body.endswith(")"):
-        body = body[1:-1]
-    chunks = _tokenize_top_level(
-        body, include_strings=True, include_atoms=True, max_tokens=4,
-    )
-    while len(chunks) < 4:
-        chunks.append("nil")
-    title = chunks[0].strip().strip('"') if chunks[0] != "nil" else ""
-    sess  = chunks[1].strip().strip('"') if chunks[1] != "nil" else ""
-    all_titles = _parse_skill_str_list(chunks[2])
-    # Parse only the focused title — mixing in other windows' titles
-    # gives inconsistent output (session id from focus + lib/cell from
-    # some sibling window).  Callers that want a brief of a non-focused
-    # window should click it first.
-    parsed = _parse_mae_title([title])
+    state = get_session_state(client)
+    title = state.title or ""
     return {
-        "session":      sess,
+        "session":      state.session or "",
         "title":        title,
-        "all_titles":   all_titles,
-        "all_sessions": _parse_skill_str_list(chunks[3]),
-        "application":  parsed.get("application"),
-        "lib":          parsed.get("lib", ""),
-        "cell":         parsed.get("cell", ""),
-        "view":         parsed.get("view", ""),
-        "mode":         parsed.get("mode", ""),
-        "unsaved":      parsed.get("unsaved", False),
+        "application":  state.application,
+        "lib":          state.lib or "",
+        "cell":         state.cell or "",
+        "view":         state.view or "",
+        "mode":         state.access.title() if state.access != "unknown" else "Unknown",
+        "unsaved":      state.unsaved,
+        "state":        state.model_dump(mode="json"),
     }
 
 

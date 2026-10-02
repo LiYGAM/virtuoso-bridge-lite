@@ -104,7 +104,7 @@ def test_bootstrap_health_check_uses_profile_authentication(monkeypatch):
     monkeypatch.setattr(SSHClient, "read_state", classmethod(lambda cls, profile: {
         "setup_path": "/owned/setup.il", "port": 65001}))
     monkeypatch.setattr(SSHClient, "from_env", classmethod(lambda cls, **kw: SimpleNamespace(
-        port=65001, auth_token="fixture-token", close=lambda: None)))
+        port=65001, auth_token="fixture-token", ensure_daemon_token=lambda: "signed-token", close=lambda: None)))
     observed = []
 
     def make_client(**kwargs):

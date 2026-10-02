@@ -178,7 +178,7 @@ def test_execute_skill_uses_one_deadline_across_retry_and_socket_phases(
 
     assert result.status == ExecutionStatus.ERROR
     assert result.errors == ["Socket timeout after 1.0s"]
-    assert result.completion == CompletionStatus.TIMED_OUT_UNKNOWN
+    assert result.completion == CompletionStatus.NOT_DISPATCHED
     assert result.execution_time == pytest.approx(1.0)
     assert clock.sleeps == [0.2]
     assert refused.phase_timeouts == [("connect", pytest.approx(1.0))]
@@ -205,7 +205,7 @@ def test_execute_skill_timeout_caps_jump_host_retry_grace(
     factory = _SocketFactory(refused_sockets)
     _use_fake_network(monkeypatch, clock, factory)
 
-    result = VirtuosoClient().execute_skill("1+1", timeout=0.1)
+    result = VirtuosoClient(auth_token="test-fork-token", ).execute_skill("1+1", timeout=0.1)
 
     assert result.status == ExecutionStatus.ERROR
     assert result.errors == ["Socket timeout after 0.1s"]
@@ -236,22 +236,31 @@ def test_execute_skill_preserves_successful_jump_host_retry(
         connect_duration=0.05,
         connect_error=ConnectionRefusedError(errno.ECONNREFUSED, "refused"),
     )
+    hello = _FakeSocket(
+        clock,
+        connect_duration=0.05,
+        send_duration=0.05,
+        # Skill-less capability handshake: fake daemon answers auth=off.
+        recv_results=((0.05, b'\x02{"proto": 1, "auth": "off"}'), (0.0, b"")),
+    )
     connected = _FakeSocket(
         clock,
         connect_duration=0.05,
         send_duration=0.05,
         recv_results=((0.05, b"\x023"), (0.0, b"")),
     )
-    factory = _SocketFactory([refused, connected])
+    factory = _SocketFactory([refused, hello, connected])
     _use_fake_network(monkeypatch, clock, factory)
+    # Bare client + auth-off fake daemon: explicit legacy opt-in.
+    monkeypatch.setenv("VB_ALLOW_UNAUTHENTICATED_DAEMON", "1")
 
     result = VirtuosoClient().execute_skill("1+2", timeout=1.0)
 
     assert result.status == ExecutionStatus.SUCCESS
     assert result.output == "3"
-    assert result.execution_time == pytest.approx(0.4)
+    assert result.execution_time == pytest.approx(0.55)
     assert clock.sleeps == [0.2]
-    assert len(factory.created) == 2
+    assert len(factory.created) == 3
 
 
 @pytest.mark.parametrize("phase", ["send", "shutdown", "recv"])
@@ -276,7 +285,7 @@ def test_execute_skill_transport_reset_after_dispatch_is_unknown_and_not_retried
     factory = _SocketFactory([connected])
     _use_fake_network(monkeypatch, clock, factory)
 
-    result = VirtuosoClient().execute_skill(
+    result = VirtuosoClient(auth_token="test-fork-token", ).execute_skill(
         "dbCreateRect(cv list(0:0 1:1))",
         timeout=1.0,
         operation_class=operation_class,
@@ -307,7 +316,7 @@ def test_execute_skill_preserves_pre_dispatch_reset_retry(
     factory = _SocketFactory([reset, connected])
     _use_fake_network(monkeypatch, clock, factory)
 
-    result = VirtuosoClient().execute_skill("1+2", timeout=1.0)
+    result = VirtuosoClient(auth_token="test-fork-token", ).execute_skill("1+2", timeout=1.0)
 
     assert result.status == ExecutionStatus.SUCCESS
     assert result.output == "3"
@@ -325,7 +334,7 @@ def test_execute_skill_unretryable_pre_dispatch_error_is_not_dispatched(
     factory = _SocketFactory([unreachable])
     _use_fake_network(monkeypatch, clock, factory)
 
-    result = VirtuosoClient().execute_skill(
+    result = VirtuosoClient(auth_token="test-fork-token", ).execute_skill(
         "1+2", timeout=1.0, request_id="req-unreachable-001"
     )
 
@@ -344,7 +353,7 @@ def test_execute_skill_empty_response_after_dispatch_is_unknown(
     factory = _SocketFactory([_FakeSocket(clock, recv_results=((0.0, b""),))])
     _use_fake_network(monkeypatch, clock, factory)
 
-    result = VirtuosoClient().execute_skill(
+    result = VirtuosoClient(auth_token="test-fork-token", ).execute_skill(
         "dbSave(cv)",
         timeout=1.0,
         operation_class=OperationClass.MUTATING,
@@ -366,7 +375,7 @@ def test_no_cached_duplicate_response_remains_unknown(
     ])
     _use_fake_network(monkeypatch, clock, factory)
 
-    result = VirtuosoClient().execute_skill(
+    result = VirtuosoClient(auth_token="test-fork-token", ).execute_skill(
         "dbSave(cv)",
         timeout=1.0,
         operation_class=OperationClass.MUTATING,
@@ -418,7 +427,7 @@ def test_execute_skill_marks_lifecycle_request_exclusive(
     factory = _SocketFactory([connected])
     _use_fake_network(monkeypatch, clock, factory)
 
-    VirtuosoClient().execute_skill(
+    VirtuosoClient(auth_token="test-fork-token", ).execute_skill(
         "RBStop()",
         timeout=5.0,
         operation_class=OperationClass.MUTATING,
@@ -441,7 +450,7 @@ def test_execute_skill_daemon_timeout_is_unknown_commit_for_mutating_request(
     factory = _SocketFactory([connected])
     _use_fake_network(monkeypatch, clock, factory)
 
-    result = VirtuosoClient().execute_skill(
+    result = VirtuosoClient(auth_token="test-fork-token", ).execute_skill(
         "dbCreateRect(cv list(0:0 1:1))",
         timeout=1.0,
         operation_class=OperationClass.MUTATING,
@@ -558,7 +567,7 @@ def test_protocol_v3_falls_back_only_on_exact_legacy_rejection(
     factory = _SocketFactory([rejected, accepted])
     _use_fake_network(monkeypatch, clock, factory)
 
-    result = VirtuosoClient().execute_skill(
+    result = VirtuosoClient(auth_token="test-fork-token", ).execute_skill(
         "1+2", timeout=1.0, request_id="req-v3-fallback", exclusive=True
     )
 
@@ -580,7 +589,7 @@ def test_load_il_classifies_the_request_as_mutating(
 ) -> None:
     script = tmp_path / "check.il"
     script.write_text("t\n", encoding="utf-8")
-    client = VirtuosoClient(log_to_ciw=False)
+    client = VirtuosoClient(auth_token="test-fork-token", log_to_ciw=False)
     observed: dict[str, object] = {}
 
     def fake_execute(skill_code, timeout=None, operation_class=OperationClass.UNKNOWN):
@@ -595,3 +604,27 @@ def test_load_il_classifies_the_request_as_mutating(
 
     assert result.status == ExecutionStatus.SUCCESS
     assert observed["operation_class"] == OperationClass.MUTATING
+
+
+def test_execute_skill_can_disable_connect_retry_for_non_idempotent_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    refused = _FakeSocket(
+        clock,
+        connect_error=ConnectionRefusedError(errno.ECONNREFUSED, "refused"),
+    )
+    factory = _SocketFactory([refused])
+    _use_fake_network(monkeypatch, clock, factory)
+
+    result = VirtuosoClient().execute_skill(
+        "nonIdempotentWrite()", timeout=1.0, retry_connect=False,
+    )
+
+    assert result.status == ExecutionStatus.ERROR
+    assert result.errors == [
+        "Connection refused to 127.0.0.1:65432. "
+        "Ensure the RAMIC Bridge daemon is running in Virtuoso."
+    ]
+    assert clock.sleeps == []
+    assert len(factory.created) == 1

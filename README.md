@@ -29,6 +29,8 @@ A new infrastructure for **Agentic Analog and Mixed-Signal Design**. LLM Agents 
 - **Flexible programming**: execute inline SKILL, load `.il` files, or use Python APIs
 - **Four design domains**: schematic editing, layout generation, simulation setup (Maestro), and standalone Spectre with PSF parsing
 - **Deterministic schematic planning**: explicit connectivity plus hard/soft grid, polarity-row, differential-pair, pin-column, and output-stage constraints
+- **Exact schematic recreation**: import routed source geometry through explicit PDK maps, live symbol-pin audits, readback verification, and batch GUI screenshots
+- **Optional SOS cellview control**: explicit status/checkout/cancel-checkout/checkin/initial registration with dry-run, post-state verification, and unknown-result safety
 
 **2. Scalable Architecture** — Multi-server, multi-session, built for distributed design clusters.
 - Multi-profile SSH: connect to N design servers, each with independent tunnel
@@ -102,6 +104,25 @@ virtuoso-bridge bootstrap --window 0x3000012
 
 `bootstrap` refuses windows that are not identified as a CIW and does not
 accept arbitrary SKILL text.
+
+### Optional IPC logging
+
+Daemon IPC logging is disabled by default. To enable it, set
+`RB_LOG_ENABLED=1` in the environment that launches the Virtuoso process.
+`RB_LOG_PATH` optionally selects the file; when it is unset or empty, the log
+is written as `ramic-bridge.log` in Virtuoso's working directory. These are
+CIW-process variables, not bridge `.env` settings, and changing them does not
+alter an already running Virtuoso process. The monitor's logging toggle uses
+the configured path and restarts only the bridge daemon.
+
+### Optional nonce replay cache size
+
+The daemon remembers signed request nonces to reject replays. Its default
+capacity is 4096; once full, it rejects new requests rather than discarding
+live replay marks. For sustained high request rates, set a positive integer
+such as `RB_NONCE_CACHE_MAX=8192` in the environment that launches Virtuoso,
+then restart Virtuoso and the bridge daemon. This is a daemon-side setting,
+not a client bridge `.env` setting. A larger value uses more memory.
 
 ### Split GUI and daemon hosts
 
@@ -198,6 +219,33 @@ client = VirtuosoClient.from_env()
 client.execute_skill("1+2")  # VirtuosoResult(status=SUCCESS, output='3')
 ```
 
+To recreate existing drawings across several PDKs, use the exact-coordinate
+manifest workflow.  It never guesses target devices or placement:
+
+```python
+result = client.schematic.import_manifest(
+    "source.json",
+    "process-map.json",
+    processes=["pdk180", "pdk28"],
+)
+client.schematic.capture_import_result(result, "output/evidence")
+```
+
+See [`examples/01_virtuoso/schematic_manifest/`](examples/01_virtuoso/schematic_manifest/)
+for the portable JSON contracts and a complete runner.
+
+For operation-scoped schematic diagnostics, use:
+
+```python
+report = client.schematic.check_and_save("myLib", "myCell")
+print(report.status, report.check_error_count, report.check_warning_count)
+for diagnostic in report.diagnostics:
+    print(diagnostic.severity, diagnostic.code, diagnostic.message)
+```
+
+This captures only messages emitted by the current `schCheck`/`dbSave`, and
+reports a blocking modal separately instead of mixing in stale CIW history.
+
 For fail-fast access to standalone Spectre PSF ASCII artifacts, use the strict
 helpers instead of guessing filenames, keys, or value shapes:
 
@@ -269,7 +317,8 @@ All commands take `-p PROFILE` / `--env PATH` to pick a non-default config; run 
 | **Interaction / diagnostics** | |
 | `windows` | List all open Virtuoso windows (number + name) |
 | `screenshot [ciw\|current\|N] [-o DIR\|FILE]` | Capture a window; defaults to the user artifact screenshots directory |
-| `dismiss-dialog` | X11 path: find and dismiss blocking GUI dialogs (saves you when SKILL channel deadlocks on a modal) |
+| `inspect-dialogs --pid PID` | Read-only process-scoped X11 blocker inspection; supports `--json`, profile and explicit DISPLAY/CIW window |
+| `dismiss-dialog --legacy-bulk` | Explicit opt-in legacy bulk dismissal; unsuitable for shared CIWs |
 | `list-windows [--top-level] [--json]` | X11 path: enumerate Virtuoso windows; `--top-level` returns one deduplicated entry per frame for CIW selection |
 | `bootstrap --window WINDOW_ID` | Opt-in X11 first load: inject only the generated `load(...)` into one explicit, verified CIW |
 | `dismiss-window WINDOW_ID [--action enter\|escape\|alt-y\|alt-n]` | X11 path: send an explicit action to one window ID returned by `list-windows` |

@@ -20,8 +20,23 @@ from virtuoso_bridge.virtuoso.maestro.lifecycle import (
     open_gui_session,
     open_session,
 )
+from virtuoso_bridge.virtuoso.maestro.history import (
+    get_history,
+    list_histories,
+    lock_history,
+    set_history_lock,
+    unlock_history,
+)
+from virtuoso_bridge.virtuoso.maestro.monte_carlo import (
+    configure_monte_carlo,
+    export_monte_carlo_results,
+    get_monte_carlo_config,
+    run_monte_carlo_and_wait,
+)
 from virtuoso_bridge.virtuoso.maestro.reader import (
     export_waveform,
+    get_session_state,
+    list_session_states,
     read_results,
     snapshot,
 )
@@ -96,8 +111,23 @@ class MaestroOps:
     close_gui_session = _client_method(close_gui_session)
     purge_maestro_cellviews = _client_method(_purge_maestro_cellviews)
 
+    # Simulation history retention
+    list_histories = _client_method(list_histories)
+    get_history = _client_method(get_history)
+    set_history_lock = _client_method(set_history_lock)
+    lock_history = _client_method(lock_history)
+    unlock_history = _client_method(unlock_history)
+
+    # Monte Carlo configuration, execution, and export
+    get_monte_carlo_config = _client_method(get_monte_carlo_config)
+    configure_monte_carlo = _client_method(configure_monte_carlo)
+    run_monte_carlo_and_wait = _client_method(run_monte_carlo_and_wait)
+    export_monte_carlo_results = _client_method(export_monte_carlo_results)
+
     # Read results and waveforms
     snapshot = _client_method(snapshot)
+    get_session_state = _client_method(get_session_state)
+    list_session_states = _client_method(list_session_states)
     read_results = _client_method(read_results)
     export_waveform = _client_method(export_waveform)
     open_waveform_viewer = _client_method(open_waveform_viewer)

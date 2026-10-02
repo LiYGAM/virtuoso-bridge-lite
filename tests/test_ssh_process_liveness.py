@@ -19,8 +19,9 @@ def test_external_tunnel_liveness_does_not_terminate_process(monkeypatch):
     try:
         runner.tunnel_pid = proc.pid
         monkeypatch.setattr(SSHClient, "read_state", lambda profile=None: {
-            "mode": "remote", "tunnel_pid": proc.pid,
+            "mode": "remote", "tunnel_pid": proc.pid, "port": 65432,
         })
+        monkeypatch.setattr(SSHRunner, "can_reach_port", staticmethod(lambda port: True))
         assert runner.is_tunnel_alive
         assert SSHClient.is_running()
         assert runner.is_tunnel_alive

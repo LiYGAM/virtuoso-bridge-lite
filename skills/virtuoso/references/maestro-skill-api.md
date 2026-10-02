@@ -441,7 +441,7 @@ maeMigrateADEXLToMaestro("myLib" "myCell" "adexl" ?maestroView "maestro_convert"
 
 ## Known Blockers
 
-- **GUI dialogs** block the SKILL execution channel. All `execute_skill()` calls timeout until the dialog is dismissed manually. Common culprits: "Specify history name", "No analyses enabled", "Change Mode Confirmation". Use `hiFormDone(hiGetCurrentForm())` to dismiss programmatically.
+- **GUI dialogs** can block the SKILL execution channel. Common culprits: "Specify history name", "No analyses enabled", "Change Mode Confirmation". Inspect the selected PID through SSH/X11; never automatically close the current form in a shared CIW. See [Shared CIW Dialog Protection](shared-ciw-dialogs.md).
 - **Schematic must be checked & saved** (`schCheck` + `dbSave`) before simulation, otherwise netlisting fails with dialog.
 - **Schematic should be open in GUI** for Maestro to reference it correctly.
 - **`maeOpenSetup` creates background edit locks** — always pair with `maeCloseSession(?forceClose t)`. Stale `.cdslck` files may need manual deletion.

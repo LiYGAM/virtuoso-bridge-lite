@@ -35,3 +35,39 @@ Diagnostics read existing authentication material without provisioning secrets. 
 This is a source integration. Deploy/activate the matching client and packaged daemon together before relying on the new authenticated factories. An old running daemon may reject the new handshake; do not enable unauthenticated mode to bypass this. Use the existing guarded deployment/restart workflow after separate authorization, then verify source/runtime identity and read-only execution.
 
 The parent repository's gitlink and `tools/dependencies/bridge.json` remain pinned to the previous release pending a coordinated publication. Do not publish a parent pin to a commit that has not been pushed to the maintained fork.
+
+## Publication and IC23.1 activation — 2026-10-02 07:03 UTC
+
+User subsequently authorized GitHub publication and VM activation. The integration
+commit `aa33148` and follow-up fix `623fd5d` were pushed to the maintained fork's
+`codex/upstream-integration-20261002` branch.
+
+The first activation exposed an upstream port-discovery incompatibility: its
+process pattern recognized only unversioned daemon names with the port as the
+last argument. The fork uses a SHA-qualified name and trailing token/ledger/profile
+arguments. This incorrectly moved the configured remote port from 65140 to 65141.
+The unchanged old daemon ledger contained no new restart admission. After fixing
+the pattern (52 focused tunnel tests passed), the managed tunnel was stopped,
+the verified daemon port 65140 restored, and guarded restart completed successfully.
+No Virtuoso process or design window was terminated.
+
+Verified through profile `v231`:
+
+- Packaged/deployed/running daemon SHA-256:
+  `2b8ec8eab10475dba3563bfc89365c291211b0e71065771af24cde99784582a4`.
+- Packaged/deployed/running SKILL identity matches; heartbeat fresh.
+- New daemon epoch: `0850e86ee2404217acf1255dca5fc885`.
+- HMAC, authenticated hello, nonce replay protection, v3 frames, ledger, exclusive
+  admission and timeout-drain capabilities advertised by the running daemon.
+- Read-only `1+1`: output `2`, protocol 3, completion `confirmed`, frame integrity
+  `verified`; request `d7052d38-fd0b-45e5-a72f-58c132a2ec4d`.
+- Bridge status successful. Existing managed autoload block matches the stable
+  setup path and retains mode 0600.
+- SOS executable not found on PATH or under `$CLIOSOFT_DIR/bin/soscmd`; real SOS
+  operations remain unverified. No SOS software was installed.
+
+Evidence is retained locally under `test_output/bridge-runs/`, notably restart
+run `20261002T070245602Z-35016-e3cb8ea4` and read-only verification run
+`20261002T070337032Z-10432-0a0d9b9f`. These operational results do not replace the
+broader platform/PDK acceptance limits described above. The parent dependency pin
+was not published as a separate release.

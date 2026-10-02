@@ -2982,7 +2982,7 @@ def _remote_port_occupancy_cmd(port: int) -> str:
     """POSIX-sh one-liner classifying who holds *port* on the remote host.
 
     Returns FREE (nothing listening), OWN (a bridge daemon of the current
-    SSH user — its argv ends with the port), or FOREIGN (something else,
+    SSH user, including versioned resources and trailing ledger arguments), or FOREIGN (something else,
     typically another user's Virtuoso bridge daemon).  ``ss`` is probed
     first, ``netstat`` is the fallback; when neither exists the command
     prints FREE and the caller keeps the default port.
@@ -2991,6 +2991,6 @@ def _remote_port_occupancy_cmd(port: int) -> str:
         f"if (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) "
         f"| awk '{{print $4}}' | grep -E ':{port}$' >/dev/null 2>&1; then "
         f"if pgrep -u \"$(id -un 2>/dev/null)\" -f "
-        f"'ramic_bridge_daemon_(3|27)\\.py.* {port}$' >/dev/null 2>&1; then "
+        f"'ramic_bridge_daemon_(3|27)(\\.[0-9a-f]{{64}})?\\.py[[:space:]]+[^[:space:]]+[[:space:]]+{port}([[:space:]]|$)' >/dev/null 2>&1; then "
         f"echo OWN; else echo FOREIGN; fi; else echo FREE; fi"
     )

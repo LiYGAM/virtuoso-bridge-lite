@@ -1085,7 +1085,14 @@ def test_occupancy_cmd_targets_port() -> None:
     cmd = _remote_port_occupancy_cmd(65061)
     assert ":65061$" in cmd
     assert "pgrep" in cmd and "id -un" in cmd
-    assert r"ramic_bridge_daemon_(3|27)\.py.* 65061$" in cmd
+    assert r"ramic_bridge_daemon_(3|27)(\.[0-9a-f]{64})?\.py" in cmd
+    # Exercise the actual generated ERE against both upstream and fork argv.
+    import re
+    pattern = cmd.split("-f '", 1)[1].split("'", 1)[0].replace("[[:space:]]", r"\s").replace("[^[:space:]]", r"\S")
+    assert re.search(pattern, "python3 /tmp/ramic_bridge_daemon_3.py 127.0.0.1 65061")
+    assert re.search(pattern, "python3 /tmp/ramic_bridge_daemon_3." + "a" * 64 + ".py 127.0.0.1 65061 /tmp/auth.token /tmp/ledger.json v231")
+    assert not re.search(pattern, "python3 /tmp/ramic_bridge_daemon_3.py 127.0.0.1 650610")
+    assert not re.search(pattern, "python3 /tmp/ramic_bridge_daemon_3.py 127.0.0.1 65062 /tmp/65061")
 
 
 def test_deconflict_shifts_off_foreign_listener(monkeypatch) -> None:
